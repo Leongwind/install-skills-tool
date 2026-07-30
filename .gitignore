@@ -3,4 +3,9 @@ node_modules/
 dist/
 target/
 *.log
-
+.idea/
+.vscode/
+coverage/
+.pnpm-store/
+*.tsbuildinfo
+**/src-tauri/gen/
