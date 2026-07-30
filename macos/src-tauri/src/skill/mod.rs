@@ -3,8 +3,8 @@ use crate::storage::{cache_dir, inspect_tree, MAX_BYTES, MAX_FILES};
 use regex::Regex;
 use serde::Deserialize;
 use std::fs;
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::io::{Cursor, Read, Seek};
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 use zip::ZipArchive;
 
@@ -118,6 +118,91 @@ fn validate_skill(
     })
 }
 
+fn extract_skill_archive<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    destination: &Path,
+    subpath: &str,
+    repository: &str,
+) -> Result<PathBuf, String> {
+    let selected = Path::new(subpath);
+    if selected
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err("GitHub Skill 子路径无效".to_string());
+    }
+
+    let mut archive_root = None;
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).map_err(|error| error.to_string())?;
+        let enclosed = file
+            .enclosed_name()
+            .ok_or_else(|| "ZIP 包含路径穿越".to_string())?;
+        let Some(Component::Normal(root)) = enclosed.components().next() else {
+            return Err("GitHub ZIP 根目录无效".to_string());
+        };
+        match archive_root.as_ref() {
+            Some(existing) if existing != root => {
+                return Err("GitHub ZIP 包含多个根目录".to_string());
+            }
+            None => archive_root = Some(root.to_os_string()),
+            _ => {}
+        }
+    }
+    let archive_root = archive_root.ok_or_else(|| "GitHub ZIP 为空".to_string())?;
+    let selected_prefix = PathBuf::from(archive_root).join(selected);
+    let skill_folder = selected
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new(repository));
+    let skill_destination = destination.join(skill_folder);
+    let mut extracted_files = 0usize;
+    let mut extracted_bytes = 0u64;
+
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| error.to_string())?;
+        let enclosed = file
+            .enclosed_name()
+            .ok_or_else(|| "ZIP 包含路径穿越".to_string())?
+            .to_path_buf();
+        if !enclosed.starts_with(&selected_prefix) {
+            continue;
+        }
+        if file
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err("Skill 包含软链接，已拒绝".to_string());
+        }
+        let relative = enclosed
+            .strip_prefix(&selected_prefix)
+            .map_err(|error| error.to_string())?;
+        let target = skill_destination.join(relative);
+        if file.is_dir() {
+            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+        } else {
+            extracted_files += 1;
+            extracted_bytes = extracted_bytes.saturating_add(file.size());
+            if extracted_files > MAX_FILES {
+                return Err(format!("文件数量超过限制 {MAX_FILES}"));
+            }
+            if extracted_bytes > MAX_BYTES {
+                return Err("解压内容超过 200 MB".to_string());
+            }
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let mut output = fs::File::create(target).map_err(|error| error.to_string())?;
+            std::io::copy(&mut file, &mut output).map_err(|error| error.to_string())?;
+        }
+    }
+    if extracted_files == 0 {
+        return Err("GitHub Skill 路径不存在或目录为空".to_string());
+    }
+    skill_destination
+        .canonicalize()
+        .map_err(|error| format!("GitHub Skill 路径不存在: {error}"))
+}
+
 async fn download_github(
     raw: &str,
     data_dir: &Path,
@@ -178,53 +263,12 @@ async fn download_github(
     fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
     let mut archive =
         ZipArchive::new(Cursor::new(bytes)).map_err(|error| format!("ZIP 无效: {error}"))?;
-    let mut extracted_files = 0usize;
-    let mut extracted_bytes = 0u64;
-    for index in 0..archive.len() {
-        let mut file = archive.by_index(index).map_err(|error| error.to_string())?;
-        if file
-            .unix_mode()
-            .is_some_and(|mode| mode & 0o170000 == 0o120000)
-        {
-            return Err("GitHub 包含软链接，已拒绝".to_string());
-        }
-        let enclosed = file
-            .enclosed_name()
-            .ok_or_else(|| "ZIP 包含路径穿越".to_string())?
-            .to_path_buf();
-        let target = destination.join(enclosed);
-        if file.is_dir() {
-            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
-        } else {
-            extracted_files += 1;
-            extracted_bytes = extracted_bytes.saturating_add(file.size());
-            if extracted_files > MAX_FILES {
-                return Err(format!("文件数量超过限制 {MAX_FILES}"));
-            }
-            if extracted_bytes > MAX_BYTES {
-                return Err("解压内容超过 200 MB".to_string());
-            }
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            let mut output = fs::File::create(target).map_err(|error| error.to_string())?;
-            std::io::copy(&mut file, &mut output).map_err(|error| error.to_string())?;
-        }
-    }
-    let root = fs::read_dir(&destination)
-        .map_err(|error| error.to_string())?
-        .next()
-        .ok_or_else(|| "GitHub ZIP 为空".to_string())?
-        .map_err(|error| error.to_string())?
-        .path();
-    let skill = if location.subpath.is_empty() {
-        root
-    } else {
-        root.join(&location.subpath)
-    };
-    let skill = skill
-        .canonicalize()
-        .map_err(|error| format!("GitHub Skill 路径不存在: {error}"))?;
+    let skill = extract_skill_archive(
+        &mut archive,
+        &destination,
+        &location.subpath,
+        &location.repository,
+    )?;
     Ok((
         skill,
         SkillSourceDetails {
@@ -264,6 +308,33 @@ pub async fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    fn archive_with_symlink(symlink_path: &str) -> Cursor<Vec<u8>> {
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut bytes);
+            let options = SimpleFileOptions::default();
+            writer
+                .add_symlink(symlink_path, "README.md", options)
+                .unwrap();
+            writer
+                .start_file("skills-main/skills/engineering/tdd/SKILL.md", options)
+                .unwrap();
+            writer
+                .write_all(b"---\nname: tdd\ndescription: TDD\n---\n")
+                .unwrap();
+            writer
+                .start_file("skills-main/skills/engineering/tdd/tests.md", options)
+                .unwrap();
+            writer.write_all(b"Test guidance").unwrap();
+            writer.finish().unwrap();
+        }
+        bytes.set_position(0);
+        bytes
+    }
 
     #[test]
     fn parses_tree_and_skill_urls() {
@@ -293,5 +364,58 @@ mod tests {
             SkillSourceDetails::default(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn ignores_symlinks_outside_selected_skill() {
+        let destination = tempfile::tempdir().unwrap();
+        let bytes = archive_with_symlink("skills-main/AGENTS.md");
+        let mut archive = ZipArchive::new(bytes).unwrap();
+
+        let extracted = extract_skill_archive(
+            &mut archive,
+            destination.path(),
+            "skills/engineering/tdd",
+            "skills",
+        )
+        .unwrap();
+
+        assert_eq!(extracted.file_name().unwrap(), "tdd");
+        assert!(extracted.join("SKILL.md").is_file());
+        assert!(!destination.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn rejects_symlinks_inside_selected_skill() {
+        let destination = tempfile::tempdir().unwrap();
+        let bytes = archive_with_symlink("skills-main/skills/engineering/tdd/linked.md");
+        let mut archive = ZipArchive::new(bytes).unwrap();
+
+        let error = extract_skill_archive(
+            &mut archive,
+            destination.path(),
+            "skills/engineering/tdd",
+            "skills",
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Skill 包含软链接，已拒绝");
+    }
+
+    #[test]
+    #[ignore = "requires public GitHub access"]
+    fn downloads_tdd_skill_from_repository_with_root_symlink() {
+        let data = tempfile::tempdir().unwrap();
+        let source = SkillSource::Github {
+            url: "https://github.com/mattpocock/skills/tree/main/skills/engineering/tdd"
+                .to_string(),
+        };
+
+        let (metadata, path) =
+            tauri::async_runtime::block_on(inspect(source, data.path())).unwrap();
+
+        assert_eq!(metadata.name, "tdd");
+        assert!(path.join("SKILL.md").is_file());
+        assert!(!path.join("AGENTS.md").exists());
     }
 }
