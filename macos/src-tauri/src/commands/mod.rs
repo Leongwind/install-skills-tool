@@ -396,13 +396,20 @@ pub fn adopt_external_skill_inner(
         .iter()
         .find(|client| client.id == client_id)
         .ok_or_else(|| format!("未知 Agent: {client_id}"))?;
-    let root = PathBuf::from(&client.global_skills_path)
-        .canonicalize()
-        .map_err(|error| format!("Agent Skills 目录无效: {error}"))?;
+    let roots = crate::inventory::inventory_roots(client)
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect::<Vec<_>>();
+    if roots.is_empty() {
+        return Err("Agent Skills 目录无效".to_string());
+    }
     let path = PathBuf::from(resolved_path)
         .canonicalize()
         .map_err(|error| format!("Skill 路径无效: {error}"))?;
-    if path.parent() != Some(root.as_path()) {
+    if !roots
+        .iter()
+        .any(|root| path.parent() == Some(root.as_path()))
+    {
         return Err("只能纳管 Agent 全局目录中的直接子目录".to_string());
     }
     let mut persisted = storage::load_state(data_dir)?;
@@ -785,6 +792,47 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "只能纳管 Agent 全局目录中的直接子目录");
+    }
+
+    #[test]
+    fn adopting_codex_legacy_skill_records_the_existing_path() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let current_root = home.path().join(".agents/skills");
+        let legacy_skill = home.path().join(".codex/skills/legacy");
+        fs::create_dir_all(&current_root).unwrap();
+        fs::create_dir_all(&legacy_skill).unwrap();
+        fs::write(
+            legacy_skill.join("SKILL.md"),
+            "---\nname: legacy\ndescription: Legacy\n---\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: current_root.display().to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let adopted = adopt_external_skill_inner(
+            "codex",
+            &legacy_skill.display().to_string(),
+            data.path(),
+            &[client],
+        )
+        .unwrap();
+
+        assert_eq!(
+            PathBuf::from(adopted.resolved_path),
+            legacy_skill.canonicalize().unwrap()
+        );
+        assert_eq!(adopted.provenance, InstallationProvenance::Adopted);
     }
 
     #[test]

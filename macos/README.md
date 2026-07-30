@@ -1,8 +1,14 @@
 # Skill Installer for macOS
 
-Skill Installer 0.2.0 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
+Skill Installer 0.2.1 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
 Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 应用数据只保存在本机，不采集遥测，不上传 Skill 内容。
+
+## 0.2.1 修复
+
+- 修复批量来源列表中搜索框被统计卡片样式影响而错位的问题。
+- Codex 库存同时扫描当前的 `~/.agents/skills` 和早期版本使用的
+  `~/.codex/skills`，旧目录中的外部 Skill 也可主动纳入管理。
 
 ## 0.2.0 功能
 
@@ -18,7 +24,7 @@ Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 
 | Agent | 全局 Skill 目录 |
 |---|---|
-| Codex | `~/.agents/skills` |
+| Codex | `~/.agents/skills`（库存兼容读取 `~/.codex/skills`） |
 | Claude Code | `~/.claude/skills` |
 | Kiro | `~/.kiro/skills` |
 | Cursor | `~/.cursor/skills` |
@@ -48,7 +54,7 @@ TRAE 国际版通过 `com.trae.app`、应用内 `product.json` 和 `.trae` 数�
 
 ## 库存与纳管
 
-库存只扫描每个适配器的全局目录直接子项，不跟随软链接：
+库存只扫描每个适配器的已知全局目录直接子项，不跟随软链接：
 
 - `SKILL.md` 可读但目录名或 frontmatter 不规范时仍显示警告。
 - 软链接、无法安全哈希或越出已知全局目录的内容仅供查看，不能纳管。
@@ -104,7 +110,7 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer pnpm tauri build
 macos/src-tauri/target/release/bundle/dmg/
 ```
 
-首次打开未签名版本时，可在 Finder 中右键应用并选择“打开”。0.2.0 不包含
+首次打开未签名版本时，可在 Finder 中右键应用并选择“打开”。0.2.1 不包含
 Developer ID 签名、公证、自动更新、私有 GitHub、OAuth 或 Skill 市场。
 
 ## Windows 边界

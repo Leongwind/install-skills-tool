@@ -147,31 +147,24 @@ pub fn scan_client_inventory(
     client: &DetectedClient,
     state: &PersistedState,
 ) -> ClientSkillInventory {
-    let root = PathBuf::from(&client.global_skills_path);
-    if !root.exists() {
-        return ClientSkillInventory {
-            client_id: client.id.clone(),
-            root_path: client.global_skills_path.clone(),
-            direct_skills: Vec::new(),
-            passive_skills: Vec::new(),
-            scan_error: None,
-        };
-    }
-    let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return ClientSkillInventory {
-                client_id: client.id.clone(),
-                root_path: client.global_skills_path.clone(),
-                direct_skills: Vec::new(),
-                passive_skills: Vec::new(),
-                scan_error: Some(error.to_string()),
-            };
+    let mut direct_skills = Vec::new();
+    let mut scan_errors = Vec::new();
+    let mut read_succeeded = false;
+    for root in inventory_roots(client) {
+        if !root.exists() {
+            continue;
         }
-    };
-    let mut direct_skills = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => {
+                read_succeeded = true;
+                entries
+            }
+            Err(error) => {
+                scan_errors.push(format!("{}: {error}", root.display()));
+                continue;
+            }
+        };
+        direct_skills.extend(entries.filter_map(Result::ok).filter_map(|entry| {
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path).ok()?;
             if metadata.file_type().is_symlink() {
@@ -182,16 +175,34 @@ pub fn scan_client_inventory(
             } else {
                 None
             }
-        })
-        .collect::<Vec<_>>();
-    direct_skills.sort_by(|left, right| left.name.cmp(&right.name));
+        }));
+    }
+    direct_skills.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.resolved_path.cmp(&right.resolved_path))
+    });
     ClientSkillInventory {
         client_id: client.id.clone(),
         root_path: client.global_skills_path.clone(),
         direct_skills,
         passive_skills: Vec::new(),
-        scan_error: None,
+        scan_error: (!read_succeeded && !scan_errors.is_empty()).then(|| scan_errors.join("\n")),
     }
+}
+
+pub fn inventory_roots(client: &DetectedClient) -> Vec<PathBuf> {
+    let primary = PathBuf::from(&client.global_skills_path);
+    let mut roots = vec![primary.clone()];
+    if client.id == "codex" {
+        if let Some(home) = primary.parent().and_then(Path::parent) {
+            let legacy = home.join(".codex/skills");
+            if legacy != primary {
+                roots.push(legacy);
+            }
+        }
+    }
+    roots
 }
 
 pub fn build_environment_scan(
@@ -386,5 +397,47 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.contains("description")));
+    }
+
+    #[test]
+    fn codex_inventory_includes_current_and_legacy_global_roots() {
+        let home = tempfile::tempdir().unwrap();
+        let current_root = home.path().join(".agents/skills");
+        let legacy_root = home.path().join(".codex/skills");
+        for (root, name) in [(&current_root, "current"), (&legacy_root, "legacy")] {
+            let skill = root.join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\n"),
+            )
+            .unwrap();
+        }
+        let client = DetectedClient {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: current_root.display().to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let inventory = scan_client_inventory(&client, &PersistedState::default());
+
+        assert_eq!(
+            inventory
+                .direct_skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current", "legacy"]
+        );
+        assert!(inventory.direct_skills.iter().any(|skill| {
+            skill.resolved_path == legacy_root.join("legacy").display().to_string()
+        }));
     }
 }

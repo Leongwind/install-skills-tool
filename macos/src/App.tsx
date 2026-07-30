@@ -430,7 +430,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS 0.2.0</Badge>
+          <Badge variant="outline">macOS 0.2.1</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
@@ -570,15 +570,15 @@ export default function App() {
                   {inspection && (
                     <>
                       <div className="inspection-summary">
-                        <div>
+                        <div className="inspection-stat">
                           <strong>{inspection.skills.length}</strong>
                           <span>有效</span>
                         </div>
-                        <div>
+                        <div className="inspection-stat">
                           <strong>{inspection.rejected.length}</strong>
                           <span>无效</span>
                         </div>
-                        <div>
+                        <div className="inspection-stat">
                           <strong>
                             {inspection.skills.filter((skill) => skill.hasScripts).length}
                           </strong>

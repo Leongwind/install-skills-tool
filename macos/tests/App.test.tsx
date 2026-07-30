@@ -175,6 +175,13 @@ describe("Skill Installer desktop UI", () => {
     expect(screen.getByText("缺少 description")).toBeInTheDocument();
     expect(screen.getByText("已选 2 / 2")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "生成安装预览" })).toBeDisabled();
+
+    const search = screen.getByPlaceholderText("搜索 Skill");
+    expect(search.closest(".inspection-summary")).not.toBeNull();
+    expect(search.closest(".inspection-stat")).toBeNull();
+    fireEvent.change(search, { target: { value: "two" } });
+    expect(screen.queryByText("First skill")).not.toBeInTheDocument();
+    expect(screen.getByText("Second skill")).toBeInTheDocument();
   });
 
   it("groups inventory by IDE and allows an external skill to be adopted", async () => {

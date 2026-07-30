@@ -8,7 +8,7 @@ Skill Installer 是一个本地优先的 Agent Skill 批量安装和 IDE Skill �
 
 | 平台 | 目录 | 状态 | 安装包 |
 |---|---|---|---|
-| macOS | [`macos/`](macos/) | 0.2.0 | `.dmg` |
+| macOS | [`macos/`](macos/) | 0.2.1 | `.dmg` |
 | Windows | `windows/` | 尚未开始 | 未来提供独立安装包 |
 
 macOS 版支持 Codex、Claude Code、Kiro、Cursor、Windsurf、TRAE 国际版和

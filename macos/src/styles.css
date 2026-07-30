@@ -255,7 +255,7 @@ input {
   gap: 8px;
 }
 
-.inspection-summary > div {
+.inspection-summary > .inspection-stat {
   min-width: 0;
   display: grid;
   place-items: center;
@@ -265,16 +265,17 @@ input {
   background: var(--gray-a2);
 }
 
-.inspection-summary > div strong {
+.inspection-summary > .inspection-stat strong {
   font-size: 16px;
 }
 
-.inspection-summary > div span {
+.inspection-summary > .inspection-stat span {
   color: var(--gray-10);
   font-size: 10px;
 }
 
 .inspection-summary > .rt-TextFieldRoot {
+  width: 100%;
   align-self: stretch;
 }
 
