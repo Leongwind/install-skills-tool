@@ -1,11 +1,16 @@
-use crate::domain::{SkillMetadata, SkillSource, SkillSourceDetails};
+use crate::domain::{
+    RejectedSkill, SkillMetadata, SkillSource, SkillSourceDetails, SourceInspection,
+};
 use crate::storage::{cache_dir, inspect_tree, MAX_BYTES, MAX_FILES};
 use regex::Regex;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Cursor, Read, Seek};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
+use walkdir::WalkDir;
 use zip::ZipArchive;
 
 const MAX_DOWNLOAD: u64 = 50 * 1024 * 1024;
@@ -23,6 +28,8 @@ struct GithubLocation {
     reference: String,
     subpath: String,
 }
+
+type DiscoveryResult = (Vec<SkillMetadata>, Vec<RejectedSkill>, Vec<String>);
 
 fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
     let url = url::Url::parse(raw).map_err(|_| "GitHub URL 无效".to_string())?;
@@ -42,7 +49,7 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
     {
         (parts[3].to_string(), parts[4..].join("/"))
     } else {
-        ("main".to_string(), String::new())
+        ("HEAD".to_string(), String::new())
     };
     if subpath.ends_with("/SKILL.md") {
         subpath.truncate(subpath.len() - "/SKILL.md".len());
@@ -59,6 +66,7 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
 
 fn validate_skill(
     path: &Path,
+    relative_path: String,
     source: SkillSource,
     source_details: SkillSourceDetails,
 ) -> Result<SkillMetadata, String> {
@@ -105,6 +113,8 @@ fn validate_skill(
         warnings.push("Skill 包含脚本或可执行文件；安装器不会执行它们。".to_string());
     }
     Ok(SkillMetadata {
+        skill_id: Uuid::new_v4().to_string(),
+        relative_path,
         name: frontmatter.name,
         description: frontmatter.description,
         source,
@@ -116,6 +126,91 @@ fn validate_skill(
         has_scripts,
         warnings,
     })
+}
+
+fn ignored_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name,
+                ".git" | "node_modules" | "target" | "__MACOSX" | ".DS_Store"
+            )
+        })
+}
+
+fn relative_text(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn joined_subpath(base: Option<&str>, relative: &str) -> String {
+    [base.unwrap_or_default(), relative]
+        .into_iter()
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn discover_skills(
+    root: &Path,
+    source: SkillSource,
+    base_details: SkillSourceDetails,
+) -> Result<DiscoveryResult, String> {
+    if !root.is_dir() {
+        return Err("Skill 来源必须是目录".to_string());
+    }
+    let mut walker = WalkDir::new(root).follow_links(false).into_iter();
+    let mut skills = Vec::new();
+    let mut rejected = Vec::new();
+    let mut warnings = Vec::new();
+    let mut visited = 0usize;
+    let mut duplicates = HashSet::new();
+
+    while let Some(item) = walker.next() {
+        let item = item.map_err(|error| error.to_string())?;
+        visited += 1;
+        if visited > MAX_FILES {
+            return Err(format!("来源中的文件和目录超过限制 {MAX_FILES}"));
+        }
+        if ignored_entry(item.path()) {
+            if item.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if !item.file_type().is_dir() || !item.path().join("SKILL.md").is_file() {
+            continue;
+        }
+        let relative = relative_text(root, item.path());
+        let mut details = base_details.clone();
+        details.subpath = Some(joined_subpath(base_details.subpath.as_deref(), &relative));
+        match validate_skill(item.path(), relative.clone(), source.clone(), details) {
+            Ok(skill) => {
+                let duplicate_key = (skill.name.clone(), skill.content_hash.clone());
+                if duplicates.insert(duplicate_key) {
+                    skills.push(skill);
+                } else {
+                    warnings.push(format!("已合并重复 Skill: {}", skill.name));
+                }
+            }
+            Err(reason) => rejected.push(RejectedSkill {
+                relative_path: relative,
+                reason,
+            }),
+        }
+        walker.skip_current_dir();
+    }
+
+    if skills.is_empty() && rejected.is_empty() {
+        return Err("来源中未发现 SKILL.md".to_string());
+    }
+    skills.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    rejected.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok((skills, rejected, warnings))
 }
 
 fn extract_skill_archive<R: Read + Seek>(
@@ -171,7 +266,7 @@ fn extract_skill_archive<R: Read + Seek>(
             .unix_mode()
             .is_some_and(|mode| mode & 0o170000 == 0o120000)
         {
-            return Err("Skill 包含软链接，已拒绝".to_string());
+            continue;
         }
         let relative = enclosed
             .strip_prefix(&selected_prefix)
@@ -201,6 +296,82 @@ fn extract_skill_archive<R: Read + Seek>(
     skill_destination
         .canonicalize()
         .map_err(|error| format!("GitHub Skill 路径不存在: {error}"))
+}
+
+fn extract_local_archive(
+    path: &Path,
+    data_dir: &Path,
+) -> Result<(PathBuf, SkillSourceDetails), String> {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("zip"))
+    {
+        return Err("首版仅支持本地 ZIP 压缩包".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("本地 ZIP 路径无效: {error}"))?;
+    let metadata = fs::metadata(&canonical).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_DOWNLOAD {
+        return Err("压缩包超过 50 MB".to_string());
+    }
+    let file = fs::File::open(&canonical).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|error| format!("ZIP 无效: {error}"))?;
+    let destination = cache_dir(data_dir)
+        .join(Uuid::new_v4().to_string())
+        .join("archive");
+    fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+    let mut extracted_files = 0usize;
+    let mut extracted_bytes = 0u64;
+
+    for index in 0..archive.len() {
+        let mut item = archive.by_index(index).map_err(|error| error.to_string())?;
+        let enclosed = item
+            .enclosed_name()
+            .ok_or_else(|| "ZIP 包含路径穿越或绝对路径".to_string())?
+            .to_path_buf();
+        let text = enclosed
+            .to_str()
+            .ok_or_else(|| "ZIP 包含非 UTF-8 文件名".to_string())?;
+        if text.chars().any(char::is_control) {
+            return Err("ZIP 包含控制字符文件名".to_string());
+        }
+        if item
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err("ZIP 包含软链接，已拒绝".to_string());
+        }
+        let target = destination.join(&enclosed);
+        if item.is_dir() {
+            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+            continue;
+        }
+        extracted_files += 1;
+        extracted_bytes = extracted_bytes.saturating_add(item.size());
+        if extracted_files > MAX_FILES {
+            return Err(format!("文件数量超过限制 {MAX_FILES}"));
+        }
+        if extracted_bytes > MAX_BYTES {
+            return Err("解压内容超过 200 MB".to_string());
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut output = fs::File::create(target).map_err(|error| error.to_string())?;
+        std::io::copy(&mut item, &mut output).map_err(|error| error.to_string())?;
+    }
+    if extracted_files == 0 {
+        return Err("ZIP 为空".to_string());
+    }
+    Ok((
+        destination,
+        SkillSourceDetails {
+            archive_path: Some(canonical.display().to_string()),
+            ..SkillSourceDetails::default()
+        },
+    ))
 }
 
 async fn download_github(
@@ -278,16 +449,29 @@ async fn download_github(
             subpath: Some(location.subpath),
             commit_sha,
             local_path: None,
+            archive_path: None,
         },
     ))
 }
 
-pub async fn inspect(
+#[cfg(test)]
+async fn inspect(source: SkillSource, data_dir: &Path) -> Result<(SkillMetadata, PathBuf), String> {
+    let inspection = inspect_source(source, data_dir).await?;
+    if inspection.skills.len() != 1 || !inspection.rejected.is_empty() {
+        return Err("该来源包含多个 Skill，请使用批量来源检查".to_string());
+    }
+    let metadata = inspection.skills.into_iter().next().expect("one skill");
+    let path = PathBuf::from(&metadata.prepared_path);
+    Ok((metadata, path))
+}
+
+pub async fn inspect_source(
     source: SkillSource,
     data_dir: &Path,
-) -> Result<(SkillMetadata, PathBuf), String> {
-    let (path, source_details) = match &source {
-        SkillSource::Local { path } => {
+) -> Result<SourceInspection, String> {
+    crate::storage::cleanup_cache(data_dir, Duration::from_secs(24 * 60 * 60))?;
+    let (root, source_details) = match &source {
+        SkillSource::LocalDirectory { path } => {
             let canonical = PathBuf::from(path)
                 .canonicalize()
                 .map_err(|error| format!("本地路径无效: {error}"))?;
@@ -299,10 +483,17 @@ pub async fn inspect(
                 },
             )
         }
+        SkillSource::LocalArchive { path } => extract_local_archive(Path::new(path), data_dir)?,
         SkillSource::Github { url } => download_github(url, data_dir).await?,
     };
-    let metadata = validate_skill(&path, source, source_details)?;
-    Ok((metadata, path))
+    let (skills, rejected, warnings) = discover_skills(&root, source.clone(), source_details)?;
+    Ok(SourceInspection {
+        inspection_id: Uuid::new_v4().to_string(),
+        source,
+        skills,
+        rejected,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -338,6 +529,9 @@ mod tests {
 
     #[test]
     fn parses_tree_and_skill_urls() {
+        let root = parse_github_url("https://github.com/acme/skills").unwrap();
+        assert_eq!(root.reference, "HEAD");
+        assert_eq!(root.subpath, "");
         let tree = parse_github_url("https://github.com/acme/skills/tree/v1/demo").unwrap();
         assert_eq!(tree.subpath, "demo");
         assert_eq!(tree.reference, "v1");
@@ -358,12 +552,169 @@ mod tests {
         .unwrap();
         assert!(validate_skill(
             &skill,
-            SkillSource::Local {
+            ".".to_string(),
+            SkillSource::LocalDirectory {
                 path: skill.display().to_string()
             },
             SkillSourceDetails::default(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn local_directory_discovers_multiple_skills_and_keeps_rejections() {
+        let root = tempfile::tempdir().unwrap();
+        let valid = root.path().join("skills").join("valid-skill");
+        let invalid = root.path().join("skills").join("invalid-skill");
+        fs::create_dir_all(&valid).unwrap();
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(
+            valid.join("SKILL.md"),
+            "---\nname: valid-skill\ndescription: Valid\n---\nInstructions",
+        )
+        .unwrap();
+        fs::write(
+            invalid.join("SKILL.md"),
+            "---\nname: different-name\ndescription: Invalid\n---\nInstructions",
+        )
+        .unwrap();
+
+        let inspection = tauri::async_runtime::block_on(inspect_source(
+            SkillSource::LocalDirectory {
+                path: root.path().display().to_string(),
+            },
+            root.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(inspection.skills.len(), 1);
+        assert_eq!(inspection.skills[0].name, "valid-skill");
+        assert_eq!(inspection.rejected.len(), 1);
+        assert_eq!(inspection.rejected[0].relative_path, "skills/invalid-skill");
+    }
+
+    #[test]
+    fn local_zip_discovers_skills_across_multiple_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let archive_path = root.path().join("skills.zip");
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut bytes);
+            let options = SimpleFileOptions::default();
+            for (path, name) in [
+                ("first/SKILL.md", "first"),
+                ("nested/second/SKILL.md", "second"),
+            ] {
+                writer.start_file(path, options).unwrap();
+                writer
+                    .write_all(format!("---\nname: {name}\ndescription: {name}\n---\n").as_bytes())
+                    .unwrap();
+            }
+            writer.start_file("__MACOSX/.DS_Store", options).unwrap();
+            writer.write_all(b"ignored").unwrap();
+            writer.finish().unwrap();
+        }
+        fs::write(&archive_path, bytes.into_inner()).unwrap();
+
+        let inspection = tauri::async_runtime::block_on(inspect_source(
+            SkillSource::LocalArchive {
+                path: archive_path.display().to_string(),
+            },
+            root.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            inspection
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn discovered_skill_keeps_the_github_parent_subpath() {
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("nested").join("demo");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\n",
+        )
+        .unwrap();
+        let details = SkillSourceDetails {
+            subpath: Some("catalog".to_string()),
+            ..SkillSourceDetails::default()
+        };
+
+        let (skills, _, _) = discover_skills(
+            root.path(),
+            SkillSource::Github {
+                url: "https://github.com/acme/skills/tree/main/catalog".to_string(),
+            },
+            details,
+        )
+        .unwrap();
+
+        assert_eq!(
+            skills[0].source_details.subpath.as_deref(),
+            Some("catalog/nested/demo")
+        );
+    }
+
+    #[test]
+    fn local_zip_rejects_path_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let archive_path = root.path().join("unsafe.zip");
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut bytes);
+            let options = SimpleFileOptions::default();
+            writer.start_file("../escape/SKILL.md", options).unwrap();
+            writer
+                .write_all(b"---\nname: escape\ndescription: Escape\n---\n")
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        fs::write(&archive_path, bytes.into_inner()).unwrap();
+
+        let error = tauri::async_runtime::block_on(inspect_source(
+            SkillSource::LocalArchive {
+                path: archive_path.display().to_string(),
+            },
+            root.path(),
+        ))
+        .unwrap_err();
+
+        assert!(error.contains("路径穿越"));
+        assert!(!root.path().join("escape").exists());
+    }
+
+    #[test]
+    fn local_zip_rejects_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let archive_path = root.path().join("unsafe.zip");
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut bytes);
+            writer
+                .add_symlink("demo/link", "../../outside", SimpleFileOptions::default())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        fs::write(&archive_path, bytes.into_inner()).unwrap();
+
+        let error = tauri::async_runtime::block_on(inspect_source(
+            SkillSource::LocalArchive {
+                path: archive_path.display().to_string(),
+            },
+            root.path(),
+        ))
+        .unwrap_err();
+
+        assert_eq!(error, "ZIP 包含软链接，已拒绝");
     }
 
     #[test]
@@ -386,20 +737,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_symlinks_inside_selected_skill() {
+    fn github_archives_skip_symlinks_inside_selected_paths() {
         let destination = tempfile::tempdir().unwrap();
         let bytes = archive_with_symlink("skills-main/skills/engineering/tdd/linked.md");
         let mut archive = ZipArchive::new(bytes).unwrap();
 
-        let error = extract_skill_archive(
+        let extracted = extract_skill_archive(
             &mut archive,
             destination.path(),
             "skills/engineering/tdd",
             "skills",
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error, "Skill 包含软链接，已拒绝");
+        assert!(extracted.join("SKILL.md").is_file());
+        assert!(!extracted.join("linked.md").exists());
     }
 
     #[test]
@@ -417,5 +769,24 @@ mod tests {
         assert_eq!(metadata.name, "tdd");
         assert!(path.join("SKILL.md").is_file());
         assert!(!path.join("AGENTS.md").exists());
+    }
+
+    #[test]
+    #[ignore = "requires public GitHub access"]
+    fn discovers_multiple_skills_from_a_public_repository_root() {
+        let data = tempfile::tempdir().unwrap();
+        let source = SkillSource::Github {
+            url: "https://github.com/mattpocock/skills".to_string(),
+        };
+
+        let inspection =
+            tauri::async_runtime::block_on(inspect_source(source, data.path())).unwrap();
+
+        assert!(inspection.skills.len() > 1);
+        assert!(inspection.skills.iter().any(|skill| skill.name == "tdd"));
+        assert!(inspection
+            .skills
+            .iter()
+            .all(|skill| skill.source_details.reference.as_deref() == Some("HEAD")));
     }
 }

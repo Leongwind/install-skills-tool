@@ -1,6 +1,7 @@
 mod adapters;
 mod commands;
 mod domain;
+mod inventory;
 mod macos;
 mod skill;
 mod storage;
@@ -25,21 +26,24 @@ pub fn run() {
             }
             app.manage(AppState {
                 data_dir,
+                inspections: Mutex::new(HashMap::new()),
                 plans: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::scan_clients,
-            commands::inspect_skill,
+            commands::scan_environment,
+            commands::inspect_source,
             commands::plan_install,
             commands::apply_install_plan,
             commands::list_installations,
             commands::list_backups,
+            commands::adopt_external_skill,
             commands::check_updates,
             commands::uninstall_installation,
             commands::restore_backup,
             commands::export_diagnostics,
+            commands::reveal_in_finder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Skill Installer");

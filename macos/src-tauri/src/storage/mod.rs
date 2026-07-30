@@ -6,6 +6,7 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -18,7 +19,18 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
         return Ok(PersistedState::default());
     }
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("状态文件无效: {error}"))
+    let mut state: PersistedState =
+        serde_json::from_slice(&bytes).map_err(|error| format!("状态文件无效: {error}"))?;
+    if state.schema_version == 1 {
+        for installation in &mut state.installations {
+            installation.legacy_project =
+                installation.scope == crate::domain::InstallScope::Project;
+            installation.provenance = crate::domain::InstallationProvenance::Tool;
+        }
+        state.schema_version = 2;
+        save_state(data_dir, &state)?;
+    }
+    Ok(state)
 }
 
 pub fn save_state(data_dir: &Path, state: &PersistedState) -> Result<(), String> {
@@ -202,6 +214,28 @@ pub fn cache_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("cache")
 }
 
+pub fn cleanup_cache(data_dir: &Path, max_age: Duration) -> Result<(), String> {
+    let root = cache_dir(data_dir);
+    if !root.is_dir() {
+        return Ok(());
+    }
+    let now = SystemTime::now();
+    for entry in fs::read_dir(&root).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if now.duration_since(modified).unwrap_or_default() <= max_age {
+            continue;
+        }
+        if metadata.is_dir() {
+            fs::remove_dir_all(entry.path()).map_err(|error| error.to_string())?;
+        } else {
+            fs::remove_file(entry.path()).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +275,55 @@ mod tests {
         assert_eq!(
             fs::read_to_string(Path::new(&backup.backup_path).join("SKILL.md")).unwrap(),
             "old"
+        );
+    }
+
+    #[test]
+    fn loading_v1_state_preserves_global_and_legacy_project_records() {
+        let data = tempfile::tempdir().unwrap();
+        fs::write(
+            data.path().join("state.json"),
+            r#"{
+              "schemaVersion": 1,
+              "installations": [
+                {
+                  "id": "global",
+                  "skillName": "one",
+                  "resolvedPath": "/tmp/global/one",
+                  "source": {"kind": "local", "path": "/tmp/source/one"},
+                  "contentHash": "abc",
+                  "scope": "global",
+                  "consumers": ["codex"],
+                  "passiveConsumers": [],
+                  "adapterVersion": 1,
+                  "installedAt": "2026-01-01T00:00:00Z"
+                },
+                {
+                  "id": "project",
+                  "skillName": "two",
+                  "resolvedPath": "/tmp/project/.agents/skills/two",
+                  "source": {"kind": "github", "url": "https://github.com/example/skills"},
+                  "contentHash": "def",
+                  "scope": "project",
+                  "consumers": ["codex"],
+                  "passiveConsumers": [],
+                  "adapterVersion": 1,
+                  "installedAt": "2026-01-01T00:00:00Z"
+                }
+              ],
+              "backups": []
+            }"#,
+        )
+        .unwrap();
+
+        let state = load_state(data.path()).unwrap();
+
+        assert_eq!(state.schema_version, 2);
+        assert!(!state.installations[0].legacy_project);
+        assert!(state.installations[1].legacy_project);
+        assert_eq!(
+            state.installations[0].provenance,
+            crate::domain::InstallationProvenance::Tool
         );
     }
 }

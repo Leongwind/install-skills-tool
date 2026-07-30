@@ -182,7 +182,6 @@ pub fn scan_clients() -> Vec<DetectedClient> {
                 application_path: application.map(|path| path.display().to_string()),
                 cli_path: cli.map(|path| path.display().to_string()),
                 global_skills_path: home.join(adapter.global_relative).display().to_string(),
-                project_skills_path: adapter.project_relative.to_string(),
                 supports_skills: usable && supports_version,
                 notes,
             }

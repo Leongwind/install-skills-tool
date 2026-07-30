@@ -1,9 +1,9 @@
-use crate::adapters::{adapters, passive_consumers_for, resolve_target};
+use crate::adapters::{adapters, passive_consumers_for, resolve_global_target};
 use crate::domain::*;
 use crate::{macos, skill, storage};
 use chrono::Utc;
 use serde_json::json;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub struct AppState {
     pub data_dir: PathBuf,
+    pub inspections: Mutex<HashMap<String, SourceInspection>>,
     pub plans: Mutex<HashMap<String, PendingPlan>>,
 }
 
@@ -35,64 +36,114 @@ fn normalized(path: &Path) -> String {
     result.display().to_string()
 }
 
-#[tauri::command]
-pub fn scan_clients() -> Vec<DetectedClient> {
-    macos::scan_clients()
-}
-
-#[tauri::command]
-pub async fn inspect_skill(
-    source: SkillSource,
-    state: State<'_, AppState>,
-) -> Result<SkillMetadata, String> {
-    skill::inspect(source, &state.data_dir)
-        .await
-        .map(|(metadata, _)| metadata)
-}
-
-#[tauri::command]
-pub async fn plan_install(
-    source: SkillSource,
-    client_ids: Vec<String>,
-    scope: InstallScope,
-    project_path: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<InstallPlan, String> {
-    if client_ids.is_empty() {
-        return Err("请至少选择一个 Agent".to_string());
+fn inspected_update<'a>(
+    inspection: &'a SourceInspection,
+    installation: &PhysicalInstallation,
+) -> Result<&'a SkillMetadata, String> {
+    let candidates = inspection
+        .skills
+        .iter()
+        .filter(|skill| skill.name == installation.skill_name)
+        .collect::<Vec<_>>();
+    if let Some(expected) = installation.source_details.subpath.as_deref() {
+        return candidates
+            .into_iter()
+            .find(|skill| skill.source_details.subpath.as_deref() == Some(expected))
+            .ok_or_else(|| "来源中已找不到原 Skill 路径".to_string());
     }
+    match candidates.as_slice() {
+        [skill] => Ok(*skill),
+        [] => Err("来源中已找不到该 Skill".to_string()),
+        _ => Err("来源包含多个同名 Skill，无法确定更新目标".to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, String> {
     let clients = macos::scan_clients();
-    let detected = crate::adapters::detected_map(&clients);
-    for id in &client_ids {
-        let client = detected
-            .get(id)
-            .ok_or_else(|| format!("未知 Agent: {id}"))?;
-        if !client.supports_skills {
-            return Err(format!("{} 当前不可安装 Skills", client.name));
-        }
-    }
+    let persisted = storage::load_state(&state.data_dir)?;
+    Ok(crate::inventory::build_environment_scan(
+        clients, &persisted,
+    ))
+}
 
-    let (metadata, source_path) = skill::inspect(source, &state.data_dir).await?;
-    let home = home_dir()?;
-    let project = project_path.as_deref().map(Path::new);
+#[tauri::command]
+pub async fn inspect_source(
+    source: SkillSource,
+    state: State<'_, AppState>,
+) -> Result<SourceInspection, String> {
+    let inspection = skill::inspect_source(source, &state.data_dir).await?;
+    state
+        .inspections
+        .lock()
+        .map_err(|_| "来源检查锁已损坏".to_string())?
+        .insert(inspection.inspection_id.clone(), inspection.clone());
+    Ok(inspection)
+}
+
+pub fn build_install_plan(
+    inspection: &SourceInspection,
+    assignments: &[SkillAssignment],
+    clients: &[DetectedClient],
+    home: &Path,
+    persisted: &PersistedState,
+) -> Result<InstallPlan, String> {
+    if assignments.is_empty() {
+        return Err("请至少选择一个 Skill".to_string());
+    }
+    let detected = crate::adapters::detected_map(clients);
     let adapter_map: HashMap<_, _> = adapters()
         .into_iter()
         .map(|adapter| (adapter.id, adapter))
         .collect();
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for id in &client_ids {
-        let adapter = adapter_map
-            .get(id.as_str())
-            .ok_or_else(|| format!("尚未适配 Agent: {id}"))?;
-        let path = resolve_target(adapter, &home, project, scope, &metadata.name)?;
-        groups
-            .entry(normalized(&path))
-            .or_default()
-            .push(id.clone());
+    let skills_by_id: HashMap<_, _> = inspection
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.as_str(), skill))
+        .collect();
+    let mut selected = Vec::new();
+    let mut selected_names: HashMap<&str, &str> = HashMap::new();
+    let mut groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+
+    for assignment in assignments {
+        let metadata = skills_by_id
+            .get(assignment.skill_id.as_str())
+            .ok_or_else(|| format!("来源检查中不存在 Skill: {}", assignment.skill_id))?;
+        if assignment.client_ids.is_empty() {
+            return Err(format!("请为 {} 至少选择一个 Agent", metadata.name));
+        }
+        if let Some(existing_hash) = selected_names.insert(&metadata.name, &metadata.content_hash) {
+            if existing_hash != metadata.content_hash {
+                return Err(format!(
+                    "存在同名但内容不同的 Skill: {}，请只保留一个",
+                    metadata.name
+                ));
+            }
+        }
+        selected.push((*metadata).clone());
+        for id in &assignment.client_ids {
+            let client = detected
+                .get(id)
+                .ok_or_else(|| format!("未知 Agent: {id}"))?;
+            if !client.supports_skills {
+                return Err(format!("{} 当前不可安装 Skills", client.name));
+            }
+            let adapter = adapter_map
+                .get(id.as_str())
+                .ok_or_else(|| format!("尚未适配 Agent: {id}"))?;
+            let path = resolve_global_target(adapter, home, &metadata.name);
+            groups
+                .entry((metadata.skill_id.clone(), normalized(&path)))
+                .or_default()
+                .push(id.clone());
+        }
     }
-    let persisted = storage::load_state(&state.data_dir)?;
+
     let mut entries = Vec::new();
-    for (resolved_path, consumers) in groups {
+    for ((skill_id, resolved_path), consumers) in groups {
+        let metadata = skills_by_id
+            .get(skill_id.as_str())
+            .expect("grouped skill exists");
         let path = Path::new(&resolved_path);
         let existing_hash = if path.is_dir() {
             storage::inspect_tree(path).ok().map(|value| value.0)
@@ -122,7 +173,7 @@ pub async fn plan_install(
         } else {
             ConflictState::NotInstalled
         };
-        let passive = passive_consumers_for(path, &consumers, &clients);
+        let passive = passive_consumers_for(path, &consumers, clients);
         let mut warnings = Vec::new();
         if consumers.len() > 1 {
             warnings.push("多个 Agent 共用此物理目录，将只写入一次。".to_string());
@@ -131,6 +182,9 @@ pub async fn plan_install(
             warnings.push("其他 Agent 可能自动发现此 Skill。".to_string());
         }
         entries.push(InstallPlanEntry {
+            entry_id: Uuid::new_v4().to_string(),
+            skill_id,
+            skill_name: metadata.name.clone(),
             resolved_path,
             consumers,
             passive_consumers: passive,
@@ -139,12 +193,46 @@ pub async fn plan_install(
             warnings,
         });
     }
-    let plan = InstallPlan {
+    Ok(InstallPlan {
         plan_id: Uuid::new_v4().to_string(),
-        skill: metadata,
-        scope,
+        skills: selected,
         entries,
-    };
+    })
+}
+
+#[tauri::command]
+pub async fn plan_install(
+    inspection_id: String,
+    assignments: Vec<SkillAssignment>,
+    state: State<'_, AppState>,
+) -> Result<InstallPlan, String> {
+    let inspection = state
+        .inspections
+        .lock()
+        .map_err(|_| "来源检查锁已损坏".to_string())?
+        .get(&inspection_id)
+        .cloned()
+        .ok_or_else(|| "来源检查不存在或已过期".to_string())?;
+    let clients = macos::scan_clients();
+    let persisted = storage::load_state(&state.data_dir)?;
+    let plan = build_install_plan(
+        &inspection,
+        &assignments,
+        &clients,
+        &home_dir()?,
+        &persisted,
+    )?;
+    let selected_ids: HashSet<_> = plan
+        .skills
+        .iter()
+        .map(|skill| skill.skill_id.as_str())
+        .collect();
+    let source_paths = inspection
+        .skills
+        .iter()
+        .filter(|skill| selected_ids.contains(skill.skill_id.as_str()))
+        .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
+        .collect();
     state
         .plans
         .lock()
@@ -153,7 +241,7 @@ pub async fn plan_install(
             plan.plan_id.clone(),
             PendingPlan {
                 public: plan.clone(),
-                source_path,
+                source_paths,
             },
         );
     Ok(plan)
@@ -162,7 +250,7 @@ pub async fn plan_install(
 #[tauri::command]
 pub fn apply_install_plan(
     plan_id: String,
-    overwrite_paths: Vec<String>,
+    overwrite_entry_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<OperationResult>, String> {
     let pending = state
@@ -174,6 +262,16 @@ pub fn apply_install_plan(
     let mut persisted = storage::load_state(&state.data_dir)?;
     let mut results = Vec::new();
     for entry in &pending.public.entries {
+        let metadata = pending
+            .public
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == entry.skill_id)
+            .ok_or_else(|| format!("安装计划缺少 Skill: {}", entry.skill_name))?;
+        let source_path = pending
+            .source_paths
+            .get(&entry.skill_id)
+            .ok_or_else(|| format!("安装计划缺少来源目录: {}", entry.skill_name))?;
         let destination = PathBuf::from(&entry.resolved_path);
         let requires_confirmation = matches!(
             entry.conflict,
@@ -181,6 +279,8 @@ pub fn apply_install_plan(
         );
         if entry.conflict == ConflictState::NotWritable {
             results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
                 path: entry.resolved_path.clone(),
                 success: false,
                 status: "notWritable".to_string(),
@@ -188,8 +288,10 @@ pub fn apply_install_plan(
             });
             continue;
         }
-        if requires_confirmation && !overwrite_paths.contains(&entry.resolved_path) {
+        if requires_confirmation && !overwrite_entry_ids.contains(&entry.entry_id) {
             results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
                 path: entry.resolved_path.clone(),
                 success: false,
                 status: "confirmationRequired".to_string(),
@@ -203,19 +305,23 @@ pub fn apply_install_plan(
                 .retain(|item| item.resolved_path != entry.resolved_path);
             persisted.installations.push(PhysicalInstallation {
                 id: Uuid::new_v4().to_string(),
-                skill_name: pending.public.skill.name.clone(),
+                skill_name: metadata.name.clone(),
                 resolved_path: entry.resolved_path.clone(),
-                source: pending.public.skill.source.clone(),
-                source_details: pending.public.skill.source_details.clone(),
-                content_hash: pending.public.skill.content_hash.clone(),
-                scope: pending.public.scope,
+                source: Some(metadata.source.clone()),
+                source_details: metadata.source_details.clone(),
+                content_hash: metadata.content_hash.clone(),
+                scope: InstallScope::Global,
                 consumers: entry.consumers.clone(),
                 passive_consumers: entry.passive_consumers.clone(),
                 adapter_version: 1,
                 installed_at: Utc::now().to_rfc3339(),
+                provenance: InstallationProvenance::Tool,
+                legacy_project: false,
             });
             storage::save_state(&state.data_dir, &persisted)?;
             results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
                 path: entry.resolved_path.clone(),
                 success: true,
                 status: "tracked".to_string(),
@@ -227,33 +333,39 @@ pub fn apply_install_plan(
             if let Some(backup) = storage::create_backup(&state.data_dir, &destination)? {
                 persisted.backups.push(backup);
             }
-            storage::atomic_replace(&pending.source_path, &destination)?;
+            storage::atomic_replace(source_path, &destination)?;
             persisted
                 .installations
                 .retain(|item| item.resolved_path != entry.resolved_path);
             persisted.installations.push(PhysicalInstallation {
                 id: Uuid::new_v4().to_string(),
-                skill_name: pending.public.skill.name.clone(),
+                skill_name: metadata.name.clone(),
                 resolved_path: entry.resolved_path.clone(),
-                source: pending.public.skill.source.clone(),
-                source_details: pending.public.skill.source_details.clone(),
-                content_hash: pending.public.skill.content_hash.clone(),
-                scope: pending.public.scope,
+                source: Some(metadata.source.clone()),
+                source_details: metadata.source_details.clone(),
+                content_hash: metadata.content_hash.clone(),
+                scope: InstallScope::Global,
                 consumers: entry.consumers.clone(),
                 passive_consumers: entry.passive_consumers.clone(),
                 adapter_version: 1,
                 installed_at: Utc::now().to_rfc3339(),
+                provenance: InstallationProvenance::Tool,
+                legacy_project: false,
             });
             storage::save_state(&state.data_dir, &persisted)
         })();
         results.push(match operation {
             Ok(()) => OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
                 path: entry.resolved_path.clone(),
                 success: true,
                 status: "installed".to_string(),
                 message: "安装完成".to_string(),
             },
             Err(message) => OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
                 path: entry.resolved_path.clone(),
                 success: false,
                 status: "failed".to_string(),
@@ -274,6 +386,79 @@ pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupRecord>, Str
     Ok(storage::load_state(&state.data_dir)?.backups)
 }
 
+pub fn adopt_external_skill_inner(
+    client_id: &str,
+    resolved_path: &str,
+    data_dir: &Path,
+    clients: &[DetectedClient],
+) -> Result<PhysicalInstallation, String> {
+    let client = clients
+        .iter()
+        .find(|client| client.id == client_id)
+        .ok_or_else(|| format!("未知 Agent: {client_id}"))?;
+    let root = PathBuf::from(&client.global_skills_path)
+        .canonicalize()
+        .map_err(|error| format!("Agent Skills 目录无效: {error}"))?;
+    let path = PathBuf::from(resolved_path)
+        .canonicalize()
+        .map_err(|error| format!("Skill 路径无效: {error}"))?;
+    if path.parent() != Some(root.as_path()) {
+        return Err("只能纳管 Agent 全局目录中的直接子目录".to_string());
+    }
+    let mut persisted = storage::load_state(data_dir)?;
+    let inventory = crate::inventory::scan_client_inventory(client, &persisted);
+    let item = inventory
+        .direct_skills
+        .into_iter()
+        .find(|item| {
+            Path::new(&item.resolved_path)
+                .canonicalize()
+                .is_ok_and(|candidate| candidate == path)
+        })
+        .ok_or_else(|| "未在 Agent 目录中发现该 Skill".to_string())?;
+    if item.validity == SkillValidity::Unsafe {
+        return Err("该 Skill 无法安全哈希，不能纳入管理".to_string());
+    }
+    if item.installation_id.is_some() {
+        return Err("该 Skill 已在管理中".to_string());
+    }
+    let content_hash = item
+        .content_hash
+        .ok_or_else(|| "无法计算 Skill 内容哈希".to_string())?;
+    let installation = PhysicalInstallation {
+        id: Uuid::new_v4().to_string(),
+        skill_name: item.name,
+        resolved_path: path.display().to_string(),
+        source: None,
+        source_details: SkillSourceDetails::default(),
+        content_hash,
+        scope: InstallScope::Global,
+        consumers: vec![client.id.clone()],
+        passive_consumers: passive_consumers_for(&path, std::slice::from_ref(&client.id), clients),
+        adapter_version: 1,
+        installed_at: Utc::now().to_rfc3339(),
+        provenance: InstallationProvenance::Adopted,
+        legacy_project: false,
+    };
+    persisted.installations.push(installation.clone());
+    storage::save_state(data_dir, &persisted)?;
+    Ok(installation)
+}
+
+#[tauri::command]
+pub fn adopt_external_skill(
+    client_id: String,
+    resolved_path: String,
+    state: State<'_, AppState>,
+) -> Result<PhysicalInstallation, String> {
+    adopt_external_skill_inner(
+        &client_id,
+        &resolved_path,
+        &state.data_dir,
+        &macos::scan_clients(),
+    )
+}
+
 #[tauri::command]
 pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatus>, String> {
     let persisted = storage::load_state(&state.data_dir)?;
@@ -290,8 +475,19 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
             });
             continue;
         }
-        match skill::inspect(installation.source.clone(), &state.data_dir).await {
-            Ok((metadata, _)) if metadata.content_hash != installation.content_hash => {
+        let Some(source) = installation.source.clone() else {
+            statuses.push(UpdateStatus {
+                installation_id: installation.id,
+                status: UpdateState::SourceUnavailable,
+                message: "来源未绑定，仅管理本地副本".to_string(),
+            });
+            continue;
+        };
+        match skill::inspect_source(source, &state.data_dir)
+            .await
+            .and_then(|inspection| inspected_update(&inspection, &installation).cloned())
+        {
+            Ok(metadata) if metadata.content_hash != installation.content_hash => {
                 statuses.push(UpdateStatus {
                     installation_id: installation.id,
                     status: UpdateState::SourceChanged,
@@ -331,6 +527,8 @@ pub fn uninstall_installation(
     let modified = current_hash.as_deref() != Some(installation.content_hash.as_str());
     if modified && !force {
         return Ok(OperationResult {
+            entry_id: None,
+            skill_name: Some(installation.skill_name.clone()),
             path: installation.resolved_path,
             success: false,
             status: "confirmationRequired".to_string(),
@@ -348,6 +546,8 @@ pub fn uninstall_installation(
         .retain(|item| item.id != installation_id);
     storage::save_state(&state.data_dir, &persisted)?;
     Ok(OperationResult {
+        entry_id: None,
+        skill_name: Some(installation.skill_name),
         path: installation.resolved_path,
         success: true,
         status: "uninstalled".to_string(),
@@ -374,6 +574,8 @@ pub fn restore_backup(
     storage::atomic_replace(Path::new(&backup.backup_path), &destination)?;
     storage::save_state(&state.data_dir, &persisted)?;
     Ok(OperationResult {
+        entry_id: None,
+        skill_name: None,
         path: backup.original_path,
         success: true,
         status: "restored".to_string(),
@@ -385,16 +587,50 @@ pub fn restore_backup(
 pub fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> {
     let persisted = storage::load_state(&state.data_dir)?;
     let clients = macos::scan_clients();
+    let environment = crate::inventory::build_environment_scan(clients.clone(), &persisted);
     let payload = json!({
         "generatedAt": Utc::now().to_rfc3339(),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "platform": "macOS",
         "clients": clients,
+        "inventory": environment.inventories,
         "state": persisted,
         "privacy": "User home paths are redacted; Skill contents are not included."
     });
     let raw = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
     Ok(storage::redact_home(&raw))
+}
+
+#[tauri::command]
+pub fn reveal_in_finder(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let requested = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("路径无效: {error}"))?;
+    let persisted = storage::load_state(&state.data_dir)?;
+    let environment = crate::inventory::build_environment_scan(macos::scan_clients(), &persisted);
+    let allowed = environment.inventories.iter().any(|inventory| {
+        inventory.direct_skills.iter().any(|skill| {
+            Path::new(&skill.resolved_path)
+                .canonicalize()
+                .is_ok_and(|candidate| candidate == requested)
+        })
+    }) || persisted.backups.iter().any(|backup| {
+        Path::new(&backup.backup_path)
+            .canonicalize()
+            .is_ok_and(|candidate| candidate == requested)
+    });
+    if !allowed {
+        return Err("只能在 Finder 中显示已扫描的 Skill 或备份".to_string());
+    }
+    let status = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&requested)
+        .status()
+        .map_err(|error| format!("无法打开 Finder: {error}"))?;
+    if !status.success() {
+        return Err("Finder 未能显示该路径".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -404,5 +640,214 @@ mod tests {
     #[test]
     fn normalized_paths_remove_parent_segments() {
         assert_eq!(normalized(Path::new("/tmp/project/../demo")), "/tmp/demo");
+    }
+
+    #[test]
+    fn matrix_assignments_create_entries_per_skill_and_client() {
+        let skill = |id: &str, name: &str| SkillMetadata {
+            skill_id: id.to_string(),
+            relative_path: name.to_string(),
+            name: name.to_string(),
+            description: name.to_string(),
+            source: SkillSource::LocalDirectory {
+                path: "/tmp/source".to_string(),
+            },
+            source_details: SkillSourceDetails::default(),
+            prepared_path: format!("/tmp/source/{name}"),
+            content_hash: format!("{name}-hash"),
+            file_count: 1,
+            total_bytes: 10,
+            has_scripts: false,
+            warnings: Vec::new(),
+        };
+        let inspection = SourceInspection {
+            inspection_id: "inspection".to_string(),
+            source: SkillSource::LocalDirectory {
+                path: "/tmp/source".to_string(),
+            },
+            skills: vec![skill("one-id", "one"), skill("two-id", "two")],
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let client = |id: &str, root: &str| DetectedClient {
+            id: id.to_string(),
+            name: id.to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let assignments = vec![
+            SkillAssignment {
+                skill_id: "one-id".to_string(),
+                client_ids: vec!["codex".to_string(), "kiro".to_string()],
+            },
+            SkillAssignment {
+                skill_id: "two-id".to_string(),
+                client_ids: vec!["kiro".to_string()],
+            },
+        ];
+
+        let plan = build_install_plan(
+            &inspection,
+            &assignments,
+            &[client("codex", "/tmp/agents"), client("kiro", "/tmp/kiro")],
+            Path::new("/tmp/home"),
+            &PersistedState::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.entries.len(), 3);
+        assert!(plan.entries.iter().any(|entry| {
+            entry.skill_name == "one" && entry.resolved_path == "/tmp/home/.agents/skills/one"
+        }));
+        assert!(plan.entries.iter().any(|entry| {
+            entry.skill_name == "two" && entry.resolved_path == "/tmp/home/.kiro/skills/two"
+        }));
+    }
+
+    #[test]
+    fn adopting_external_skill_records_a_safe_baseline() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("external");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: external\ndescription: External\n---\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let adopted = adopt_external_skill_inner(
+            "kiro",
+            &skill.display().to_string(),
+            data.path(),
+            &[client],
+        )
+        .unwrap();
+
+        assert_eq!(adopted.provenance, InstallationProvenance::Adopted);
+        assert!(adopted.source.is_none());
+        assert_eq!(
+            storage::load_state(data.path())
+                .unwrap()
+                .installations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn adopting_external_skill_rejects_paths_outside_the_client_root() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nname: outside\ndescription: Outside\n---\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let error = adopt_external_skill_inner(
+            "kiro",
+            &outside.path().display().to_string(),
+            data.path(),
+            &[client],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "只能纳管 Agent 全局目录中的直接子目录");
+    }
+
+    #[test]
+    fn matrix_rejects_same_name_with_different_content() {
+        let first = SkillMetadata {
+            skill_id: "first".to_string(),
+            relative_path: "one/demo".to_string(),
+            name: "demo".to_string(),
+            description: "First".to_string(),
+            source: SkillSource::LocalDirectory {
+                path: "/tmp/source".to_string(),
+            },
+            source_details: SkillSourceDetails::default(),
+            prepared_path: "/tmp/source/one/demo".to_string(),
+            content_hash: "first-hash".to_string(),
+            file_count: 1,
+            total_bytes: 10,
+            has_scripts: false,
+            warnings: Vec::new(),
+        };
+        let mut second = first.clone();
+        second.skill_id = "second".to_string();
+        second.relative_path = "two/demo".to_string();
+        second.prepared_path = "/tmp/source/two/demo".to_string();
+        second.content_hash = "second-hash".to_string();
+        let inspection = SourceInspection {
+            inspection_id: "inspection".to_string(),
+            source: first.source.clone(),
+            skills: vec![first.clone(), second],
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: "/tmp/kiro".to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let error = build_install_plan(
+            &inspection,
+            &[
+                SkillAssignment {
+                    skill_id: first.skill_id,
+                    client_ids: vec!["kiro".to_string()],
+                },
+                SkillAssignment {
+                    skill_id: "second".to_string(),
+                    client_ids: vec!["kiro".to_string()],
+                },
+            ],
+            &[client],
+            Path::new("/tmp/home"),
+            &PersistedState::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("同名但内容不同"));
     }
 }

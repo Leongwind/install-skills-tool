@@ -1,4 +1,4 @@
-use crate::domain::{ClientEdition, DetectedClient, InstallScope};
+use crate::domain::{ClientEdition, DetectedClient};
 use semver::Version;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,6 @@ pub struct Adapter {
     pub name: &'static str,
     pub edition: ClientEdition,
     pub global_relative: &'static str,
-    pub project_relative: &'static str,
 }
 
 pub fn adapters() -> Vec<Adapter> {
@@ -19,67 +18,48 @@ pub fn adapters() -> Vec<Adapter> {
             name: "Codex",
             edition: ClientEdition::Standard,
             global_relative: ".agents/skills",
-            project_relative: ".agents/skills",
         },
         Adapter {
             id: "claude-code",
             name: "Claude Code",
             edition: ClientEdition::Standard,
             global_relative: ".claude/skills",
-            project_relative: ".claude/skills",
         },
         Adapter {
             id: "kiro",
             name: "Kiro",
             edition: ClientEdition::Standard,
             global_relative: ".kiro/skills",
-            project_relative: ".kiro/skills",
         },
         Adapter {
             id: "cursor",
             name: "Cursor",
             edition: ClientEdition::Standard,
             global_relative: ".cursor/skills",
-            project_relative: ".cursor/skills",
         },
         Adapter {
             id: "windsurf",
             name: "Windsurf",
             edition: ClientEdition::Standard,
             global_relative: ".codeium/windsurf/skills",
-            project_relative: ".windsurf/skills",
         },
         Adapter {
             id: "trae-international",
             name: "TRAE International",
             edition: ClientEdition::TraeInternational,
             global_relative: ".trae/skills",
-            project_relative: ".trae/skills",
         },
         Adapter {
             id: "trae-china",
             name: "TRAE China",
             edition: ClientEdition::TraeChina,
             global_relative: ".trae-cn/skills",
-            project_relative: ".trae/skills",
         },
     ]
 }
 
-pub fn resolve_target(
-    adapter: &Adapter,
-    home: &Path,
-    project: Option<&Path>,
-    scope: InstallScope,
-    skill_name: &str,
-) -> Result<PathBuf, String> {
-    let base = match scope {
-        InstallScope::Global => home.join(adapter.global_relative),
-        InstallScope::Project => project
-            .ok_or_else(|| "项目安装需要选择项目目录".to_string())?
-            .join(adapter.project_relative),
-    };
-    Ok(base.join(skill_name))
+pub fn resolve_global_target(adapter: &Adapter, home: &Path, skill_name: &str) -> PathBuf {
+    home.join(adapter.global_relative).join(skill_name)
 }
 
 pub fn detected_map(clients: &[DetectedClient]) -> HashMap<String, DetectedClient> {
@@ -131,7 +111,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trae_editions_share_project_path_but_not_global_path() {
+    fn trae_editions_use_distinct_global_paths() {
         let list = adapters();
         let international = list
             .iter()
@@ -142,23 +122,8 @@ mod tests {
             .find(|adapter| adapter.id == "trae-china")
             .unwrap();
         let home = Path::new("/Users/test");
-        let project = Path::new("/work/project");
-
-        let int_project = resolve_target(
-            international,
-            home,
-            Some(project),
-            InstallScope::Project,
-            "demo",
-        )
-        .unwrap();
-        let cn_project =
-            resolve_target(china, home, Some(project), InstallScope::Project, "demo").unwrap();
-        assert_eq!(int_project, cn_project);
-
-        let int_global =
-            resolve_target(international, home, None, InstallScope::Global, "demo").unwrap();
-        let cn_global = resolve_target(china, home, None, InstallScope::Global, "demo").unwrap();
+        let int_global = resolve_global_target(international, home, "demo");
+        let cn_global = resolve_global_target(china, home, "demo");
         assert_ne!(int_global, cn_global);
     }
 
@@ -173,7 +138,6 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: String::new(),
-            project_skills_path: String::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
