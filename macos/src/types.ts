@@ -5,13 +5,21 @@ export type DetectionStatus =
   | "configOnly"
   | "unsupportedVersion"
   | "notInstalled";
-export type InstallScope = "global" | "project";
 export type ConflictState =
   | "notInstalled"
   | "identical"
   | "updateAvailable"
   | "conflict"
   | "notWritable";
+export type InstallScope = "global" | "project";
+export type SkillValidity = "valid" | "nonConforming" | "unsafe";
+export type SkillManagementStatus =
+  | "toolManaged"
+  | "adopted"
+  | "external"
+  | "modified"
+  | "unsafe"
+  | "passive";
 
 export interface DetectedClient {
   id: string;
@@ -22,13 +30,13 @@ export interface DetectedClient {
   applicationPath?: string;
   cliPath?: string;
   globalSkillsPath: string;
-  projectSkillsPath: string;
   supportsSkills: boolean;
   notes: string[];
 }
 
 export type SkillSource =
-  | { kind: "local"; path: string }
+  | { kind: "localDirectory"; path: string }
+  | { kind: "localArchive"; path: string }
   | { kind: "github"; url: string };
 
 export interface SkillSourceDetails {
@@ -38,9 +46,12 @@ export interface SkillSourceDetails {
   subpath?: string;
   commitSha?: string;
   localPath?: string;
+  archivePath?: string;
 }
 
 export interface SkillMetadata {
+  skillId: string;
+  relativePath: string;
   name: string;
   description: string;
   source: SkillSource;
@@ -53,7 +64,28 @@ export interface SkillMetadata {
   warnings: string[];
 }
 
+export interface RejectedSkill {
+  relativePath: string;
+  reason: string;
+}
+
+export interface SourceInspection {
+  inspectionId: string;
+  source: SkillSource;
+  skills: SkillMetadata[];
+  rejected: RejectedSkill[];
+  warnings: string[];
+}
+
+export interface SkillAssignment {
+  skillId: string;
+  clientIds: string[];
+}
+
 export interface InstallPlanEntry {
+  entryId: string;
+  skillId: string;
+  skillName: string;
   resolvedPath: string;
   consumers: string[];
   passiveConsumers: string[];
@@ -64,12 +96,13 @@ export interface InstallPlanEntry {
 
 export interface InstallPlan {
   planId: string;
-  skill: SkillMetadata;
-  scope: InstallScope;
+  skills: SkillMetadata[];
   entries: InstallPlanEntry[];
 }
 
 export interface OperationResult {
+  entryId?: string;
+  skillName?: string;
   path: string;
   success: boolean;
   status: string;
@@ -80,7 +113,7 @@ export interface PhysicalInstallation {
   id: string;
   skillName: string;
   resolvedPath: string;
-  source: SkillSource;
+  source?: SkillSource;
   sourceDetails: SkillSourceDetails;
   contentHash: string;
   scope: InstallScope;
@@ -88,6 +121,36 @@ export interface PhysicalInstallation {
   passiveConsumers: string[];
   adapterVersion: number;
   installedAt: string;
+  provenance: "tool" | "adopted";
+  legacyProject: boolean;
+}
+
+export interface InventorySkill {
+  inventoryId: string;
+  name: string;
+  directoryName: string;
+  description?: string;
+  resolvedPath: string;
+  contentHash?: string;
+  validity: SkillValidity;
+  managementStatus: SkillManagementStatus;
+  installationId?: string;
+  issues: string[];
+  consumers: string[];
+  passiveFromClientId?: string;
+}
+
+export interface ClientSkillInventory {
+  clientId: string;
+  rootPath: string;
+  directSkills: InventorySkill[];
+  passiveSkills: InventorySkill[];
+  scanError?: string;
+}
+
+export interface EnvironmentScan {
+  clients: DetectedClient[];
+  inventories: ClientSkillInventory[];
 }
 
 export interface BackupRecord {

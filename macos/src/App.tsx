@@ -1,17 +1,18 @@
 import {
   ArrowClockwise,
   ArrowRight,
+  Archive,
   Check,
   CloudArrowDown,
   Code,
   Copy,
   Database,
-  Desktop,
   FolderOpen,
+  FolderSimple,
   Gear,
   GithubLogo,
-  HardDrives,
   Info,
+  MagnifyingGlass,
   Package,
   ShieldWarning,
   Trash,
@@ -23,7 +24,6 @@ import {
   Callout,
   Checkbox,
   Flex,
-  RadioGroup,
   Separator,
   Spinner,
   Text,
@@ -35,19 +35,35 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import type {
   BackupRecord,
+  ClientSkillInventory,
   DetectedClient,
+  EnvironmentScan,
   InstallPlan,
-  InstallScope,
+  InventorySkill,
   OperationResult,
   PhysicalInstallation,
-  SkillMetadata,
+  SkillManagementStatus,
   SkillSource,
+  SourceInspection,
   UpdateStatus,
 } from "./types";
 import { conflictLabel, detectionLabel, formatBytes, shortPath } from "./ui";
 
 type Page = "install" | "manage" | "diagnostics";
-type SourceMode = "local" | "github";
+type SourceMode = "localDirectory" | "localArchive" | "github";
+type InventoryFilter = "all" | "managed" | "external" | "issues";
+
+const inventoryStatus: Record<
+  SkillManagementStatus,
+  { label: string; color: "green" | "blue" | "gray" | "orange" | "red" }
+> = {
+  toolManaged: { label: "本工具安装", color: "green" },
+  adopted: { label: "已纳管", color: "blue" },
+  external: { label: "外部安装", color: "gray" },
+  modified: { label: "内容已修改", color: "orange" },
+  unsafe: { label: "不安全", color: "red" },
+  passive: { label: "被动发现", color: "blue" },
+};
 
 function friendlyError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -69,42 +85,82 @@ function StatusBadge({ client }: { client: DetectedClient }) {
   );
 }
 
+function SearchBox({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}) {
+  return (
+    <TextField.Root
+      value={value}
+      placeholder={placeholder}
+      onChange={(event) => onChange(event.target.value)}
+    >
+      <TextField.Slot>
+        <MagnifyingGlass />
+      </TextField.Slot>
+    </TextField.Root>
+  );
+}
+
+function LoadingRows() {
+  return (
+    <div aria-label="正在扫描" className="skeleton-list">
+      {[0, 1, 2].map((index) => (
+        <div className="skeleton-row" key={index}>
+          <span />
+          <span />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("install");
-  const [clients, setClients] = useState<DetectedClient[]>([]);
+  const [environment, setEnvironment] = useState<EnvironmentScan>({
+    clients: [],
+    inventories: [],
+  });
   const [installations, setInstallations] = useState<PhysicalInstallation[]>([]);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
-  const [sourceMode, setSourceMode] = useState<SourceMode>("local");
+  const [sourceMode, setSourceMode] =
+    useState<SourceMode>("localDirectory");
   const [sourceValue, setSourceValue] = useState("");
-  const [skill, setSkill] = useState<SkillMetadata>();
-  const [scope, setScope] = useState<InstallScope>("global");
-  const [projectPath, setProjectPath] = useState("");
-  const [selected, setSelected] = useState<string[]>([]);
+  const [inspection, setInspection] = useState<SourceInspection>();
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [assignments, setAssignments] = useState<Record<string, string[]>>({});
+  const [sourceSearch, setSourceSearch] = useState("");
   const [plan, setPlan] = useState<InstallPlan>();
   const [overwrites, setOverwrites] = useState<string[]>([]);
   const [results, setResults] = useState<OperationResult[]>([]);
   const [updates, setUpdates] = useState<UpdateStatus[]>([]);
+  const [inventorySearch, setInventorySearch] = useState("");
+  const [inventoryFilter, setInventoryFilter] =
+    useState<InventoryFilter>("all");
   const [diagnostics, setDiagnostics] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+
+  const clients = environment.clients;
 
   const refresh = useCallback(async () => {
     setBusy("scan");
     setError("");
     try {
-      const [nextClients, nextInstallations, nextBackups] = await Promise.all([
-        api.scanClients(),
-        api.listInstallations(),
-        api.listBackups(),
-      ]);
-      setClients(nextClients);
+      const [nextEnvironment, nextInstallations, nextBackups] =
+        await Promise.all([
+          api.scanEnvironment(),
+          api.listInstallations(),
+          api.listBackups(),
+        ]);
+      setEnvironment(nextEnvironment);
       setInstallations(nextInstallations);
       setBackups(nextBackups);
-      setSelected((current) =>
-        current.filter((id) =>
-          nextClients.some((client) => client.id === id && client.supportsSkills),
-        ),
-      );
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -117,58 +173,145 @@ export default function App() {
   }, [refresh]);
 
   const source: SkillSource | undefined = sourceValue
-    ? sourceMode === "local"
-      ? { kind: "local", path: sourceValue }
-      : { kind: "github", url: sourceValue }
+    ? sourceMode === "github"
+      ? { kind: "github", url: sourceValue }
+      : { kind: sourceMode, path: sourceValue }
     : undefined;
 
-  const activeClients = useMemo(
+  const targetClients = useMemo(
     () => clients.filter((client) => client.status !== "notInstalled"),
     [clients],
   );
-
-  async function chooseFolder(kind: "skill" | "project") {
-    const selectedPath = await open({ directory: true, multiple: false });
-    if (typeof selectedPath !== "string") return;
-    if (kind === "skill") {
-      setSourceMode("local");
-      setSourceValue(selectedPath);
-      setSkill(undefined);
-      setPlan(undefined);
-    } else {
-      setProjectPath(selectedPath);
-      setPlan(undefined);
+  const selectedSkills = useMemo(
+    () =>
+      inspection?.skills.filter((skill) =>
+        selectedSkillIds.includes(skill.skillId),
+      ) ?? [],
+    [inspection, selectedSkillIds],
+  );
+  const filteredSkills = useMemo(() => {
+    const query = sourceSearch.trim().toLowerCase();
+    if (!inspection || !query) return inspection?.skills ?? [];
+    return inspection.skills.filter(
+      (skill) =>
+        skill.name.toLowerCase().includes(query) ||
+        skill.description.toLowerCase().includes(query) ||
+        skill.relativePath.toLowerCase().includes(query),
+    );
+  }, [inspection, sourceSearch]);
+  const duplicateNames = useMemo(() => {
+    const hashes = new Map<string, Set<string>>();
+    for (const skill of selectedSkills) {
+      const values = hashes.get(skill.name) ?? new Set<string>();
+      values.add(skill.contentHash);
+      hashes.set(skill.name, values);
     }
+    return [...hashes].filter(([, values]) => values.size > 1).map(([name]) => name);
+  }, [selectedSkills]);
+  const assignmentsComplete =
+    selectedSkills.length > 0 &&
+    selectedSkills.every((skill) => (assignments[skill.skillId]?.length ?? 0) > 0);
+
+  function resetInspection() {
+    setInspection(undefined);
+    setSelectedSkillIds([]);
+    setAssignments({});
+    setPlan(undefined);
+    setResults([]);
+  }
+
+  async function chooseSource() {
+    const selectedPath =
+      sourceMode === "localArchive"
+        ? await open({
+            directory: false,
+            multiple: false,
+            filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
+          })
+        : await open({ directory: true, multiple: false });
+    if (typeof selectedPath !== "string") return;
+    setSourceValue(selectedPath);
+    resetInspection();
   }
 
   async function inspect() {
     if (!source) return;
     setBusy("inspect");
     setError("");
-    setPlan(undefined);
+    resetInspection();
     try {
-      setSkill(await api.inspectSkill(source));
+      const next = await api.inspectSource(source);
+      setInspection(next);
+      setSelectedSkillIds(next.skills.map((skill) => skill.skillId));
+      setAssignments(
+        Object.fromEntries(next.skills.map((skill) => [skill.skillId, []])),
+      );
     } catch (reason) {
-      setSkill(undefined);
       setError(friendlyError(reason));
     } finally {
       setBusy("");
     }
   }
 
+  function setSkillSelected(skillId: string, checked: boolean) {
+    setSelectedSkillIds((current) =>
+      checked
+        ? current.includes(skillId)
+          ? current
+          : [...current, skillId]
+        : current.filter((id) => id !== skillId),
+    );
+    setPlan(undefined);
+  }
+
+  function toggleAssignment(skillId: string, clientId: string, checked: boolean) {
+    setAssignments((current) => {
+      const ids = current[skillId] ?? [];
+      return {
+        ...current,
+        [skillId]: checked
+          ? ids.includes(clientId)
+            ? ids
+            : [...ids, clientId]
+          : ids.filter((id) => id !== clientId),
+      };
+    });
+    setPlan(undefined);
+  }
+
+  function toggleClientColumn(client: DetectedClient) {
+    if (!client.supportsSkills) return;
+    const allChecked = selectedSkills.every((skill) =>
+      assignments[skill.skillId]?.includes(client.id),
+    );
+    setAssignments((current) =>
+      Object.fromEntries(
+        Object.entries(current).map(([skillId, ids]) => [
+          skillId,
+          selectedSkillIds.includes(skillId)
+            ? allChecked
+              ? ids.filter((id) => id !== client.id)
+              : [...new Set([...ids, client.id])]
+            : ids,
+        ]),
+      ),
+    );
+    setPlan(undefined);
+  }
+
   async function createPlan() {
-    if (!source) return;
+    if (!inspection) return;
     setBusy("plan");
     setError("");
     setResults([]);
     try {
       const next = await api.planInstall(
-        source,
-        selected,
-        scope,
-        scope === "project" ? projectPath : undefined,
+        inspection.inspectionId,
+        selectedSkills.map((skill) => ({
+          skillId: skill.skillId,
+          clientIds: assignments[skill.skillId] ?? [],
+        })),
       );
-      setSkill(next.skill);
       setPlan(next);
       setOverwrites([]);
     } catch (reason) {
@@ -183,8 +326,7 @@ export default function App() {
     setBusy("apply");
     setError("");
     try {
-      const next = await api.applyInstallPlan(plan.planId, overwrites);
-      setResults(next);
+      setResults(await api.applyInstallPlan(plan.planId, overwrites));
       setPlan(undefined);
       await refresh();
     } catch (reason) {
@@ -194,10 +336,15 @@ export default function App() {
     }
   }
 
-  async function checkUpdates() {
-    setBusy("updates");
+  async function adopt(clientId: string, skill: InventorySkill) {
+    if (!window.confirm(`将 ${skill.name} 纳入管理？\n\n${shortPath(skill.resolvedPath)}`)) {
+      return;
+    }
+    setBusy(skill.inventoryId);
+    setError("");
     try {
-      setUpdates(await api.checkUpdates());
+      await api.adoptExternalSkill(clientId, skill.resolvedPath);
+      await refresh();
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -205,13 +352,18 @@ export default function App() {
     }
   }
 
-  async function uninstall(item: PhysicalInstallation, force = false) {
-    setBusy(item.id);
+  async function uninstallById(
+    installationId: string,
+    displayPath: string,
+    force = false,
+  ) {
+    setBusy(installationId);
+    setError("");
     try {
-      const result = await api.uninstall(item.id, force);
+      const result = await api.uninstall(installationId, force);
       if (!result.success && result.status === "confirmationRequired") {
-        if (window.confirm(`${result.message}\n\n${shortPath(result.path)}`)) {
-          await uninstall(item, true);
+        if (window.confirm(`${result.message}\n\n${shortPath(displayPath)}`)) {
+          await uninstallById(installationId, displayPath, true);
         }
         return;
       }
@@ -238,6 +390,18 @@ export default function App() {
     }
   }
 
+  async function checkUpdates() {
+    setBusy("updates");
+    setError("");
+    try {
+      setUpdates(await api.checkUpdates());
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function loadDiagnostics() {
     setBusy("diagnostics");
     try {
@@ -249,6 +413,16 @@ export default function App() {
     }
   }
 
+  const managedCount = environment.inventories.reduce(
+    (count, inventory) =>
+      count +
+      inventory.directSkills.filter((skill) =>
+        ["toolManaged", "adopted", "modified"].includes(skill.managementStatus),
+      ).length,
+    0,
+  );
+  const legacyInstallations = installations.filter((item) => item.legacyProject);
+
   return (
     <Theme accentColor="blue" grayColor="slate" radius="medium" scaling="95%">
       <div className="app-shell">
@@ -256,7 +430,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS Preview</Badge>
+          <Badge variant="outline">macOS 0.2.0</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
@@ -271,20 +445,23 @@ export default function App() {
                 className={page === "install" ? "nav-item active" : "nav-item"}
                 onClick={() => setPage("install")}
               >
-                <CloudArrowDown />安装 Skill
+                <CloudArrowDown />
+                批量安装
               </button>
               <button
                 className={page === "manage" ? "nav-item active" : "nav-item"}
                 onClick={() => setPage("manage")}
               >
-                <Database />已安装与备份
-                <span className="nav-count">{installations.length}</span>
+                <Database />
+                IDE Skill 库存
+                <span className="nav-count">{managedCount}</span>
               </button>
               <button
                 className={page === "diagnostics" ? "nav-item active" : "nav-item"}
                 onClick={() => setPage("diagnostics")}
               >
-                <Gear />诊断
+                <Gear />
+                诊断
               </button>
             </nav>
             <div className="sidebar-footer">
@@ -305,21 +482,24 @@ export default function App() {
                 <Callout.Text>{error}</Callout.Text>
               </Callout.Root>
             )}
+
             {page === "install" && (
-              <div className="page">
+              <div className="page install-page">
                 <div className="page-heading">
                   <div>
                     <Text as="div" size="5" weight="bold">
-                      安装一个 Skill
+                      批量安装 Skills
                     </Text>
                     <Text as="div" size="2" color="gray">
-                      校验一次，安全地复制到多个 Agent。
+                      一次检查来源，再为每个 Skill 分配全局 IDE。
                     </Text>
                   </div>
-                  <div className="step-indicator">
-                    <span className={skill ? "done" : "current"}>1 来源</span>
+                  <div className="step-indicator" aria-label="安装步骤">
+                    <span className={inspection ? "done" : "current"}>1 来源</span>
                     <ArrowRight />
-                    <span className={plan ? "done" : skill ? "current" : ""}>2 目标</span>
+                    <span className={plan ? "done" : inspection ? "current" : ""}>
+                      2 分配
+                    </span>
                     <ArrowRight />
                     <span className={results.length ? "done" : plan ? "current" : ""}>
                       3 执行
@@ -331,194 +511,256 @@ export default function App() {
                   <div className="panel-title">
                     <div className="number">1</div>
                     <div>
-                      <strong>选择 Skill 来源</strong>
+                      <strong>检查 Skill 来源</strong>
                       <Text as="div" size="1" color="gray">
-                        本地目录或公开 GitHub 目录
+                        可从目录、ZIP 或公开 GitHub 递归发现多个 Skill
                       </Text>
                     </div>
                   </div>
-                  <div className="segmented">
-                    <button
-                      className={sourceMode === "local" ? "selected" : ""}
-                      onClick={() => {
-                        setSourceMode("local");
-                        setSourceValue("");
-                        setSkill(undefined);
-                      }}
-                    >
-                      <FolderOpen />本地目录
-                    </button>
-                    <button
-                      className={sourceMode === "github" ? "selected" : ""}
-                      onClick={() => {
-                        setSourceMode("github");
-                        setSourceValue("");
-                        setSkill(undefined);
-                      }}
-                    >
-                      <GithubLogo />GitHub
-                    </button>
+                  <div className="segmented" aria-label="来源类型">
+                    {(
+                      [
+                        ["localDirectory", "本地目录", <FolderOpen key="dir" />],
+                        ["localArchive", "ZIP", <Archive key="zip" />],
+                        ["github", "GitHub", <GithubLogo key="git" />],
+                      ] as const
+                    ).map(([mode, label, icon]) => (
+                      <button
+                        className={sourceMode === mode ? "selected" : ""}
+                        key={mode}
+                        onClick={() => {
+                          setSourceMode(mode);
+                          setSourceValue("");
+                          resetInspection();
+                        }}
+                      >
+                        {icon}
+                        {label}
+                      </button>
+                    ))}
                   </div>
                   <Flex gap="2" className="source-input-row">
                     <TextField.Root
                       className="grow"
                       value={sourceValue}
                       placeholder={
-                        sourceMode === "local"
-                          ? "选择包含 SKILL.md 的目录"
-                          : "https://github.com/owner/repo/tree/main/skill"
+                        sourceMode === "github"
+                          ? "https://github.com/owner/repository"
+                          : sourceMode === "localArchive"
+                            ? "选择包含 Skills 的 .zip 文件"
+                            : "选择单个 Skill 或包含多个 Skills 的目录"
                       }
                       onChange={(event) => {
                         setSourceValue(event.target.value);
-                        setSkill(undefined);
-                        setPlan(undefined);
+                        resetInspection();
                       }}
                     />
-                    {sourceMode === "local" && (
-                      <Button variant="soft" onClick={() => void chooseFolder("skill")}>
+                    {sourceMode !== "github" && (
+                      <Button variant="soft" onClick={() => void chooseSource()}>
                         浏览…
                       </Button>
                     )}
                     <Button disabled={!source || Boolean(busy)} onClick={() => void inspect()}>
                       {busy === "inspect" && <Spinner size="1" />}
-                      校验
+                      检查来源
                     </Button>
                   </Flex>
-                  {skill && (
-                    <div className="skill-card">
-                      <div className="skill-icon">
-                        <Code size={20} />
+
+                  {busy === "inspect" && <LoadingRows />}
+                  {inspection && (
+                    <>
+                      <div className="inspection-summary">
+                        <div>
+                          <strong>{inspection.skills.length}</strong>
+                          <span>有效</span>
+                        </div>
+                        <div>
+                          <strong>{inspection.rejected.length}</strong>
+                          <span>无效</span>
+                        </div>
+                        <div>
+                          <strong>
+                            {inspection.skills.filter((skill) => skill.hasScripts).length}
+                          </strong>
+                          <span>含脚本</span>
+                        </div>
+                        <SearchBox
+                          value={sourceSearch}
+                          onChange={setSourceSearch}
+                          placeholder="搜索 Skill"
+                        />
                       </div>
-                      <div className="grow min-width-zero">
-                        <Flex align="center" gap="2">
-                          <strong>{skill.name}</strong>
-                          <Badge color="green">
-                            <Check />规范有效
-                          </Badge>
-                        </Flex>
-                        <Text as="div" size="2" color="gray" className="truncate">
-                          {skill.description}
-                        </Text>
-                        <Text as="div" size="1" color="gray">
-                          {skill.fileCount} 个文件 · {formatBytes(skill.totalBytes)} · SHA-256{" "}
-                          {skill.contentHash.slice(0, 10)}
+                      <div className="list-toolbar">
+                        <Checkbox
+                          checked={
+                            inspection.skills.length > 0 &&
+                            selectedSkillIds.length === inspection.skills.length
+                          }
+                          onCheckedChange={(value) => {
+                            setSelectedSkillIds(
+                              value
+                                ? inspection.skills.map((skill) => skill.skillId)
+                                : [],
+                            );
+                            setPlan(undefined);
+                          }}
+                        />
+                        <Text size="1" color="gray">
+                          已选 {selectedSkillIds.length} / {inspection.skills.length}
                         </Text>
                       </div>
-                    </div>
+                      <div className="source-skill-list">
+                        {filteredSkills.map((skill) => (
+                          <label className="source-skill-row" key={skill.skillId}>
+                            <Checkbox
+                              checked={selectedSkillIds.includes(skill.skillId)}
+                              onCheckedChange={(value) =>
+                                setSkillSelected(skill.skillId, Boolean(value))
+                              }
+                            />
+                            <div className="skill-icon">
+                              <Code size={18} />
+                            </div>
+                            <div className="grow min-width-zero">
+                              <Flex align="center" gap="2" wrap="wrap">
+                                <strong>{skill.name}</strong>
+                                <Badge color="green" variant="soft">
+                                  <Check />
+                                  有效
+                                </Badge>
+                                {skill.hasScripts && (
+                                  <Badge color="amber" variant="soft">
+                                    <ShieldWarning />
+                                    含脚本
+                                  </Badge>
+                                )}
+                              </Flex>
+                              <Text as="div" size="1" color="gray" className="truncate">
+                                {skill.relativePath} · {skill.fileCount} 个文件 ·{" "}
+                                {formatBytes(skill.totalBytes)} ·{" "}
+                                {skill.contentHash.slice(0, 10)}
+                              </Text>
+                              <Text as="div" size="1" color="gray" className="truncate">
+                                {skill.description}
+                              </Text>
+                            </div>
+                          </label>
+                        ))}
+                        {inspection.rejected.map((rejected) => (
+                          <div className="source-skill-row rejected" key={rejected.relativePath}>
+                            <Checkbox disabled />
+                            <div className="skill-icon">
+                              <WarningCircle size={18} />
+                            </div>
+                            <div className="grow min-width-zero">
+                              <strong>{rejected.relativePath}</strong>
+                              <Text as="div" size="1" color="red">
+                                {rejected.reason}
+                              </Text>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {inspection.warnings.map((warning) => (
+                        <Callout.Root color="amber" size="1" key={warning}>
+                          <Callout.Icon>
+                            <ShieldWarning />
+                          </Callout.Icon>
+                          <Callout.Text>{warning}</Callout.Text>
+                        </Callout.Root>
+                      ))}
+                    </>
                   )}
-                  {skill?.warnings.map((warning) => (
-                    <Callout.Root color="amber" size="1" key={warning}>
-                      <Callout.Icon>
-                        <ShieldWarning />
-                      </Callout.Icon>
-                      <Callout.Text>{warning}</Callout.Text>
-                    </Callout.Root>
-                  ))}
                 </section>
 
-                <section className={`panel ${skill ? "" : "disabled-panel"}`}>
+                <section className={`panel ${inspection ? "" : "disabled-panel"}`}>
                   <div className="panel-title">
                     <div className="number">2</div>
                     <div>
-                      <strong>范围与目标</strong>
+                      <strong>分配到 IDE</strong>
                       <Text as="div" size="1" color="gray">
-                        目标路径由原生适配器生成
+                        新安装仅写入全局目录，IDE 默认全部不选
                       </Text>
                     </div>
                   </div>
-                  <RadioGroup.Root
-                    value={scope}
-                    onValueChange={(value) => {
-                      setScope(value as InstallScope);
-                      setPlan(undefined);
-                    }}
-                    className="scope-row"
-                    disabled={!skill}
-                  >
-                    <RadioGroup.Item value="global">
-                      <Text size="2" weight="medium">
-                        全局
-                      </Text>
-                      <Text size="1" color="gray">
-                        当前用户的所有项目
-                      </Text>
-                    </RadioGroup.Item>
-                    <RadioGroup.Item value="project">
-                      <Text size="2" weight="medium">
-                        项目
-                      </Text>
-                      <Text size="1" color="gray">
-                        仅指定项目目录
-                      </Text>
-                    </RadioGroup.Item>
-                  </RadioGroup.Root>
-                  {scope === "project" && (
-                    <Flex gap="2" className="project-input-row">
-                      <TextField.Root
-                        className="grow"
-                        value={projectPath}
-                        placeholder="选择项目根目录"
-                        onChange={(event) => setProjectPath(event.target.value)}
-                      />
-                      <Button variant="soft" onClick={() => void chooseFolder("project")}>
-                        浏览…
-                      </Button>
-                    </Flex>
-                  )}
-                  <div className="client-list">
-                    {activeClients.length === 0 && busy !== "scan" && (
-                      <div className="empty-inline">
-                        <Desktop size={24} />
-                        暂未检测到支持的 Agent
+                  {busy === "scan" && clients.length === 0 ? (
+                    <LoadingRows />
+                  ) : selectedSkills.length === 0 ? (
+                    <div className="empty-inline">请先选择至少一个有效 Skill</div>
+                  ) : (
+                    <div className="assignment-matrix">
+                      <div className="matrix-head">
+                        <span>Skill</span>
+                        {targetClients.map((client) => (
+                          <button
+                            disabled={!client.supportsSkills}
+                            key={client.id}
+                            onClick={() => toggleClientColumn(client)}
+                            title={client.notes.join("；")}
+                          >
+                            <span>{client.name}</span>
+                            <small>
+                              {client.supportsSkills
+                                ? "整列选择"
+                                : detectionLabel[client.status]}
+                            </small>
+                          </button>
+                        ))}
                       </div>
-                    )}
-                    {activeClients.map((client) => {
-                      const checked = selected.includes(client.id);
-                      return (
-                        <label
-                          className={`client-row ${client.supportsSkills ? "" : "unavailable"}`}
-                          key={client.id}
-                        >
-                          <Checkbox
-                            checked={checked}
-                            disabled={!client.supportsSkills || !skill}
-                            onCheckedChange={(value) => {
-                              setSelected((current) =>
-                                value
-                                  ? [...current, client.id]
-                                  : current.filter((id) => id !== client.id),
-                              );
-                              setPlan(undefined);
-                            }}
-                          />
-                          <div className="client-mark">{client.name.slice(0, 1)}</div>
-                          <div className="grow min-width-zero">
-                            <Flex align="center" gap="2">
-                              <Text size="2" weight="medium">
-                                {client.name}
-                              </Text>
-                              <StatusBadge client={client} />
-                            </Flex>
-                            <Text as="div" size="1" color="gray" className="truncate mono">
-                              {scope === "global"
-                                ? shortPath(client.globalSkillsPath)
-                                : client.projectSkillsPath}
-                            </Text>
+                      {selectedSkills.map((skill) => (
+                        <div className="matrix-row" key={skill.skillId}>
+                          <div className="matrix-skill">
+                            <strong>{skill.name}</strong>
+                            <small>{skill.contentHash.slice(0, 8)}</small>
                           </div>
-                          <Text size="1" color="gray">
-                            {client.version ?? ""}
-                          </Text>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  <Flex justify="end">
+                          <div className="matrix-targets">
+                            {targetClients.map((client) => (
+                              <label
+                                className={!client.supportsSkills ? "unavailable" : ""}
+                                key={client.id}
+                                title={client.notes.join("；")}
+                              >
+                                <Checkbox
+                                  checked={assignments[skill.skillId]?.includes(client.id)}
+                                  disabled={!client.supportsSkills}
+                                  onCheckedChange={(value) =>
+                                    toggleAssignment(
+                                      skill.skillId,
+                                      client.id,
+                                      Boolean(value),
+                                    )
+                                  }
+                                />
+                                <span>{client.name}</span>
+                                {!client.supportsSkills && (
+                                  <small>{detectionLabel[client.status]}</small>
+                                )}
+                              </label>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {duplicateNames.length > 0 && (
+                    <Callout.Root color="red" size="1">
+                      <Callout.Icon>
+                        <WarningCircle />
+                      </Callout.Icon>
+                      <Callout.Text>
+                        同名但内容不同，必须只保留一个：{duplicateNames.join("、")}
+                      </Callout.Text>
+                    </Callout.Root>
+                  )}
+                  <Flex justify="between" align="center" gap="3">
+                    <Text size="1" color="gray">
+                      每个已选 Skill 至少分配一个可用 IDE。
+                    </Text>
                     <Button
                       disabled={
-                        !skill ||
-                        selected.length === 0 ||
                         Boolean(busy) ||
-                        (scope === "project" && !projectPath)
+                        !assignmentsComplete ||
+                        duplicateNames.length > 0
                       }
                       onClick={() => void createPlan()}
                     >
@@ -535,83 +777,94 @@ export default function App() {
                       <div>
                         <strong>确认物理写入</strong>
                         <Text as="div" size="1" color="gray">
-                          {plan.entries.length} 个唯一目录；共享路径已合并
+                          {plan.skills.length} 个 Skill，{plan.entries.length} 个目标路径
                         </Text>
                       </div>
                     </div>
-                    {plan.entries.map((entry) => {
-                      const needsOverwrite =
-                        entry.conflict === "conflict" ||
-                        entry.conflict === "updateAvailable";
-                      return (
-                        <div className="plan-entry" key={entry.resolvedPath}>
-                          <HardDrives size={19} />
-                          <div className="grow min-width-zero">
-                            <code>{shortPath(entry.resolvedPath)}</code>
-                            <div className="consumer-line">
-                              {entry.consumers.map((id) => (
-                                <Badge key={id} variant="soft">
-                                  {clients.find((client) => client.id === id)?.name ?? id}
+                    <div className="plan-list">
+                      {plan.entries.map((entry) => {
+                        const needsOverwrite = ["conflict", "updateAvailable"].includes(
+                          entry.conflict,
+                        );
+                        return (
+                          <div className="plan-entry" key={entry.entryId}>
+                            <div className="grow min-width-zero">
+                              <Flex align="center" gap="2" wrap="wrap">
+                                <strong>{entry.skillName}</strong>
+                                <Badge
+                                  color={
+                                    ["conflict", "notWritable"].includes(entry.conflict)
+                                      ? "red"
+                                      : entry.conflict === "updateAvailable"
+                                        ? "orange"
+                                        : entry.conflict === "identical"
+                                          ? "gray"
+                                          : "green"
+                                  }
+                                >
+                                  {conflictLabel[entry.conflict]}
                                 </Badge>
-                              ))}
-                              {entry.passiveConsumers.length > 0 && (
-                                <Text size="1" color="amber">
-                                  可能被 {entry.passiveConsumers.join("、")} 被动发现
-                                </Text>
-                              )}
+                              </Flex>
+                              <Text as="div" size="1" className="mono truncate">
+                                {shortPath(entry.resolvedPath)}
+                              </Text>
+                              <div className="consumer-line">
+                                {entry.consumers.map((id) => (
+                                  <Badge key={id} variant="soft">
+                                    {clients.find((client) => client.id === id)?.name ?? id}
+                                  </Badge>
+                                ))}
+                                {entry.passiveConsumers.length > 0 && (
+                                  <Text size="1" color="amber">
+                                    可能被{" "}
+                                    {entry.passiveConsumers
+                                      .map(
+                                        (id) =>
+                                          clients.find((client) => client.id === id)
+                                            ?.name ?? id,
+                                      )
+                                      .join("、")}
+                                    被动发现
+                                  </Text>
+                                )}
+                              </div>
                             </div>
+                            {needsOverwrite && (
+                              <label className="overwrite">
+                                <Checkbox
+                                  checked={overwrites.includes(entry.entryId)}
+                                  onCheckedChange={(value) =>
+                                    setOverwrites((current) =>
+                                      value
+                                        ? [...current, entry.entryId]
+                                        : current.filter((id) => id !== entry.entryId),
+                                    )
+                                  }
+                                />
+                                覆盖并备份
+                              </label>
+                            )}
                           </div>
-                          <Badge
-                            color={
-                              entry.conflict === "conflict"
-                                ? "red"
-                                : entry.conflict === "notWritable"
-                                  ? "red"
-                                  : entry.conflict === "identical"
-                                    ? "gray"
-                                    : entry.conflict === "updateAvailable"
-                                      ? "orange"
-                                      : "green"
-                            }
-                          >
-                            {conflictLabel[entry.conflict]}
-                          </Badge>
-                          {needsOverwrite && (
-                            <label className="overwrite">
-                              <Checkbox
-                                checked={overwrites.includes(entry.resolvedPath)}
-                                onCheckedChange={(value) =>
-                                  setOverwrites((current) =>
-                                    value
-                                      ? [...current, entry.resolvedPath]
-                                      : current.filter((path) => path !== entry.resolvedPath),
-                                  )
-                                }
-                              />
-                              覆盖并备份
-                            </label>
-                          )}
-                        </div>
-                      );
-                    })}
+                        );
+                      })}
+                    </div>
                     <Flex justify="between" align="center">
                       <Text size="1" color="gray">
-                        写入前不会执行任何 Skill 脚本。
+                        安装期间不会执行 Skill 中的脚本。
                       </Text>
                       <Button
                         disabled={
                           Boolean(busy) ||
                           plan.entries.some(
                             (entry) =>
-                              (entry.conflict === "conflict" ||
-                                entry.conflict === "updateAvailable") &&
-                              !overwrites.includes(entry.resolvedPath),
+                              ["conflict", "updateAvailable"].includes(entry.conflict) &&
+                              !overwrites.includes(entry.entryId),
                           )
                         }
                         onClick={() => void applyPlan()}
                       >
                         {busy === "apply" && <Spinner size="1" />}
-                        执行安装
+                        执行批量安装
                       </Button>
                     </Flex>
                   </section>
@@ -625,10 +878,11 @@ export default function App() {
                       </div>
                       <strong>操作结果</strong>
                     </div>
-                    {results.map((result) => (
-                      <div className="result-row" key={result.path}>
+                    {results.map((result, index) => (
+                      <div className="result-row" key={result.entryId ?? `${result.path}-${index}`}>
                         <span className={result.success ? "result-dot ok" : "result-dot failed"} />
-                        <code>{shortPath(result.path)}</code>
+                        <strong>{result.skillName ?? "Skill"}</strong>
+                        <code className="truncate">{shortPath(result.path)}</code>
                         <span className="grow" />
                         <Text size="1" color={result.success ? "green" : "red"}>
                           {result.message}
@@ -641,14 +895,14 @@ export default function App() {
             )}
 
             {page === "manage" && (
-              <div className="page">
+              <div className="page manage-page">
                 <div className="page-heading">
                   <div>
                     <Text as="div" size="5" weight="bold">
-                      已安装与备份
+                      IDE Skill 库存
                     </Text>
                     <Text as="div" size="2" color="gray">
-                      仅管理由本工具追踪的物理安装。
+                      查看每个 IDE 的直接安装、外部内容和被动发现项。
                     </Text>
                   </div>
                   <Button variant="soft" onClick={() => void checkUpdates()}>
@@ -656,66 +910,92 @@ export default function App() {
                     检查更新
                   </Button>
                 </div>
-                <section className="panel">
-                  <div className="section-caption">
-                    <strong>物理安装</strong>
-                    <Badge variant="soft">{installations.length}</Badge>
+                <section className="panel inventory-controls">
+                  <SearchBox
+                    value={inventorySearch}
+                    onChange={setInventorySearch}
+                    placeholder="搜索名称或路径"
+                  />
+                  <div className="filter-tabs" aria-label="库存筛选">
+                    {(
+                      [
+                        ["all", "全部"],
+                        ["managed", "受管理"],
+                        ["external", "外部"],
+                        ["issues", "异常"],
+                      ] as const
+                    ).map(([value, label]) => (
+                      <button
+                        className={inventoryFilter === value ? "selected" : ""}
+                        key={value}
+                        onClick={() => setInventoryFilter(value)}
+                      >
+                        {label}
+                      </button>
+                    ))}
                   </div>
-                  {installations.length === 0 ? (
-                    <div className="empty-state">
-                      <Package size={34} />
-                      <strong>还没有受管理的 Skill</strong>
-                      <Text size="2" color="gray">
-                        完成一次安装后会在这里显示。
-                      </Text>
-                    </div>
-                  ) : (
-                    installations.map((item) => {
-                      const update = updates.find(
-                        (status) => status.installationId === item.id,
-                      );
-                      return (
-                        <div className="installation-row" key={item.id}>
-                          <div className="skill-icon">
-                            <Code size={18} />
-                          </div>
-                          <div className="grow min-width-zero">
-                            <Flex align="center" gap="2">
-                              <strong>{item.skillName}</strong>
-                              {item.consumers.map((id) => (
-                                <Badge key={id} variant="soft">
-                                  {clients.find((client) => client.id === id)?.name ?? id}
-                                </Badge>
-                              ))}
-                            </Flex>
-                            <Text as="div" size="1" color="gray" className="mono truncate">
-                              {shortPath(item.resolvedPath)}
-                            </Text>
-                            {update && (
-                              <Text
-                                as="div"
-                                size="1"
-                                color={update.status === "current" ? "green" : "orange"}
-                              >
-                                {update.message}
-                              </Text>
-                            )}
-                          </div>
-                          <Button
-                            size="1"
-                            variant="ghost"
-                            color="red"
-                            disabled={busy === item.id}
-                            onClick={() => void uninstall(item)}
-                          >
-                            {busy === item.id ? <Spinner size="1" /> : <Trash />}
-                            卸载
-                          </Button>
-                        </div>
-                      );
-                    })
-                  )}
                 </section>
+
+                {busy === "scan" && environment.inventories.length === 0 ? (
+                  <section className="panel">
+                    <LoadingRows />
+                  </section>
+                ) : (
+                  environment.inventories.map((inventory) => (
+                    <InventoryGroup
+                      client={clients.find((client) => client.id === inventory.clientId)}
+                      inventory={inventory}
+                      filter={inventoryFilter}
+                      search={inventorySearch}
+                      busy={busy}
+                      updates={updates}
+                      clients={clients}
+                      onAdopt={adopt}
+                      onUninstall={uninstallById}
+                      key={inventory.clientId}
+                    />
+                  ))
+                )}
+
+                {legacyInstallations.length > 0 && (
+                  <section className="panel legacy-panel">
+                    <div className="section-caption">
+                      <strong>历史项目安装</strong>
+                      <Badge color="orange" variant="soft">
+                        {legacyInstallations.length}
+                      </Badge>
+                    </div>
+                    <Text size="1" color="gray">
+                      0.2.0 不再创建项目安装；历史记录仍可检查、备份和卸载。
+                    </Text>
+                    {legacyInstallations.map((item) => (
+                      <div className="inventory-row" key={item.id}>
+                        <div className="skill-icon">
+                          <Code size={18} />
+                        </div>
+                        <div className="grow min-width-zero">
+                          <strong>{item.skillName}</strong>
+                          <Text as="div" size="1" className="mono truncate" color="gray">
+                            {shortPath(item.resolvedPath)}
+                          </Text>
+                        </div>
+                        <Button
+                          size="1"
+                          variant="ghost"
+                          color="red"
+                          disabled={busy === item.id}
+                          onClick={() =>
+                            void uninstallById(item.id, item.resolvedPath)
+                          }
+                        >
+                          <Trash />
+                          卸载
+                        </Button>
+                      </div>
+                    ))}
+                  </section>
+                )}
+
                 <section className="panel">
                   <div className="section-caption">
                     <strong>自动备份</strong>
@@ -723,7 +1003,7 @@ export default function App() {
                   </div>
                   {backups.length === 0 ? (
                     <Text as="div" size="2" color="gray" className="quiet-row">
-                      覆盖或卸载前生成的备份会出现在这里。
+                      覆盖、纳管后卸载或恢复前生成的备份会显示在这里。
                     </Text>
                   ) : (
                     backups
@@ -740,6 +1020,13 @@ export default function App() {
                               {new Date(backup.createdAt).toLocaleString()}
                             </Text>
                           </div>
+                          <Button
+                            size="1"
+                            variant="ghost"
+                            onClick={() => void api.revealInFinder(backup.backupPath)}
+                          >
+                            <FolderSimple />
+                          </Button>
                           <Button
                             size="1"
                             variant="soft"
@@ -763,7 +1050,7 @@ export default function App() {
                       诊断导出
                     </Text>
                     <Text as="div" size="2" color="gray">
-                      导出前先查看内容；用户目录会替换为 ~。
+                      导出前可预览；用户目录会替换为 ~。
                     </Text>
                   </div>
                 </div>
@@ -772,7 +1059,7 @@ export default function App() {
                     <Info />
                   </Callout.Icon>
                   <Callout.Text>
-                    包含客户端检测结果、应用版本和安装记录；不包含 Skill 内容，不上传任何数据。
+                    包含 IDE 检测、库存数量、规范和管理状态；不包含 Skill 文件内容，也不会上传数据。
                   </Callout.Text>
                 </Callout.Root>
                 <section className="panel">
@@ -786,7 +1073,8 @@ export default function App() {
                       disabled={!diagnostics}
                       onClick={() => void navigator.clipboard.writeText(diagnostics)}
                     >
-                      <Copy />复制 JSON
+                      <Copy />
+                      复制 JSON
                     </Button>
                   </Flex>
                   <Separator size="4" />
@@ -800,5 +1088,213 @@ export default function App() {
         </div>
       </div>
     </Theme>
+  );
+}
+
+function InventoryGroup({
+  client,
+  inventory,
+  filter,
+  search,
+  busy,
+  updates,
+  clients,
+  onAdopt,
+  onUninstall,
+}: {
+  client?: DetectedClient;
+  inventory: ClientSkillInventory;
+  filter: InventoryFilter;
+  search: string;
+  busy: string;
+  updates: UpdateStatus[];
+  clients: DetectedClient[];
+  onAdopt: (clientId: string, skill: InventorySkill) => Promise<void>;
+  onUninstall: (
+    installationId: string,
+    displayPath: string,
+    force?: boolean,
+  ) => Promise<void>;
+}) {
+  if (!client) return null;
+  const allSkills = [...inventory.directSkills, ...inventory.passiveSkills];
+  const query = search.trim().toLowerCase();
+  const visible = allSkills.filter((skill) => {
+    const matchesSearch =
+      !query ||
+      skill.name.toLowerCase().includes(query) ||
+      skill.resolvedPath.toLowerCase().includes(query);
+    const matchesFilter =
+      filter === "all" ||
+      (filter === "managed" &&
+        ["toolManaged", "adopted", "modified"].includes(skill.managementStatus)) ||
+      (filter === "external" && skill.managementStatus === "external") ||
+      (filter === "issues" &&
+        ["modified", "unsafe"].includes(skill.managementStatus));
+    return matchesSearch && matchesFilter;
+  });
+  const count = (status: SkillManagementStatus[]) =>
+    allSkills.filter((skill) => status.includes(skill.managementStatus)).length;
+
+  return (
+    <section className="panel inventory-group">
+      <div className="inventory-heading">
+        <div className="client-mark">{client.name.slice(0, 1)}</div>
+        <div className="grow min-width-zero">
+          <Flex align="center" gap="2" wrap="wrap">
+            <strong>{client.name}</strong>
+            <StatusBadge client={client} />
+            {client.version && <Text size="1" color="gray">{client.version}</Text>}
+          </Flex>
+          <Text as="div" size="1" className="mono truncate" color="gray">
+            {shortPath(inventory.rootPath)}
+          </Text>
+        </div>
+        <div className="inventory-counts">
+          <Badge color="green" variant="soft">
+            管理 {count(["toolManaged", "adopted", "modified"])}
+          </Badge>
+          <Badge color="gray" variant="soft">
+            外部 {count(["external"])}
+          </Badge>
+          <Badge color="red" variant="soft">
+            异常 {count(["modified", "unsafe"])}
+          </Badge>
+          <Badge color="blue" variant="soft">
+            被动 {count(["passive"])}
+          </Badge>
+        </div>
+      </div>
+      {inventory.scanError ? (
+        <Callout.Root color="red" size="1">
+          <Callout.Icon>
+            <WarningCircle />
+          </Callout.Icon>
+          <Callout.Text>目录读取失败：{inventory.scanError}</Callout.Text>
+        </Callout.Root>
+      ) : visible.length === 0 ? (
+        <div className="empty-inline">
+          {allSkills.length === 0 ? "Skill 目录为空" : "没有符合筛选条件的 Skill"}
+        </div>
+      ) : (
+        <div className="inventory-list">
+          {visible.map((skill) => {
+            const status = inventoryStatus[skill.managementStatus];
+            const update = updates.find(
+              (item) => item.installationId === skill.installationId,
+            );
+            const passiveClient = clients.find(
+              (item) => item.id === skill.passiveFromClientId,
+            );
+            return (
+              <div className="inventory-row" key={skill.inventoryId}>
+                <div className="skill-icon">
+                  <Code size={18} />
+                </div>
+                <div className="grow min-width-zero">
+                  <Flex align="center" gap="2" wrap="wrap">
+                    <strong>{skill.name}</strong>
+                    <Badge color={status.color} variant="soft">
+                      {status.label}
+                    </Badge>
+                    {skill.validity === "nonConforming" && (
+                      <Badge color="orange" variant="soft">
+                        非规范
+                      </Badge>
+                    )}
+                  </Flex>
+                  <Text as="div" size="1" className="mono truncate" color="gray">
+                    {shortPath(skill.resolvedPath)}
+                  </Text>
+                  {passiveClient && (
+                    <Text as="div" size="1" color="blue">
+                      来自 {passiveClient.name} 共享目录，仅供查看
+                    </Text>
+                  )}
+                  {skill.issues.map((issue) => (
+                    <Text as="div" size="1" color="orange" key={issue}>
+                      {issue}
+                    </Text>
+                  ))}
+                  {update && (
+                    <Text
+                      as="div"
+                      size="1"
+                      color={update.status === "current" ? "green" : "orange"}
+                    >
+                      {update.message}
+                    </Text>
+                  )}
+                </div>
+                <div className="row-actions">
+                  <Button
+                    size="1"
+                    variant="ghost"
+                    aria-label={`复制 ${skill.name} 路径`}
+                    onClick={() =>
+                      void navigator.clipboard.writeText(skill.resolvedPath)
+                    }
+                  >
+                    <Copy />
+                  </Button>
+                  {skill.managementStatus !== "passive" && (
+                    <Button
+                      size="1"
+                      variant="ghost"
+                      aria-label={`在 Finder 中显示 ${skill.name}`}
+                      onClick={() => void api.revealInFinder(skill.resolvedPath)}
+                    >
+                      <FolderSimple />
+                    </Button>
+                  )}
+                  {skill.managementStatus === "external" && (
+                    <Button
+                      size="1"
+                      variant="soft"
+                      disabled={busy === skill.inventoryId}
+                      onClick={() => void onAdopt(client.id, skill)}
+                    >
+                      纳入管理
+                    </Button>
+                  )}
+                  {skill.installationId &&
+                    ["toolManaged", "adopted", "modified"].includes(
+                      skill.managementStatus,
+                    ) && (
+                      <Button
+                        size="1"
+                        variant="ghost"
+                        color="red"
+                        disabled={busy === skill.installationId}
+                        onClick={() => {
+                          const consumers = skill.consumers
+                            .map(
+                              (id) =>
+                                clients.find((item) => item.id === id)?.name ?? id,
+                            )
+                            .join("、");
+                          if (
+                            window.confirm(
+                              `卸载 ${skill.name}？\n\n将影响：${consumers}\n卸载前会自动备份。`,
+                            )
+                          ) {
+                            void onUninstall(
+                              skill.installationId!,
+                              skill.resolvedPath,
+                            );
+                          }
+                        }}
+                      >
+                        <Trash />
+                        卸载
+                      </Button>
+                    )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }
