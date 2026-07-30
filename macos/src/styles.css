@@ -47,6 +47,7 @@ input {
 .titlebar-spacer,
 .grow {
   flex: 1;
+  min-width: 0;
 }
 
 .workspace {
@@ -116,14 +117,18 @@ input {
 }
 
 .content {
-  overflow: auto;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   background:
     radial-gradient(circle at 80% -20%, var(--accent-a3), transparent 34%),
     var(--gray-2);
 }
 
 .page {
-  width: min(860px, calc(100% - 48px));
+  width: calc(100% - 48px);
+  max-width: 860px;
+  min-width: 0;
   margin: 0 auto;
   padding: 28px 0 48px;
   display: grid;
@@ -134,16 +139,20 @@ input {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
   min-height: 50px;
 }
 
 .step-indicator {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 6px;
   padding-top: 4px;
   color: var(--gray-8);
   font-size: 11px;
+  white-space: nowrap;
 }
 
 .step-indicator svg {
@@ -160,6 +169,7 @@ input {
 }
 
 .panel {
+  min-width: 0;
   display: grid;
   gap: 13px;
   padding: 16px;
@@ -167,6 +177,11 @@ input {
   border-radius: 10px;
   background: color-mix(in srgb, var(--color-panel-solid) 94%, transparent);
   box-shadow: 0 1px 2px var(--black-a3);
+}
+
+.source-input-row,
+.project-input-row {
+  min-width: 0;
 }
 
 .disabled-panel {
@@ -265,6 +280,7 @@ input {
 }
 
 .client-list {
+  min-width: 0;
   border: 1px solid var(--gray-a5);
   border-radius: 8px;
   overflow: hidden;
@@ -427,7 +443,7 @@ code {
   min-width: 0;
 }
 
-@media (max-width: 780px) {
+@media (max-width: 1000px) {
   .workspace {
     grid-template-columns: 168px minmax(0, 1fr);
   }
@@ -438,6 +454,26 @@ code {
 
   .step-indicator {
     display: none;
+  }
+}
+
+@media (max-width: 920px) {
+  .workspace {
+    grid-template-columns: 156px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .nav-item {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .scope-row {
+    grid-template-columns: 1fr;
   }
 }
 

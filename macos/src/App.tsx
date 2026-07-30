@@ -359,7 +359,7 @@ export default function App() {
                       <GithubLogo />GitHub
                     </button>
                   </div>
-                  <Flex gap="2">
+                  <Flex gap="2" className="source-input-row">
                     <TextField.Root
                       className="grow"
                       value={sourceValue}
@@ -453,7 +453,7 @@ export default function App() {
                     </RadioGroup.Item>
                   </RadioGroup.Root>
                   {scope === "project" && (
-                    <Flex gap="2">
+                    <Flex gap="2" className="project-input-row">
                       <TextField.Root
                         className="grow"
                         value={projectPath}

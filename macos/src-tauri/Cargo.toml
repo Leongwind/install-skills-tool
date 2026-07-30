@@ -1,6 +1,6 @@
 [package]
 name = "skill-installer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Install Agent Skills across macOS coding agents"
 authors = ["Leongwind"]
 edition = "2021"

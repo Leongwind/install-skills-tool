@@ -34,6 +34,23 @@ fn first_app(names: &[&str], home: &Path) -> Option<PathBuf> {
         .find(|path| path.is_dir())
 }
 
+fn is_codex_bundle_id(bundle_id: Option<&str>) -> bool {
+    bundle_id == Some("com.openai.codex")
+}
+
+fn first_codex_app(home: &Path) -> Option<PathBuf> {
+    ["Codex", "ChatGPT"]
+        .iter()
+        .flat_map(|name| app_candidates(name, home))
+        .find(|path| path.is_dir() && is_codex_bundle_id(app_metadata(path).0.as_deref()))
+}
+
+fn embedded_codex_cli(application: Option<&Path>) -> Option<PathBuf> {
+    application
+        .map(|path| path.join("Contents/Resources/codex"))
+        .filter(|path| path.is_file())
+}
+
 fn app_metadata(path: &Path) -> (Option<String>, Option<String>, Option<String>) {
     let plist_path = path.join("Contents/Info.plist");
     let plist = Value::from_file(plist_path).ok();
@@ -76,7 +93,7 @@ pub fn scan_clients() -> Vec<DetectedClient> {
         .into_iter()
         .map(|adapter| {
             let (app_names, cli_name, config_relative): (&[&str], &str, &str) = match adapter.id {
-                "codex" => (&["Codex"], "codex", ".codex"),
+                "codex" => (&["Codex", "ChatGPT"], "codex", ".codex"),
                 "claude-code" => (&["Claude"], "claude", ".claude"),
                 "kiro" => (&["Kiro"], "kiro", ".kiro"),
                 "cursor" => (&["Cursor"], "cursor", ".cursor"),
@@ -85,8 +102,12 @@ pub fn scan_clients() -> Vec<DetectedClient> {
                 "trae-china" => (&["Trae CN", "TRAE CN", "Trae"], "trae-cn", ".trae-cn"),
                 _ => (&[], "", ""),
             };
-            let mut application = first_app(app_names, &home);
-            let cli = if cli_name.is_empty() {
+            let mut application = if adapter.id == "codex" {
+                first_codex_app(&home)
+            } else {
+                first_app(app_names, &home)
+            };
+            let mut cli = if cli_name.is_empty() {
                 None
             } else {
                 find_cli(cli_name)
@@ -112,6 +133,17 @@ pub fn scan_clients() -> Vec<DetectedClient> {
                     if !is_china {
                         application = None;
                     }
+                }
+            }
+
+            if adapter.id == "codex" {
+                if cli.is_none() {
+                    cli = embedded_codex_cli(application.as_deref());
+                }
+                if application.as_ref().is_some_and(|path| {
+                    path.file_stem().and_then(|name| name.to_str()) == Some("ChatGPT")
+                }) {
+                    notes.push("通过 bundle ID com.openai.codex 识别 Codex Desktop".to_string());
                 }
             }
 
@@ -167,6 +199,31 @@ mod tests {
         assert!(!version_supported(Some("3.5.24"), "3.5.25"));
         assert!(version_supported(Some("3.5.25"), "3.5.25"));
         assert!(!version_supported(Some("3.3.24"), "3.3.25"));
+    }
+
+    #[test]
+    fn codex_desktop_requires_the_codex_bundle_id() {
+        assert!(is_codex_bundle_id(Some("com.openai.codex")));
+        assert!(!is_codex_bundle_id(Some("com.openai.chat")));
+        assert!(!is_codex_bundle_id(None));
+    }
+
+    #[test]
+    fn local_codex_desktop_is_recognized_when_present() {
+        let application = Path::new("/Applications/ChatGPT.app");
+        if application.is_dir() && is_codex_bundle_id(app_metadata(application).0.as_deref()) {
+            let clients = scan_clients();
+            let codex = clients
+                .iter()
+                .find(|client| client.id == "codex")
+                .expect("Codex adapter exists");
+            assert_eq!(codex.status, DetectionStatus::Installed);
+            assert_eq!(
+                codex.application_path.as_deref(),
+                Some("/Applications/ChatGPT.app")
+            );
+            assert!(codex.supports_skills);
+        }
     }
 
     #[test]
