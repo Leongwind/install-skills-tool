@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 
 pub mod adapters;
 pub mod domain;
+pub mod inventory;
+pub mod skill;
+pub mod storage;
 pub mod windows;
 
 fn data_dir_from(appdata: &Path) -> PathBuf {
