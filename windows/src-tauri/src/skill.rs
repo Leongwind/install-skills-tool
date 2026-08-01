@@ -312,6 +312,25 @@ async fn download_github(
         .user_agent("Skill-Installer-Windows/0.1")
         .build()
         .map_err(|error| error.to_string())?;
+    let commit_sha = match client
+        .get(format!(
+            "https://api.github.com/repos/{}/{}/commits/{}",
+            location.owner, location.repository, location.reference
+        ))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|json| {
+                json.get("sha")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            }),
+        _ => None,
+    };
     let url = format!(
         "https://codeload.github.com/{}/{}/zip/{}",
         location.owner, location.repository, location.reference
@@ -350,6 +369,7 @@ async fn download_github(
             repository: Some(location.repository),
             reference: Some(location.reference),
             subpath: Some(location.subpath),
+            commit_sha,
             ..SkillSourceDetails::default()
         },
     ))
@@ -390,7 +410,14 @@ fn inspect_prepared(
     root: PathBuf,
     details: SkillSourceDetails,
 ) -> Result<SourceInspection, String> {
-    let (skills, rejected, warnings) = discover_skills(&root, source.clone(), details)?;
+    let (skills, rejected, mut warnings) = discover_skills(&root, source.clone(), details)?;
+    if matches!(&source, SkillSource::Github { .. })
+        && skills
+            .iter()
+            .all(|skill| skill.source_details.commit_sha.is_none())
+    {
+        warnings.push("GitHub commit SHA 暂不可用，更新检查将使用当前 ref。".to_string());
+    }
     Ok(SourceInspection {
         inspection_id: Uuid::new_v4().to_string(),
         source,
