@@ -33,6 +33,22 @@ and GitHub Actions. The verified local DMG SHA-256 was
 | Commit | Change |
 |---|---|
 | `f5996ba` | Created the independent `windows/` directory. |
+| `9e89a1c` | Added project history, plan snapshots, and Win11 handoff documents. |
+| `69ced78` | Bootstrapped the independent Windows Tauri 2 application. |
+| `951b0a1` | Added Windows client detection, registry inputs, and seven native adapters. |
+| `c768c72` | Added directory, ZIP, GitHub source inspection and per-IDE inventory. |
+| `bc08505` | Added assignment planning, global installation, adoption, backups, restore, and IPC. |
+| `146354f` | Added the responsive Windows batch installation and inventory interface. |
+| `50501c0` | Added the Windows-only synthetic environment integration test and NSIS CI workflow. |
+| `a3c6b74` | Fixed a Windows-only Clippy warning in reparse-point detection. |
+| `89cb9ed` | Recorded GitHub source commit SHAs with a clear API fallback warning. |
 
-Further Windows milestones must be appended here as soon as they are pushed.
+The synthetic environment test is deliberately not described as a real IDE compatibility
+test. Real Cursor and Kiro visibility remains a Windows 11 manual acceptance item.
 
+Windows workflow run
+[`30713093329`](https://github.com/Leongwind/install-skills-tool/actions/runs/30713093329)
+passed frontend build, React tests, Rust format, Windows Clippy, Windows unit and synthetic
+integration tests, NSIS packaging, and artifact upload for commit `89cb9ed`. The verified
+installer SHA-256 is
+`a78cc1b366921d265bd406d3cd3d07024e5d0f91585c5bb0af800a6c868b3640`.

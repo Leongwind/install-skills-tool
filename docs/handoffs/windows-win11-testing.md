@@ -4,11 +4,12 @@ This file is completed when Windows 0.1.0 CI produces the NSIS installer.
 
 ## Build under test
 
-- Commit SHA: `PENDING`
-- GitHub Actions run: `PENDING`
+- Commit SHA: `89cb9ed2c9e31fed3830d943cfcb99252ebbbf02`
+- GitHub Actions run: [Windows run 30713093329](https://github.com/Leongwind/install-skills-tool/actions/runs/30713093329)
 - Artifact: `skill-installer-windows-x64`
-- Installer filename: `PENDING`
-- Installer SHA-256: `PENDING`
+- Installer filename: `Skill Installer_0.1.0_x64-setup.exe`
+- Installer SHA-256: `a78cc1b366921d265bd406d3cd3d07024e5d0f91585c5bb0af800a6c868b3640`
+- Artifact retention: 14 days from the workflow run
 
 ## Required environment
 
@@ -16,6 +17,20 @@ This file is completed when Windows 0.1.0 CI produces the NSIS installer.
 - Cursor x64 and Kiro x64.
 - Access to a local multi-Skill directory or ZIP.
 - Network access for one public GitHub source test.
+
+## Install and evidence collection
+
+1. Open the GitHub Actions run recorded above and download `skill-installer-windows-x64`.
+2. Extract the artifact and verify the `.exe` SHA-256 in PowerShell:
+
+   ```powershell
+   Get-FileHash ".\Skill Installer_0.1.0_x64-setup.exe" -Algorithm SHA256
+   ```
+
+3. Keep screenshots in a dated folder outside the repository or under an ignored local
+   folder. Record their paths in the result document.
+4. Use the application's diagnosis page when a scan or operation fails. Application data
+   and logs are under `%APPDATA%\Skill Installer\`.
 
 ## Acceptance flow
 
@@ -32,6 +47,15 @@ This file is completed when Windows 0.1.0 CI produces the NSIS installer.
 11. Confirm uninstalling one Skill leaves neighboring Skills untouched.
 12. Export diagnostics and record every failure in the result template.
 
+## Known limits in 0.1.0
+
+- Windows ARM, MSIX, code signing, automatic updates, private GitHub, and project-level
+  installation are not included.
+- GitHub sources must be public.
+- An IDE may read shared `.agents\skills` content outside its own direct inventory; the
+  preview reports this as passive discovery, not as an independently written target.
+- CI uses synthetic IDE executables and directories. It cannot certify the native Skills UI.
+
 ## Claim boundary
 
 CI proves Windows build and synthetic integration behavior. Only this manual flow can
@@ -47,4 +71,3 @@ Open the repository in Codex and provide this instruction:
 > commits. Execute the Windows 11 test checklist, record results in a dated copy of the
 > template, fix only Windows-scoped failures, run relevant tests, commit intentionally,
 > and push each completed fix to `origin/main`. Do not modify `macos/`.
-
