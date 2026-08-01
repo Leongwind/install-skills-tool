@@ -1,0 +1,64 @@
+:root {
+  font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  color: var(--gray-12);
+  background: var(--gray-2);
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { min-width: 100%; min-height: 100%; margin: 0; }
+button, input { font: inherit; }
+
+.app-shell {
+  min-height: 100vh;
+  background: linear-gradient(135deg, var(--gray-1), var(--blue-2));
+}
+
+.titlebar {
+  height: 58px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--gray-a5);
+  background: color-mix(in srgb, var(--color-panel-solid) 92%, transparent);
+}
+
+.titlebar strong { font-size: 16px; }
+
+.welcome {
+  min-height: calc(100vh - 58px);
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  padding: 32px;
+  text-align: center;
+}
+
+.welcome-icon {
+  display: grid;
+  place-items: center;
+  width: 54px;
+  height: 54px;
+  color: var(--blue-11);
+  border: 1px solid var(--blue-a6);
+  border-radius: 12px;
+  background: var(--blue-a3);
+}
+
+.welcome h1 { margin: 8px 0 0; font-size: 24px; }
+.welcome p { margin: 0; color: var(--gray-11); }
+
+.security-note {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+  color: var(--green-11);
+  font-size: 13px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-shell { background: linear-gradient(135deg, var(--gray-2), var(--blue-3)); }
+}

@@ -1,0 +1,16 @@
+packages:
+  - "."
+
+minimumReleaseAge: 4320
+
+minimumReleaseAgeExclude:
+  - "@tauri-apps/*"
+  - "tauri"
+
+trustPolicy: no-downgrade
+
+trustPolicyExclude:
+  - "semver@6.3.1"
+
+allowBuilds:
+  esbuild: true
