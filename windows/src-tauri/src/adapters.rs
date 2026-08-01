@@ -1,5 +1,6 @@
 use crate::domain::{ClientEdition, DetectedClient};
 use semver::Version;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -99,6 +100,14 @@ pub fn adapters() -> Vec<Adapter> {
 
 pub fn resolve_global_target(adapter: &Adapter, user_profile: &Path, skill: &str) -> PathBuf {
     user_profile.join(adapter.global_relative).join(skill)
+}
+
+pub fn detected_map(clients: &[DetectedClient]) -> HashMap<String, DetectedClient> {
+    clients
+        .iter()
+        .cloned()
+        .map(|client| (client.id.clone(), client))
+        .collect()
 }
 
 pub fn inventory_roots(adapter: &Adapter, user_profile: &Path) -> Vec<PathBuf> {

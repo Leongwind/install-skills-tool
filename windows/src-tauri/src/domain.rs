@@ -249,3 +249,20 @@ pub struct EnvironmentScan {
     pub clients: Vec<DetectedClient>,
     pub inventories: Vec<ClientSkillInventory>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpdateState {
+    Current,
+    SourceChanged,
+    TargetModified,
+    SourceUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateStatus {
+    pub installation_id: String,
+    pub status: UpdateState,
+    pub message: String,
+}

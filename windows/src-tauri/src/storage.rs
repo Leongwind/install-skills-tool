@@ -217,6 +217,14 @@ pub fn cleanup_cache(data_dir: &Path, max_age: Duration) -> Result<(), String> {
     Ok(())
 }
 
+pub fn redact_user_profile(input: &str) -> String {
+    std::env::var("USERPROFILE")
+        .ok()
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| input.replace(&profile, "~"))
+        .unwrap_or_else(|| input.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
