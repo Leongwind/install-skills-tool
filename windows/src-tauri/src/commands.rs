@@ -3,6 +3,7 @@ use crate::{inventory, operations, skill, storage, windows};
 use chrono::Utc;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
@@ -163,8 +164,9 @@ pub fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<()
     if !reveal_is_allowed(&requested, &environment, &persisted) {
         return Err("只能在资源管理器中显示已扫描的 Skill 或备份".to_string());
     }
-    std::process::Command::new("explorer.exe")
-        .arg(explorer_select_argument(&requested))
+    let mut explorer = std::process::Command::new("explorer.exe");
+    explorer.raw_arg(explorer_select_argument(&requested));
+    explorer
         .spawn()
         .map_err(|error| format!("无法打开资源管理器: {error}"))?;
     Ok(())
