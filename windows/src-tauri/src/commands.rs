@@ -132,7 +132,7 @@ pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupRecord>, Str
 }
 
 fn explorer_select_argument(path: &Path) -> String {
-    format!(r#"/select,"{}""#, path.display())
+    format!(r#"/select,"{}""#, storage::normalized_path(path))
 }
 
 fn reveal_is_allowed(
@@ -282,9 +282,14 @@ mod tests {
 
     #[test]
     fn explorer_select_argument_quotes_the_complete_path() {
+        let expected = r#"/select,"c:\users\leong\.codex\skills\imagegen""#;
         assert_eq!(
             explorer_select_argument(Path::new(r"C:\Users\Leong\.codex\skills\imagegen")),
-            r#"/select,"C:\Users\Leong\.codex\skills\imagegen""#
+            expected
+        );
+        assert_eq!(
+            explorer_select_argument(Path::new(r"\\?\C:\Users\Leong\.codex\skills\imagegen")),
+            expected
         );
     }
 
