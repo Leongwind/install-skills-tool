@@ -131,6 +131,42 @@ pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupRecord>, Str
     Ok(storage::load_state(&state.data_dir)?.backups)
 }
 
+fn reveal_is_allowed(
+    requested: &Path,
+    environment: &EnvironmentScan,
+    persisted: &PersistedState,
+) -> bool {
+    environment.inventories.iter().any(|inventory| {
+        inventory.direct_skills.iter().any(|skill| {
+            Path::new(&skill.resolved_path)
+                .canonicalize()
+                .is_ok_and(|candidate| candidate == requested)
+        })
+    }) || persisted.backups.iter().any(|backup| {
+        Path::new(&backup.backup_path)
+            .canonicalize()
+            .is_ok_and(|candidate| candidate == requested)
+    })
+}
+
+#[tauri::command]
+pub fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let requested = PathBuf::from(&path)
+        .canonicalize()
+        .map_err(|error| format!("路径无效: {error}"))?;
+    let persisted = storage::load_state(&state.data_dir)?;
+    let environment = inventory::build_environment_scan(windows::scan_clients()?, &persisted);
+    if !reveal_is_allowed(&requested, &environment, &persisted) {
+        return Err("只能在资源管理器中显示已扫描的 Skill 或备份".to_string());
+    }
+    std::process::Command::new("explorer.exe")
+        .arg("/select,")
+        .arg(&requested)
+        .spawn()
+        .map_err(|error| format!("无法打开资源管理器: {error}"))?;
+    Ok(())
+}
+
 fn inspected_update<'a>(
     inspection: &'a SourceInspection,
     installation: &PhysicalInstallation,
@@ -234,4 +270,48 @@ pub fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> 
     });
     let raw = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
     Ok(storage::redact_user_profile(&raw))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn reveal_allowlist_accepts_scanned_skills_and_rejects_unrelated_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let unrelated_root = tempfile::tempdir().unwrap();
+        let skill_path = root.path().join("existing");
+        fs::create_dir_all(&skill_path).unwrap();
+        fs::write(
+            skill_path.join("SKILL.md"),
+            "---\nname: existing\ndescription: Fixture\n---\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "cursor".to_string(),
+            name: "Cursor".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let persisted = PersistedState::default();
+        let environment = inventory::build_environment_scan(vec![client], &persisted);
+
+        assert!(reveal_is_allowed(
+            &skill_path.canonicalize().unwrap(),
+            &environment,
+            &persisted
+        ));
+        assert!(!reveal_is_allowed(
+            &unrelated_root.path().canonicalize().unwrap(),
+            &environment,
+            &persisted
+        ));
+    }
 }

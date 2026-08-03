@@ -22,6 +22,7 @@ export const backend = {
     invoke<Installation>("adopt_external_skill", { clientId, resolvedPath }),
   listInstallations: () => invoke<Installation[]>("list_installations"),
   listBackups: () => invoke<Backup[]>("list_backups"),
+  revealInExplorer: (path: string) => invoke<void>("reveal_in_explorer", { path }),
   uninstallInstallation: (installationId: string, force = false) =>
     invoke<OperationResult>("uninstall_installation", { installationId, force }),
   restoreBackup: (backupId: string) => invoke<OperationResult>("restore_backup", { backupId }),

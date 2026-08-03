@@ -49,6 +49,7 @@ pub fn run() {
             commands::adopt_external_skill,
             commands::list_installations,
             commands::list_backups,
+            commands::reveal_in_explorer,
             commands::check_updates,
             commands::uninstall_installation,
             commands::restore_backup,

@@ -203,6 +203,15 @@ export default function App() {
     }
   };
 
+  const runAction = async (action: () => Promise<unknown>) => {
+    setError("");
+    try {
+      await action();
+    } catch (cause) {
+      setError(errorText(cause));
+    }
+  };
+
   const inventoryCount = environment?.inventories.reduce(
     (total, item) => total + item.directSkills.length,
     0,
@@ -270,6 +279,7 @@ export default function App() {
               filter={inventoryFilter}
               setFilter={setInventoryFilter}
               busy={busy}
+              onReveal={(path) => runAction(() => backend.revealInExplorer(path))}
               onAdopt={(clientId, path) => actAndRefresh(() => backend.adoptExternalSkill(clientId, path))}
               onUninstall={(id) => actAndRefresh(async () => {
                 const first = await backend.uninstallInstallation(id);
@@ -389,10 +399,10 @@ function InstallPage(props: InstallPageProps) {
   </section>;
 }
 
-function InventoryPage({ environment, query, setQuery, filter, setFilter, busy, onAdopt, onUninstall }: {
+function InventoryPage({ environment, query, setQuery, filter, setFilter, busy, onReveal, onAdopt, onUninstall }: {
   environment?: EnvironmentScan; query: string; setQuery: (value: string) => void;
   filter: InventoryFilter; setFilter: (value: InventoryFilter) => void; busy: boolean;
-  onAdopt: (clientId: string, path: string) => Promise<void>; onUninstall: (id: string) => Promise<void>;
+  onReveal: (path: string) => Promise<void>; onAdopt: (clientId: string, path: string) => Promise<void>; onUninstall: (id: string) => Promise<void>;
 }) {
   const visible = (status: ManagementStatus) => filter === "all"
     || (filter === "managed" && ["toolManaged", "adopted", "modified"].includes(status))
@@ -412,7 +422,7 @@ function InventoryPage({ environment, query, setQuery, filter, setFilter, busy, 
         {skills.length === 0 ? <EmptyState text={client.status === "notInstalled" ? "IDE 未安装" : "该筛选下没有 Skill"} /> : skills.map((skill) => <div className="inventory-row" key={skill.inventoryId}>
           <span className="skill-icon">&lt;/&gt;</span><div><strong>{skill.name}</strong><Badge color={skill.managementStatus === "external" ? "gray" : skill.managementStatus === "unsafe" || skill.managementStatus === "modified" ? "red" : "green"}>{managementText[skill.managementStatus]}</Badge>
             <small>{skill.resolvedPath}</small>{skill.passiveFromClientId && <span>来自 {skill.passiveFromClientId} 共享目录</span>}{skill.issues.map((issue) => <span className="warning" key={issue}>{issue}</span>)}</div>
-          <div className="row-actions">{skill.managementStatus === "external" && <button disabled={busy} onClick={() => void onAdopt(client.id, skill.resolvedPath)}>纳入管理</button>}{skill.installationId && <button className="danger" disabled={busy} onClick={() => void onUninstall(skill.installationId!)}><Trash />卸载</button>}</div>
+          <div className="row-actions">{skill.managementStatus !== "passive" && <button aria-label={`在资源管理器中显示 ${skill.name}`} title="在资源管理器中显示" onClick={() => void onReveal(skill.resolvedPath)}><FolderOpen /></button>}{skill.managementStatus === "external" && <button disabled={busy} onClick={() => void onAdopt(client.id, skill.resolvedPath)}>纳入管理</button>}{skill.installationId && <button className="danger" disabled={busy} onClick={() => void onUninstall(skill.installationId!)}><Trash />卸载</button>}</div>
         </div>)}</div>;
     })}</section>;
 }

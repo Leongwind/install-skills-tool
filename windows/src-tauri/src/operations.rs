@@ -258,9 +258,9 @@ pub fn adopt_external_skill(
         .map_err(|error| format!("Skill 路径无效: {error}"))?;
     if !roots
         .iter()
-        .any(|root| path.parent() == Some(root.as_path()))
+        .any(|root| path.starts_with(root) && path != *root)
     {
-        return Err("只能纳管已知 IDE 全局目录中的直接子目录".to_string());
+        return Err("只能纳管已知 IDE 全局目录中的 Skill".to_string());
     }
     let mut persisted = storage::load_state(data_dir)?;
     if persisted
@@ -510,6 +510,33 @@ mod tests {
     }
 
     #[test]
+    fn adoption_supports_discovered_skill_below_container_directory() {
+        let profile = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let legacy = profile.path().join(".codex/skills/.system");
+        skill(&legacy, "existing", "existing", "fixture");
+        let clients = vec![client("codex", profile.path())];
+        let path = legacy.join("existing");
+
+        let adopted =
+            adopt_external_skill("codex", &path.display().to_string(), data.path(), &clients)
+                .unwrap();
+
+        assert_eq!(adopted.provenance, InstallationProvenance::Adopted);
+        assert_eq!(
+            PathBuf::from(adopted.resolved_path),
+            path.canonicalize().unwrap()
+        );
+        assert_eq!(
+            storage::load_state(data.path())
+                .unwrap()
+                .installations
+                .len(),
+            1
+        );
+    }
+    #[test]
+
     fn synthetic_environment_applies_scans_backs_up_restores_and_uninstalls() {
         let source = tempfile::tempdir().unwrap();
         let profile = tempfile::tempdir().unwrap();

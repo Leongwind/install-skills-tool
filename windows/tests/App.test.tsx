@@ -13,6 +13,7 @@ vi.mock("../src/api", () => ({
     planInstall: vi.fn(),
     applyInstallPlan: vi.fn(),
     adoptExternalSkill: vi.fn(),
+    revealInExplorer: vi.fn(),
     uninstallInstallation: vi.fn(),
     restoreBackup: vi.fn(),
     exportDiagnostics: vi.fn(),
@@ -79,6 +80,7 @@ beforeEach(() => {
     id: "record", skillName: "review", resolvedPath: "path", contentHash: "abc",
     consumers: ["cursor"], passiveConsumers: [], provenance: "adopted",
   });
+  vi.mocked(backend.revealInExplorer).mockResolvedValue();
 });
 
 describe("Windows desktop interface", () => {
@@ -116,7 +118,11 @@ describe("Windows desktop interface", () => {
     expect(await screen.findByRole("heading", { name: /Cursor/ })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: /Windsurf/ })).not.toBeInTheDocument();
     expect(screen.getByText("review")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "纳入管理" }));
+    fireEvent.click(screen.getByRole("button", { name: "在资源管理器中显示 review" }));
+    expect(backend.revealInExplorer).toHaveBeenCalledWith("C:\\Users\\tester\\.cursor\\skills\\review");
+    const adopt = screen.getByRole("button", { name: "纳入管理" });
+    expect(adopt).toBeEnabled();
+    fireEvent.click(adopt);
     await waitFor(() => expect(backend.adoptExternalSkill).toHaveBeenCalledWith(
       "cursor", "C:\\Users\\tester\\.cursor\\skills\\review",
     ));
