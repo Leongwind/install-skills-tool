@@ -101,10 +101,10 @@ fn inventory_entry(
         }
     };
     let resolved_path = path.display().to_string();
-    let tracked = state
-        .installations
-        .iter()
-        .find(|record| record.resolved_path == resolved_path);
+    let tracked = state.installations.iter().find(|record| {
+        crate::storage::normalized_path(Path::new(&record.resolved_path))
+            == crate::storage::normalized_path(&path)
+    });
     let management_status = if validity == SkillValidity::Unsafe {
         SkillManagementStatus::Unsafe
     } else if let Some(record) = tracked {

@@ -4,26 +4,11 @@ use crate::storage;
 use chrono::Utc;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 fn normalized(path: &Path) -> String {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
-            other => result.push(other.as_os_str()),
-        }
-    }
-    let text = result.display().to_string();
-    if cfg!(windows) {
-        text.to_lowercase()
-    } else {
-        text
-    }
+    storage::normalized_path(path)
 }
 
 pub fn build_install_plan(
@@ -279,10 +264,11 @@ pub fn adopt_external_skill(
     if item.validity == SkillValidity::Unsafe {
         return Err("该 Skill 无法安全哈希，不能纳入管理".to_string());
     }
+    let managed_path = item.resolved_path.clone();
     let installation = PhysicalInstallation {
         id: Uuid::new_v4().to_string(),
         skill_name: item.name,
-        resolved_path: path.display().to_string(),
+        resolved_path: managed_path,
         source: None,
         source_details: SkillSourceDetails::default(),
         content_hash: item
@@ -523,20 +509,23 @@ mod tests {
                 .unwrap();
 
         assert_eq!(adopted.provenance, InstallationProvenance::Adopted);
+        assert_eq!(PathBuf::from(&adopted.resolved_path), path);
+        let persisted = storage::load_state(data.path()).unwrap();
+        assert_eq!(persisted.installations.len(), 1);
+        let inventory = crate::inventory::scan_client_inventory(&clients[0], &persisted);
+        let existing = inventory
+            .direct_skills
+            .iter()
+            .find(|skill| skill.name == "existing")
+            .unwrap();
+        assert_eq!(existing.management_status, SkillManagementStatus::Adopted);
         assert_eq!(
-            PathBuf::from(adopted.resolved_path),
-            path.canonicalize().unwrap()
-        );
-        assert_eq!(
-            storage::load_state(data.path())
-                .unwrap()
-                .installations
-                .len(),
-            1
+            existing.installation_id.as_deref(),
+            Some(adopted.id.as_str())
         );
     }
-    #[test]
 
+    #[test]
     fn synthetic_environment_applies_scans_backs_up_restores_and_uninstalls() {
         let source = tempfile::tempdir().unwrap();
         let profile = tempfile::tempdir().unwrap();

@@ -3,13 +3,37 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub const MAX_FILES: usize = 5_000;
 pub const MAX_BYTES: u64 = 200 * 1024 * 1024;
+
+pub fn normalized_path(path: &Path) -> String {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other.as_os_str()),
+        }
+    }
+    let text = result.display().to_string();
+    if cfg!(windows) {
+        let without_verbatim = text
+            .strip_prefix(r"\\?\UNC\")
+            .map(|rest| format!(r"\\{rest}"))
+            .or_else(|| text.strip_prefix(r"\\?\").map(str::to_owned))
+            .unwrap_or(text);
+        without_verbatim.replace('/', r"\").to_lowercase()
+    } else {
+        text
+    }
+}
 
 fn link_like(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
@@ -259,6 +283,14 @@ mod tests {
             redact_profile(r#"{"path":"C:\\Users\\Leong\\.cursor\\skills"}"#, profile),
             r#"{"path":"~\\.cursor\\skills"}"#
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalized_windows_paths_ignore_verbatim_prefix_slashes_and_case() {
+        let regular = normalized_path(Path::new(r"C:\Users\Leong\.codex/skills"));
+        let verbatim = normalized_path(Path::new(r"\\?\C:\Users\LEONG\.codex\skills"));
+        assert_eq!(regular, verbatim);
     }
 
     #[cfg(unix)]
