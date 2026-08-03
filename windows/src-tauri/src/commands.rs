@@ -131,6 +131,10 @@ pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupRecord>, Str
     Ok(storage::load_state(&state.data_dir)?.backups)
 }
 
+fn explorer_select_argument(path: &Path) -> String {
+    format!(r#"/select,"{}""#, path.display())
+}
+
 fn reveal_is_allowed(
     requested: &Path,
     environment: &EnvironmentScan,
@@ -160,8 +164,7 @@ pub fn reveal_in_explorer(path: String, state: State<'_, AppState>) -> Result<()
         return Err("只能在资源管理器中显示已扫描的 Skill 或备份".to_string());
     }
     std::process::Command::new("explorer.exe")
-        .arg("/select,")
-        .arg(&requested)
+        .arg(explorer_select_argument(&requested))
         .spawn()
         .map_err(|error| format!("无法打开资源管理器: {error}"))?;
     Ok(())
@@ -276,6 +279,14 @@ pub fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> 
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn explorer_select_argument_quotes_the_complete_path() {
+        assert_eq!(
+            explorer_select_argument(Path::new(r"C:\Users\Leong\.codex\skills\imagegen")),
+            r#"/select,"C:\Users\Leong\.codex\skills\imagegen""#
+        );
+    }
 
     #[test]
     fn reveal_allowlist_accepts_scanned_skills_and_rejects_unrelated_paths() {
