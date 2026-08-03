@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 #[derive(Deserialize)]
 struct InventoryFrontmatter {
@@ -160,22 +161,38 @@ pub fn scan_client_inventory(
         if !root.exists() {
             continue;
         }
-        let entries = match fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) => {
-                errors.push(format!("{}: {error}", root.display()));
-                continue;
-            }
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
+        let mut entries = WalkDir::new(&root)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter();
+        while let Some(entry) = entries.next() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", root.display()));
+                    continue;
+                }
+            };
+            let path = entry.path().to_path_buf();
             let Ok(metadata) = fs::symlink_metadata(&path) else {
                 continue;
             };
+            let has_manifest = path.join("SKILL.md").is_file();
             if metadata.file_type().is_symlink() {
-                direct_skills.push(inventory_entry(client, path, state, true));
-            } else if metadata.is_dir() && path.join("SKILL.md").is_file() {
+                if has_manifest {
+                    direct_skills.push(inventory_entry(client, path, state, true));
+                }
+                entries.skip_current_dir();
+            } else if metadata.is_dir() && has_manifest {
                 direct_skills.push(inventory_entry(client, path, state, false));
+                entries.skip_current_dir();
+            } else if metadata.is_dir()
+                && matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some(".git" | "node_modules" | "target")
+                )
+            {
+                entries.skip_current_dir();
             }
         }
     }
@@ -332,6 +349,28 @@ mod tests {
                 .map(|skill| skill.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["current", "legacy"]
+        );
+    }
+
+    #[test]
+    fn inventory_discovers_existing_skills_below_container_directories() {
+        let root = tempfile::tempdir().unwrap();
+        skill(&root.path().join(".system"), "existing-system-skill");
+        skill(&root.path().join("bundle"), "outer-skill");
+        skill(
+            &root.path().join("bundle/outer-skill/embedded"),
+            "embedded-source-skill",
+        );
+
+        let inventory =
+            scan_client_inventory(&client("codex", root.path()), &PersistedState::default());
+        assert_eq!(
+            inventory
+                .direct_skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["existing-system-skill", "outer-skill"]
         );
     }
 }

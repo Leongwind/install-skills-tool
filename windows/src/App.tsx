@@ -401,7 +401,7 @@ function InventoryPage({ environment, query, setQuery, filter, setFilter, busy, 
   return <section><PageHeader title="IDE Skill 库存" subtitle="按 IDE 查看直接安装、外部内容和被动发现项。" />
     <div className="panel inventory-tools"><label className="search-field"><MagnifyingGlass /><input aria-label="搜索库存" placeholder="搜索名称或路径" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
       <div className="segmented">{(["all", "managed", "external", "issues"] as InventoryFilter[]).map((value) => <button key={value} className={filter === value ? "selected" : ""} onClick={() => setFilter(value)}>{{ all: "全部", managed: "受管理", external: "外部", issues: "异常" }[value]}</button>)}</div></div>
-    {environment?.clients.map((client) => {
+    {environment?.clients.filter((client) => client.status !== "notInstalled").map((client) => {
       const inventory = environment.inventories.find((item) => item.clientId === client.id);
       const skills = [...(inventory?.directSkills ?? []), ...(inventory?.passiveSkills ?? [])].filter((skill) => {
         const match = `${skill.name} ${skill.resolvedPath}`.toLowerCase().includes(query.toLowerCase());

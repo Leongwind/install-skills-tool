@@ -33,6 +33,11 @@ const environment: EnvironmentScan = {
       status: "installed", globalSkillsPath: "C:\\Users\\tester\\.kiro\\skills",
       supportsSkills: true, notes: [],
     },
+    {
+      id: "windsurf", name: "Windsurf", edition: "standard",
+      status: "notInstalled", globalSkillsPath: "C:\\Users\\tester\\.codeium\\windsurf\\skills",
+      supportsSkills: false, notes: [],
+    },
   ],
   inventories: [
     {
@@ -44,6 +49,7 @@ const environment: EnvironmentScan = {
       }],
     },
     { clientId: "kiro", rootPath: "C:\\Users\\tester\\.kiro\\skills", directSkills: [], passiveSkills: [] },
+    { clientId: "windsurf", rootPath: "C:\\Users\\tester\\.codeium\\windsurf\\skills", directSkills: [], passiveSkills: [] },
   ],
 };
 
@@ -108,6 +114,7 @@ describe("Windows desktop interface", () => {
     await screen.findByText("批量安装 Skills");
     fireEvent.click(screen.getByRole("button", { name: /IDE Skill 库存/ }));
     expect(await screen.findByRole("heading", { name: /Cursor/ })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /Windsurf/ })).not.toBeInTheDocument();
     expect(screen.getByText("review")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "纳入管理" }));
     await waitFor(() => expect(backend.adoptExternalSkill).toHaveBeenCalledWith(

@@ -65,7 +65,7 @@ fn product_metadata(application: &Path) -> (Option<String>, Option<String>) {
     });
     let version = parsed
         .as_ref()
-        .and_then(|json| json.get("version"))
+        .and_then(|json| json.get("appVersion").or_else(|| json.get("version")))
         .and_then(Value::as_str)
         .map(str::to_owned);
     let data_folder = parsed
@@ -82,6 +82,9 @@ fn registry_match<'a>(
 ) -> Option<&'a RegisteredApplication> {
     context.registered_apps.iter().find(|app| {
         let name = app.display_name.to_lowercase();
+        if adapter.edition == ClientEdition::TraeInternational && name.contains("trae auto") {
+            return false;
+        }
         match adapter.edition {
             ClientEdition::TraeInternational => {
                 name.contains("trae") && !name.contains("cn") && !name.contains("中国")
@@ -120,9 +123,8 @@ fn scan_client(context: &ScanContext, adapter: Adapter) -> DetectedClient {
         .as_deref()
         .map(product_metadata)
         .unwrap_or_default();
-    let version = registered
-        .and_then(|app| app.display_version.clone())
-        .or(product_version);
+    let version =
+        product_version.or_else(|| registered.and_then(|app| app.display_version.clone()));
 
     if adapter.edition == ClientEdition::TraeInternational
         && data_folder.as_deref() == Some(".trae-cn")
@@ -307,7 +309,7 @@ mod tests {
         std::fs::write(&app, b"fixture").unwrap();
         std::fs::write(
             app.parent().unwrap().join("resources/app/product.json"),
-            r#"{"version":"3.5.78","dataFolderName":".trae"}"#,
+            r#"{"appVersion":"3.5.60","version":"1.107.1","dataFolderName":".trae"}"#,
         )
         .unwrap();
 
@@ -318,8 +320,38 @@ mod tests {
             .unwrap();
         let china = clients.iter().find(|item| item.id == "trae-china").unwrap();
         assert_eq!(international.status, DetectionStatus::Installed);
-        assert_eq!(international.version.as_deref(), Some("3.5.78"));
+        assert_eq!(international.version.as_deref(), Some("3.5.60"));
         assert_eq!(china.status, DetectionStatus::NotInstalled);
+    }
+
+    #[test]
+    fn product_metadata_wins_over_unrelated_trae_registry_version() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture = context(root.path());
+        let app = fixture.local_appdata.join("Programs/Trae/Trae.exe");
+        std::fs::create_dir_all(app.parent().unwrap().join("resources/app")).unwrap();
+        std::fs::write(&app, b"fixture").unwrap();
+        std::fs::write(
+            app.parent().unwrap().join("resources/app/product.json"),
+            r#"{"appVersion":"3.5.60","version":"1.107.1","dataFolderName":".trae"}"#,
+        )
+        .unwrap();
+        let trae_auto = root.path().join("Trae Auto/trae-auto.exe");
+        std::fs::create_dir_all(trae_auto.parent().unwrap()).unwrap();
+        std::fs::write(&trae_auto, b"fixture").unwrap();
+        fixture.registered_apps.push(RegisteredApplication {
+            display_name: "Trae Auto".to_string(),
+            display_version: Some("0.1.0".to_string()),
+            install_location: Some(root.path().join("Trae Auto")),
+            display_icon: Some(trae_auto),
+        });
+
+        let international = scan_clients_with_context(&fixture)
+            .into_iter()
+            .find(|item| item.id == "trae-international")
+            .unwrap();
+        assert_eq!(international.status, DetectionStatus::Installed);
+        assert_eq!(international.version.as_deref(), Some("3.5.60"));
     }
 
     #[test]
