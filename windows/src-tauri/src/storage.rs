@@ -221,8 +221,15 @@ pub fn redact_user_profile(input: &str) -> String {
     std::env::var("USERPROFILE")
         .ok()
         .filter(|profile| !profile.is_empty())
-        .map(|profile| input.replace(&profile, "~"))
+        .map(|profile| redact_profile(input, &profile))
         .unwrap_or_else(|| input.to_string())
+}
+
+fn redact_profile(input: &str, profile: &str) -> String {
+    let json_escaped_profile = profile.replace('\\', "\\\\");
+    input
+        .replace(&json_escaped_profile, "~")
+        .replace(profile, "~")
 }
 
 #[cfg(test)]
@@ -239,6 +246,19 @@ mod tests {
         let second = inspect_tree(root.path()).unwrap();
         assert_eq!(first.0, second.0);
         assert!(first.3);
+    }
+
+    #[test]
+    fn user_profile_redaction_handles_plain_and_json_escaped_windows_paths() {
+        let profile = r"C:\Users\Leong";
+        assert_eq!(
+            redact_profile(r"C:\Users\Leong\.cursor\skills", profile),
+            r"~\.cursor\skills"
+        );
+        assert_eq!(
+            redact_profile(r#"{"path":"C:\\Users\\Leong\\.cursor\\skills"}"#, profile),
+            r#"{"path":"~\\.cursor\\skills"}"#
+        );
     }
 
     #[cfg(unix)]
