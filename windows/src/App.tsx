@@ -26,7 +26,7 @@ import type {
   SkillSource,
   SourceInspection,
 } from "./types";
-import { conflictText, formatBytes, managementText, statusText } from "./ui";
+import { conflictText, formatBytes, formatWindowsPath, managementText, statusText } from "./ui";
 
 type Page = "install" | "inventory" | "diagnostics";
 type SourceKind = "localDirectory" | "localArchive" | "github";
@@ -375,7 +375,7 @@ function InstallPage(props: InstallPageProps) {
       {props.usableClients.length === 0 ? <EmptyState text="未检测到可安装 Skills 的 IDE" /> : <div className="matrix" role="table" aria-label="Skill IDE 分配" style={{ "--columns": props.usableClients.length } as CSSProperties}>
         <div className="matrix-head"><span>Skill</span>{props.usableClients.map((client) => <button key={client.id} onClick={() => props.toggleClientColumn(client.id)}>{client.name}<small>整列选择</small></button>)}</div>
         {props.inspection.skills.filter((skill) => props.selectedSkills.has(skill.skillId)).map((skill) => <div className="matrix-row" key={skill.skillId}>
-          <strong>{skill.name}</strong>{props.usableClients.map((client) => <label key={client.id} title={client.globalSkillsPath}>
+          <strong>{skill.name}</strong>{props.usableClients.map((client) => <label key={client.id} title={formatWindowsPath(client.globalSkillsPath)}>
             <input type="checkbox" checked={props.assignments[skill.skillId]?.has(client.id) ?? false}
               onChange={() => props.toggleAssignment(skill.skillId, client.id)} /><span>{client.name}</span></label>)}</div>)}
       </div>}
@@ -386,7 +386,7 @@ function InstallPage(props: InstallPageProps) {
       <StepTitle number="3" title="确认并执行" subtitle={`${props.plan.entries.length} 个物理安装目标`} />
       {props.plan.entries.map((entry) => { const needs = ["conflict", "updateAvailable"].includes(entry.conflict); return <div className="plan-row" key={entry.entryId}>
         <div><strong>{entry.skillName}</strong><Badge color={needs ? "amber" : "green"}>{conflictText[entry.conflict]}</Badge>
-          <small>{entry.resolvedPath}</small><span>目标：{entry.consumers.join("、")}</span>
+          <small>{formatWindowsPath(entry.resolvedPath)}</small><span>目标：{entry.consumers.join("、")}</span>
           {entry.passiveConsumers.length > 0 && <span className="warning">可能被动发现：{entry.passiveConsumers.join("、")}</span>}</div>
         {needs && <label><input type="checkbox" checked={props.overwrite.has(entry.entryId)} onChange={() => props.setOverwrite((current) => {
           const next = new Set(current); next.has(entry.entryId) ? next.delete(entry.entryId) : next.add(entry.entryId); return next;
@@ -395,7 +395,7 @@ function InstallPage(props: InstallPageProps) {
       <div className="panel-actions"><span>每个覆盖目标都会单独备份</span><button className="primary" disabled={props.busy || props.plan.entries.some((entry) => ["conflict", "updateAvailable"].includes(entry.conflict) && !props.overwrite.has(entry.entryId))} onClick={() => void props.applyPlan()}>执行安装</button></div>
     </div>}
     {props.results.length > 0 && <div className="panel results"><h2>操作结果</h2>{props.results.map((result, index) => <div key={`${result.path}-${index}`} className={result.success ? "result success" : "result failure"}>
-      {result.success ? <CheckCircle /> : <WarningCircle />}<span><strong>{result.skillName}</strong>{result.message}<small>{result.path}</small></span></div>)}</div>}
+      {result.success ? <CheckCircle /> : <WarningCircle />}<span><strong>{result.skillName}</strong>{result.message}<small>{formatWindowsPath(result.path)}</small></span></div>)}</div>}
   </section>;
 }
 
@@ -417,11 +417,11 @@ function InventoryPage({ environment, query, setQuery, filter, setFilter, busy, 
         const match = `${skill.name} ${skill.resolvedPath}`.toLowerCase().includes(query.toLowerCase());
         return match && visible(skill.managementStatus);
       });
-      return <div className="panel client-card" key={client.id}><header><span className="client-icon">{client.name[0]}</span><div><h2>{client.name} <Badge color={client.supportsSkills ? "green" : "gray"}>{statusText[client.status]}</Badge></h2><small>{client.globalSkillsPath}{client.version ? ` · ${client.version}` : ""}</small></div><span className="client-count">{skills.length} Skills</span></header>
+      return <div className="panel client-card" key={client.id}><header><span className="client-icon">{client.name[0]}</span><div><h2>{client.name} <Badge color={client.supportsSkills ? "green" : "gray"}>{statusText[client.status]}</Badge></h2><small>{formatWindowsPath(client.globalSkillsPath)}{client.version ? ` · ${client.version}` : ""}</small></div><span className="client-count">{skills.length} Skills</span></header>
         {inventory?.scanError && <div className="inline-error">{inventory.scanError}</div>}
         {skills.length === 0 ? <EmptyState text={client.status === "notInstalled" ? "IDE 未安装" : "该筛选下没有 Skill"} /> : skills.map((skill) => <div className="inventory-row" key={skill.inventoryId}>
           <span className="skill-icon">&lt;/&gt;</span><div><strong>{skill.name}</strong><Badge color={skill.managementStatus === "external" ? "gray" : skill.managementStatus === "unsafe" || skill.managementStatus === "modified" ? "red" : "green"}>{managementText[skill.managementStatus]}</Badge>
-            <small>{skill.resolvedPath}</small>{skill.passiveFromClientId && <span>来自 {skill.passiveFromClientId} 共享目录</span>}{skill.issues.map((issue) => <span className="warning" key={issue}>{issue}</span>)}</div>
+            <small>{formatWindowsPath(skill.resolvedPath)}</small>{skill.passiveFromClientId && <span>来自 {skill.passiveFromClientId} 共享目录</span>}{skill.issues.map((issue) => <span className="warning" key={issue}>{issue}</span>)}</div>
           <div className="row-actions">{skill.managementStatus !== "passive" && <button className="reveal-button" aria-label={`在资源管理器中显示 ${skill.name}`} title="在资源管理器中显示" onClick={() => void onReveal(skill.resolvedPath)}><FolderOpen /></button>}{skill.managementStatus === "external" && <button className="adopt-button" disabled={busy} onClick={() => void onAdopt(client.id, skill.resolvedPath)}>纳入管理</button>}{skill.installationId && <button className="danger" disabled={busy} onClick={() => void onUninstall(skill.installationId!)}><Trash />卸载</button>}</div>
         </div>)}</div>;
     })}</section>;
@@ -433,7 +433,7 @@ function DiagnosticsPage({ installations, backups, diagnostics, busy, onExport, 
 }) {
   return <section><PageHeader title="诊断与备份" subtitle="诊断不包含 Skill 文件内容，用户目录会被隐藏。" />
     <div className="diagnostic-grid"><div className="panel"><h2>管理状态</h2><Stat value={installations.length} label="受管理安装" /><button className="primary wide" disabled={busy} onClick={() => void onExport()}>生成诊断预览</button></div>
-      <div className="panel backup-list"><h2>备份</h2>{backups.length === 0 ? <EmptyState text="暂无备份" /> : backups.map((backup) => <div key={backup.id}><span><strong>{backup.originalPath}</strong><small>{new Date(backup.createdAt).toLocaleString()}</small></span><button disabled={busy} onClick={() => void onRestore(backup.id)}>恢复</button></div>)}</div></div>
+      <div className="panel backup-list"><h2>备份</h2>{backups.length === 0 ? <EmptyState text="暂无备份" /> : backups.map((backup) => <div key={backup.id}><span><strong>{formatWindowsPath(backup.originalPath)}</strong><small>{new Date(backup.createdAt).toLocaleString()}</small></span><button className="restore-button" disabled={busy} onClick={() => void onRestore(backup.id)}>恢复</button></div>)}</div></div>
     {diagnostics && <div className="panel diagnostic-output"><h2>诊断预览</h2><pre>{diagnostics}</pre></div>}
   </section>;
 }

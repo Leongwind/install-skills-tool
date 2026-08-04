@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App";
 import { backend } from "../src/api";
 import type { EnvironmentScan, SourceInspection } from "../src/types";
+import { formatWindowsPath } from "../src/ui";
 
 vi.mock("../src/api", () => ({
   backend: {
@@ -128,5 +129,8 @@ describe("Windows desktop interface", () => {
     await waitFor(() => expect(backend.adoptExternalSkill).toHaveBeenCalledWith(
       "cursor", "C:\\Users\\tester\\.cursor\\skills\\review",
     ));
+  });
+  it("formats Windows paths consistently", () => {
+    expect(formatWindowsPath("\\\\?\\C:\\Users\\tester\\.codex/skills/review")).toBe("C:\\Users\\tester\\.codex\\skills\\review");
   });
 });
