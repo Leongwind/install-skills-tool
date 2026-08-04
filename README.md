@@ -8,12 +8,35 @@ Skill Installer 是一个本地优先的 Agent Skill 批量安装和 IDE Skill �
 | 平台 | 目录 | 状态 | 安装包 |
 |---|---|---|---|
 | macOS | [`macos/`](macos/) | 0.2.1 | `.dmg` |
-| Windows | [`windows/`](windows/) | 0.1.0，等待 Win11 实机验收 | NSIS `.exe` |
+| Windows | [`windows/`](windows/) | 0.1.0，Win11 实机验收通过 | NSIS `.exe` |
 
 macOS 版支持 Codex、Claude Code、Kiro、Cursor、Windsurf、TRAE 国际版和
 TRAE 国内版。它可从目录、ZIP 或公开 GitHub 仓库批量发现 Skills，通过
 Skill-IDE 矩阵分配全局目标，并按 IDE 展示受管理、外部、异常和被动发现库存。
 写入前会校验和预览，冲突覆盖与卸载前自动备份，且不会执行 Skill 脚本。
+
+## Windows 版能力
+
+Windows 版与 macOS 版使用独立源码和构建链路，当前支持：
+
+- 按本机实际检测到的 IDE 或 CLI 展示 Skill 库存，不展示未安装客户端的虚拟库存。
+- 管理已有 Skill：纳入管理、卸载、重新扫描，并支持在资源管理器中定位。
+- 支持嵌套 Skill、路径归一化和跨扫描关联；诊断页可查看备份并执行恢复。
+- 所有界面路径统一显示为 Windows `C:\...` 格式，去除 `\\?\` 前缀和混合斜杠。
+- 发布版使用 Windows GUI 子系统，启动时不会弹出对应的 CMD 控制台窗口。
+
+最近一次 Windows CI（包含前端测试、Rust 测试、NSIS 打包和产物上传）：
+[`Actions #30885870070`](https://github.com/Leongwind/install-skills-tool/actions/runs/30885870070)。
+
+## 本地开发与验证
+
+```powershell
+cd windows
+pnpm install
+pnpm test
+pnpm build
+pnpm tauri build
+```
 
 开发、路径和安全模型参见 [`macos/README.md`](macos/README.md) 与
 [`windows/README.md`](windows/README.md)。跨机器继续开发时先阅读
