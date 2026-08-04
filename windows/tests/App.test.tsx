@@ -122,6 +122,8 @@ describe("Windows desktop interface", () => {
     expect(backend.revealInExplorer).toHaveBeenCalledWith("C:\\Users\\tester\\.cursor\\skills\\review");
     const adopt = screen.getByRole("button", { name: "纳入管理" });
     expect(adopt).toBeEnabled();
+    expect(adopt).toHaveClass("adopt-button");
+    expect(screen.getByTitle("在资源管理器中显示")).toHaveClass("reveal-button");
     fireEvent.click(adopt);
     await waitFor(() => expect(backend.adoptExternalSkill).toHaveBeenCalledWith(
       "cursor", "C:\\Users\\tester\\.cursor\\skills\\review",
