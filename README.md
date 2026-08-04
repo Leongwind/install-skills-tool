@@ -8,7 +8,7 @@ Skill Installer 是一个本地优先的 Agent Skill 批量安装和 IDE Skill �
 | 平台 | 目录 | 状态 | 安装包 |
 |---|---|---|---|
 | macOS | [`macos/`](macos/) | 0.2.1 | `.dmg` |
-| Windows | [`windows/`](windows/) | 0.1.0，Win11 实机验收通过 | NSIS `.exe` |
+| Windows | [`windows/`](windows/) | 0.1.0 | NSIS `.exe` |
 
 macOS 版支持 Codex、Claude Code、Kiro、Cursor、Windsurf、TRAE 国际版和
 TRAE 国内版。它可从目录、ZIP 或公开 GitHub 仓库批量发现 Skills，通过
@@ -39,5 +39,4 @@ pnpm tauri build
 ```
 
 开发、路径和安全模型参见 [`macos/README.md`](macos/README.md) 与
-[`windows/README.md`](windows/README.md)。跨机器继续开发时先阅读
-[`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)。
+[`windows/README.md`](windows/README.md)。
