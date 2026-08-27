@@ -28,6 +28,7 @@ pub fn run() {
                 data_dir,
                 inspections: Mutex::new(HashMap::new()),
                 plans: Mutex::new(HashMap::new()),
+                update_plans: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -41,9 +42,13 @@ pub fn run() {
             commands::get_app_overview,
             commands::scan_client_inventory,
             commands::recover_operation,
+            commands::rollback_operation,
             commands::export_skill_bundle,
             commands::adopt_external_skill,
             commands::check_updates,
+            commands::plan_updates,
+            commands::apply_update_plan,
+            commands::set_installation_pinned,
             commands::uninstall_installation,
             commands::restore_backup,
             commands::export_diagnostics,

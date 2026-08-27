@@ -12,6 +12,7 @@ import type {
   SkillSource,
   SourceInspection,
   UpdateStatus,
+  UpdatePlan,
 } from "./types";
 
 export const api = {
@@ -33,6 +34,8 @@ export const api = {
     invoke<ClientSkillInventory>("scan_client_inventory", { clientId }),
   recoverOperation: (journalId: string) =>
     invoke<OperationResult[]>("recover_operation", { journalId }),
+  rollbackOperation: (journalId: string) =>
+    invoke<OperationResult[]>("rollback_operation", { journalId }),
   exportSkillBundle: (installationIds: string[], destination: string) =>
     invoke<PortableBundleManifest>("export_skill_bundle", {
       installationIds,
@@ -44,6 +47,15 @@ export const api = {
       resolvedPath,
     }),
   checkUpdates: () => invoke<UpdateStatus[]>("check_updates"),
+  planUpdates: (installationIds: string[]) =>
+    invoke<UpdatePlan>("plan_updates", { installationIds }),
+  applyUpdatePlan: (planId: string, approvedEntryIds: string[]) =>
+    invoke<OperationResult[]>("apply_update_plan", {
+      planId,
+      approvedEntryIds,
+    }),
+  setInstallationPinned: (installationId: string, pinned: boolean) =>
+    invoke<void>("set_installation_pinned", { installationId, pinned }),
   uninstall: (installationId: string, force: boolean) =>
     invoke<OperationResult>("uninstall_installation", {
       installationId,

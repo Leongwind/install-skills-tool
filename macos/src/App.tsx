@@ -47,6 +47,7 @@ import type {
   SkillSource,
   SourceInspection,
   UpdateStatus,
+  UpdatePlan,
 } from "./types";
 import { conflictLabel, detectionLabel, formatBytes, shortPath } from "./ui";
 
@@ -136,6 +137,7 @@ export default function App() {
       retentionDays: 90,
     },
     operationJournals: [],
+    pinnedInstallationIds: [],
   });
   const [sourceMode, setSourceMode] =
     useState<SourceMode>("localDirectory");
@@ -148,6 +150,8 @@ export default function App() {
   const [overwrites, setOverwrites] = useState<string[]>([]);
   const [results, setResults] = useState<OperationResult[]>([]);
   const [updates, setUpdates] = useState<UpdateStatus[]>([]);
+  const [updatePlan, setUpdatePlan] = useState<UpdatePlan>();
+  const [approvedUpdateIds, setApprovedUpdateIds] = useState<string[]>([]);
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryFilter, setInventoryFilter] =
     useState<InventoryFilter>("all");
@@ -406,6 +410,59 @@ export default function App() {
     setError("");
     try {
       setUpdates(await api.checkUpdates());
+      setUpdatePlan(undefined);
+      setApprovedUpdateIds([]);
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function createUpdatePlan() {
+    const installationIds = updates
+      .filter((update) =>
+        ["sourceChanged", "targetModified"].includes(update.status),
+      )
+      .map((update) => update.installationId);
+    if (installationIds.length === 0) return;
+    setBusy("update-plan");
+    setError("");
+    try {
+      setUpdatePlan(await api.planUpdates(installationIds));
+      setApprovedUpdateIds([]);
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function applyUpdates() {
+    if (!updatePlan) return;
+    setBusy("update-apply");
+    setError("");
+    try {
+      setResults(
+        await api.applyUpdatePlan(updatePlan.planId, approvedUpdateIds),
+      );
+      setUpdatePlan(undefined);
+      setApprovedUpdateIds([]);
+      setUpdates([]);
+      await refresh();
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function setPinned(installationId: string, pinned: boolean) {
+    setBusy(`pin:${installationId}`);
+    setError("");
+    try {
+      await api.setInstallationPinned(installationId, pinned);
+      await refresh();
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -530,6 +587,9 @@ export default function App() {
   const recoverableJournals = overview.operationJournals.filter((journal) =>
     ["partial", "recoveryRequired"].includes(journal.status),
   );
+  const availableUpdateCount = updates.filter((update) =>
+    ["sourceChanged", "targetModified"].includes(update.status),
+  ).length;
 
   return (
     <Theme accentColor="blue" grayColor="slate" radius="medium" scaling="95%">
@@ -1128,8 +1188,92 @@ export default function App() {
                       {busy === "updates" ? <Spinner size="1" /> : <ArrowClockwise />}
                       检查更新
                     </Button>
+                    {availableUpdateCount > 0 && (
+                      <Button
+                        disabled={busy === "update-plan"}
+                        onClick={() => void createUpdatePlan()}
+                      >
+                        {busy === "update-plan" && <Spinner size="1" />}
+                        生成更新计划 ({availableUpdateCount})
+                      </Button>
+                    )}
                   </Flex>
                 </div>
+                {updatePlan && (
+                  <section className="panel update-plan-panel">
+                    <div className="section-caption">
+                      <div>
+                        <strong>确认更新内容</strong>
+                        <Text as="div" size="1" color="gray">
+                          仅更新已勾选项；每个目标会先备份，完成后可回滚。
+                        </Text>
+                      </div>
+                      <Badge variant="soft">{updatePlan.entries.length}</Badge>
+                    </div>
+                    <div className="plan-list">
+                      {updatePlan.entries.map((entry) => {
+                        const changes = entry.changes;
+                        return (
+                          <div className="plan-entry" key={entry.entryId}>
+                            <Checkbox
+                              aria-label={`确认更新 ${entry.skillName}`}
+                              checked={approvedUpdateIds.includes(entry.entryId)}
+                              disabled={!entry.requiresConfirmation}
+                              onCheckedChange={(value) =>
+                                setApprovedUpdateIds((current) =>
+                                  value
+                                    ? [...current, entry.entryId]
+                                    : current.filter((id) => id !== entry.entryId),
+                                )
+                              }
+                            />
+                            <div className="grow min-width-zero">
+                              <Flex align="center" gap="2" wrap="wrap">
+                                <strong>{entry.skillName}</strong>
+                                <Badge
+                                  color={
+                                    entry.status === "targetModified"
+                                      ? "orange"
+                                      : entry.status === "sourceChanged"
+                                        ? "blue"
+                                        : "gray"
+                                  }
+                                  variant="soft"
+                                >
+                                  {entry.message}
+                                </Badge>
+                              </Flex>
+                              <Text as="div" size="1" className="mono truncate" color="gray">
+                                {shortPath(entry.resolvedPath)}
+                              </Text>
+                              {changes && (
+                                <Text as="div" size="1" color="gray">
+                                  新增 {changes.added.length} · 修改 {changes.modified.length} · 删除 {changes.removed.length}
+                                </Text>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <Flex justify="end">
+                      <Button
+                        disabled={
+                          busy === "update-apply" ||
+                          updatePlan.entries.some(
+                            (entry) =>
+                              entry.requiresConfirmation &&
+                              !approvedUpdateIds.includes(entry.entryId),
+                          )
+                        }
+                        onClick={() => void applyUpdates()}
+                      >
+                        {busy === "update-apply" && <Spinner size="1" />}
+                        应用已确认更新
+                      </Button>
+                    </Flex>
+                  </section>
+                )}
                 <section className="panel inventory-controls">
                   <SearchBox
                     value={inventorySearch}
@@ -1174,6 +1318,8 @@ export default function App() {
                       onUninstall={uninstallById}
                       onRefresh={refreshClient}
                       onSync={beginSync}
+                      pinnedInstallationIds={overview.pinnedInstallationIds}
+                      onSetPinned={setPinned}
                       key={inventory.clientId}
                     />
                   ))
@@ -1325,6 +1471,8 @@ function InventoryGroup({
   onUninstall,
   onRefresh,
   onSync,
+  pinnedInstallationIds,
+  onSetPinned,
 }: {
   client?: DetectedClient;
   inventory: ClientSkillInventory;
@@ -1341,6 +1489,8 @@ function InventoryGroup({
   ) => Promise<void>;
   onRefresh: (clientId: string) => Promise<void>;
   onSync: (skill: InventorySkill) => Promise<void>;
+  pinnedInstallationIds: string[];
+  onSetPinned: (installationId: string, pinned: boolean) => Promise<void>;
 }) {
   if (!client) return null;
   const allSkills = [...inventory.directSkills, ...inventory.passiveSkills];
@@ -1434,6 +1584,10 @@ function InventoryGroup({
             const passiveClient = clients.find(
               (item) => item.id === skill.passiveFromClientId,
             );
+            const pinned = Boolean(
+              skill.installationId &&
+                pinnedInstallationIds.includes(skill.installationId),
+            );
             return (
               <div className="inventory-row" key={skill.inventoryId}>
                 <div className="skill-icon">
@@ -1519,6 +1673,17 @@ function InventoryGroup({
                       skill.managementStatus,
                     ) && (
                       <>
+                        <Button
+                          size="1"
+                          variant="ghost"
+                          aria-label={`${pinned ? "取消固定" : "固定版本"} ${skill.name}`}
+                          disabled={busy === `pin:${skill.installationId}`}
+                          onClick={() =>
+                            void onSetPinned(skill.installationId!, !pinned)
+                          }
+                        >
+                          {pinned ? "取消固定" : "固定版本"}
+                        </Button>
                         <Button
                           size="1"
                           variant="ghost"

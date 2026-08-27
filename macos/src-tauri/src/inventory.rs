@@ -300,6 +300,7 @@ mod tests {
             backups: Vec::new(),
             operation_journals: Vec::new(),
             backup_policy: BackupPolicy::default(),
+            pinned_installation_ids: Vec::new(),
         };
         let client = DetectedClient {
             id: "kiro".to_string(),

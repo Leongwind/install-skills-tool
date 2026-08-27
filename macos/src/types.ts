@@ -176,12 +176,29 @@ export interface BackupRecord {
 
 export interface UpdateStatus {
   installationId: string;
-  status: "current" | "sourceChanged" | "targetModified" | "sourceUnavailable";
+  status:
+    | "current"
+    | "sourceChanged"
+    | "targetModified"
+    | "sourceUnavailable"
+    | "pinned";
   message: string;
   currentHash?: string;
   sourceHash?: string;
   sourceRevision?: string;
   changes?: FileChangeSummary;
+}
+
+export interface UpdatePlanEntry extends UpdateStatus {
+  entryId: string;
+  skillName: string;
+  resolvedPath: string;
+  requiresConfirmation: boolean;
+}
+
+export interface UpdatePlan {
+  planId: string;
+  entries: UpdatePlanEntry[];
 }
 
 export interface FileChangeSummary {
@@ -224,6 +241,7 @@ export interface BackupPolicy {
 export interface AppOverview {
   backupPolicy: BackupPolicy;
   operationJournals: OperationJournal[];
+  pinnedInstallationIds: string[];
 }
 
 export interface PortableBundleManifest {

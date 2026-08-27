@@ -282,27 +282,31 @@ pub struct PersistedState {
     pub operation_journals: Vec<OperationJournal>,
     #[serde(default)]
     pub backup_policy: BackupPolicy,
+    #[serde(default)]
+    pub pinned_installation_ids: Vec<String>,
 }
 
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            schema_version: 3,
+            schema_version: 4,
             installations: Vec::new(),
             backups: Vec::new(),
             operation_journals: Vec::new(),
             backup_policy: BackupPolicy::default(),
+            pinned_installation_ids: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum UpdateState {
     Current,
     SourceChanged,
     TargetModified,
     SourceUnavailable,
+    Pinned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +323,35 @@ pub struct UpdateStatus {
     pub source_revision: Option<String>,
     #[serde(default)]
     pub changes: Option<FileChangeSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePlanEntry {
+    pub entry_id: String,
+    pub installation_id: String,
+    pub skill_name: String,
+    pub resolved_path: String,
+    pub status: UpdateState,
+    pub message: String,
+    pub current_hash: Option<String>,
+    pub source_hash: Option<String>,
+    pub source_revision: Option<String>,
+    pub changes: Option<FileChangeSummary>,
+    pub requires_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePlan {
+    pub plan_id: String,
+    pub entries: Vec<UpdatePlanEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingUpdatePlan {
+    pub public: UpdatePlan,
+    pub metadata_by_entry: std::collections::HashMap<String, SkillMetadata>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,6 +385,7 @@ pub struct PortableBundleManifest {
 pub struct AppOverview {
     pub backup_policy: BackupPolicy,
     pub operation_journals: Vec<OperationJournal>,
+    pub pinned_installation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

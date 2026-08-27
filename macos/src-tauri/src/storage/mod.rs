@@ -34,6 +34,9 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
     if state.schema_version == 2 {
         state.schema_version = 3;
     }
+    if state.schema_version == 3 {
+        state.schema_version = 4;
+    }
     let mut changed = original_schema != state.schema_version;
     for journal in &mut state.operation_journals {
         if matches!(
@@ -469,7 +472,7 @@ mod tests {
 
         let state = load_state(data.path()).unwrap();
 
-        assert_eq!(state.schema_version, 3);
+        assert_eq!(state.schema_version, 4);
         assert!(!state.installations[0].legacy_project);
         assert!(state.installations[1].legacy_project);
         assert_eq!(
@@ -493,9 +496,10 @@ mod tests {
 
         let state = load_state(data.path()).unwrap();
 
-        assert_eq!(state.schema_version, 3);
+        assert_eq!(state.schema_version, 4);
         assert!(state.operation_journals.is_empty());
         assert_eq!(state.backup_policy.max_backups_per_skill, 5);
+        assert!(state.pinned_installation_ids.is_empty());
     }
 
     #[test]

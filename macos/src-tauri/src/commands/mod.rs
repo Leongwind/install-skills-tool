@@ -18,6 +18,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub inspections: Mutex<HashMap<String, SourceInspection>>,
     pub plans: Mutex<HashMap<String, PendingPlan>>,
+    pub update_plans: Mutex<HashMap<String, PendingUpdatePlan>>,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -511,6 +512,7 @@ pub fn get_app_overview(state: State<'_, AppState>) -> Result<AppOverview, Strin
     Ok(AppOverview {
         backup_policy: persisted.backup_policy,
         operation_journals: persisted.operation_journals,
+        pinned_installation_ids: persisted.pinned_installation_ids,
     })
 }
 
@@ -527,9 +529,10 @@ pub fn scan_client_inventory(
     Ok(crate::inventory::scan_client_inventory(&client, &persisted))
 }
 
-pub fn recover_operation_inner(
+fn rollback_journal(
     journal_id: &str,
     data_dir: &Path,
+    allow_completed: bool,
 ) -> Result<Vec<OperationResult>, String> {
     let mut persisted = storage::load_state(data_dir)?;
     let journal = persisted
@@ -538,11 +541,16 @@ pub fn recover_operation_inner(
         .find(|journal| journal.id == journal_id)
         .cloned()
         .ok_or_else(|| "恢复记录不存在".to_string())?;
-    if !matches!(
+    let recoverable = matches!(
         journal.status,
         OperationJournalStatus::RecoveryRequired | OperationJournalStatus::Partial
-    ) {
-        return Err("该操作当前不需要恢复".to_string());
+    ) || (allow_completed && journal.status == OperationJournalStatus::Completed);
+    if !recoverable {
+        return Err(if allow_completed {
+            "该操作不能回滚".to_string()
+        } else {
+            "该操作当前不需要恢复".to_string()
+        });
     }
     let mut results = Vec::new();
     for target in journal
@@ -615,12 +623,34 @@ pub fn recover_operation_inner(
     Ok(results)
 }
 
+pub fn recover_operation_inner(
+    journal_id: &str,
+    data_dir: &Path,
+) -> Result<Vec<OperationResult>, String> {
+    rollback_journal(journal_id, data_dir, false)
+}
+
+pub fn rollback_operation_inner(
+    journal_id: &str,
+    data_dir: &Path,
+) -> Result<Vec<OperationResult>, String> {
+    rollback_journal(journal_id, data_dir, true)
+}
+
 #[tauri::command]
 pub fn recover_operation(
     journal_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<OperationResult>, String> {
     recover_operation_inner(&journal_id, &state.data_dir)
+}
+
+#[tauri::command]
+pub fn rollback_operation(
+    journal_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OperationResult>, String> {
+    rollback_operation_inner(&journal_id, &state.data_dir)
 }
 
 pub fn export_skill_bundle_inner(
@@ -806,11 +836,345 @@ pub fn adopt_external_skill(
     )
 }
 
+pub fn set_installation_pinned_inner(
+    installation_id: &str,
+    pinned: bool,
+    data_dir: &Path,
+) -> Result<(), String> {
+    let mut persisted = storage::load_state(data_dir)?;
+    if !persisted
+        .installations
+        .iter()
+        .any(|installation| installation.id == installation_id)
+    {
+        return Err("安装记录不存在".to_string());
+    }
+    persisted
+        .pinned_installation_ids
+        .retain(|id| id != installation_id);
+    if pinned {
+        persisted
+            .pinned_installation_ids
+            .push(installation_id.to_string());
+    }
+    storage::save_state(data_dir, &persisted)
+}
+
+#[tauri::command]
+pub fn set_installation_pinned(
+    installation_id: String,
+    pinned: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    set_installation_pinned_inner(&installation_id, pinned, &state.data_dir)
+}
+
+pub async fn prepare_update_plan_inner(
+    installation_ids: &[String],
+    data_dir: &Path,
+) -> Result<PendingUpdatePlan, String> {
+    if installation_ids.is_empty() {
+        return Err("请至少选择一个受管理 Skill".to_string());
+    }
+    let persisted = storage::load_state(data_dir)?;
+    let mut entries = Vec::new();
+    let mut metadata_by_entry = HashMap::new();
+    let mut seen = HashSet::new();
+    for installation_id in installation_ids {
+        if !seen.insert(installation_id) {
+            continue;
+        }
+        let installation = persisted
+            .installations
+            .iter()
+            .find(|installation| installation.id == *installation_id)
+            .cloned()
+            .ok_or_else(|| format!("安装记录不存在: {installation_id}"))?;
+        let entry_id = Uuid::new_v4().to_string();
+        let target_hash = storage::inspect_tree(Path::new(&installation.resolved_path))
+            .ok()
+            .map(|value| value.0);
+        if persisted.pinned_installation_ids.contains(installation_id) {
+            entries.push(UpdatePlanEntry {
+                entry_id,
+                installation_id: installation.id,
+                skill_name: installation.skill_name,
+                resolved_path: installation.resolved_path,
+                status: UpdateState::Pinned,
+                message: "已固定当前版本，不参与更新".to_string(),
+                current_hash: target_hash,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
+                requires_confirmation: false,
+            });
+            continue;
+        }
+        let Some(source) = installation.source.clone() else {
+            entries.push(UpdatePlanEntry {
+                entry_id,
+                installation_id: installation.id,
+                skill_name: installation.skill_name,
+                resolved_path: installation.resolved_path,
+                status: UpdateState::SourceUnavailable,
+                message: "来源未绑定，仅管理本地副本".to_string(),
+                current_hash: target_hash,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
+                requires_confirmation: false,
+            });
+            continue;
+        };
+        let inspected = skill::inspect_source(source, data_dir)
+            .await
+            .and_then(|inspection| inspected_update(&inspection, &installation).cloned());
+        match inspected {
+            Ok(metadata) => {
+                let target_modified =
+                    target_hash.as_deref() != Some(installation.content_hash.as_str());
+                let source_changed = metadata.content_hash != installation.content_hash;
+                let changes = if Path::new(&installation.resolved_path).is_dir() {
+                    storage::compare_trees(
+                        Path::new(&installation.resolved_path),
+                        Path::new(&metadata.prepared_path),
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+                let (status, message, requires_confirmation) = if target_modified {
+                    (
+                        UpdateState::TargetModified,
+                        "目标内容已被手工修改；更新会先备份当前内容".to_string(),
+                        true,
+                    )
+                } else if source_changed {
+                    (UpdateState::SourceChanged, "来源有新内容".to_string(), true)
+                } else {
+                    (UpdateState::Current, "已是最新".to_string(), false)
+                };
+                if requires_confirmation {
+                    metadata_by_entry.insert(entry_id.clone(), metadata.clone());
+                }
+                entries.push(UpdatePlanEntry {
+                    entry_id,
+                    installation_id: installation.id,
+                    skill_name: installation.skill_name,
+                    resolved_path: installation.resolved_path,
+                    status,
+                    message,
+                    current_hash: target_hash,
+                    source_hash: Some(metadata.content_hash),
+                    source_revision: metadata.source_details.commit_sha,
+                    changes,
+                    requires_confirmation,
+                });
+            }
+            Err(message) => entries.push(UpdatePlanEntry {
+                entry_id,
+                installation_id: installation.id,
+                skill_name: installation.skill_name,
+                resolved_path: installation.resolved_path,
+                status: UpdateState::SourceUnavailable,
+                message,
+                current_hash: target_hash,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
+                requires_confirmation: false,
+            }),
+        }
+    }
+    Ok(PendingUpdatePlan {
+        public: UpdatePlan {
+            plan_id: Uuid::new_v4().to_string(),
+            entries,
+        },
+        metadata_by_entry,
+    })
+}
+
+#[tauri::command]
+pub async fn plan_updates(
+    installation_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<UpdatePlan, String> {
+    let pending = prepare_update_plan_inner(&installation_ids, &state.data_dir).await?;
+    let plan = pending.public.clone();
+    state
+        .update_plans
+        .lock()
+        .map_err(|_| "更新计划锁已损坏".to_string())?
+        .insert(plan.plan_id.clone(), pending);
+    Ok(plan)
+}
+
+pub fn apply_update_plan_inner(
+    pending: PendingUpdatePlan,
+    approved_entry_ids: &[String],
+    data_dir: &Path,
+) -> Result<Vec<OperationResult>, String> {
+    let mut persisted = storage::load_state(data_dir)?;
+    let approved = approved_entry_ids.iter().collect::<HashSet<_>>();
+    let journal_id = Uuid::new_v4().to_string();
+    let journal_targets = pending
+        .public
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.requires_confirmation
+                && approved.contains(&entry.entry_id)
+                && pending.metadata_by_entry.contains_key(&entry.entry_id)
+        })
+        .map(|entry| OperationJournalTarget {
+            path: entry.resolved_path.clone(),
+            existed_before: Path::new(&entry.resolved_path).exists(),
+            backup_id: None,
+            completed: false,
+            previous_installation: persisted
+                .installations
+                .iter()
+                .find(|installation| installation.id == entry.installation_id)
+                .cloned(),
+        })
+        .collect::<Vec<_>>();
+    if !journal_targets.is_empty() {
+        persisted.operation_journals.push(OperationJournal {
+            id: journal_id.clone(),
+            operation_type: "update".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            status: OperationJournalStatus::Applying,
+            targets: journal_targets,
+            message: None,
+        });
+        storage::save_state(data_dir, &persisted)?;
+    }
+    let mut results = Vec::new();
+    for entry in &pending.public.entries {
+        if !entry.requires_confirmation {
+            continue;
+        }
+        if !approved.contains(&entry.entry_id) {
+            results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "confirmationRequired".to_string(),
+                message: "需要确认后才能更新".to_string(),
+            });
+            continue;
+        }
+        let Some(metadata) = pending.metadata_by_entry.get(&entry.entry_id) else {
+            results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "failed".to_string(),
+                message: "更新来源已失效，请重新生成计划".to_string(),
+            });
+            continue;
+        };
+        let operation = (|| -> Result<(), String> {
+            let destination = PathBuf::from(&entry.resolved_path);
+            let backup_id = record_backup(data_dir, &mut persisted, &destination)?;
+            update_journal_target(
+                &mut persisted,
+                &journal_id,
+                &entry.resolved_path,
+                backup_id,
+                true,
+            );
+            storage::save_state(data_dir, &persisted)?;
+            storage::atomic_replace(Path::new(&metadata.prepared_path), &destination)?;
+            let installation = persisted
+                .installations
+                .iter_mut()
+                .find(|installation| installation.id == entry.installation_id)
+                .ok_or_else(|| "安装记录不存在".to_string())?;
+            installation.source = Some(metadata.source.clone());
+            installation.source_details = metadata.source_details.clone();
+            installation.content_hash = metadata.content_hash.clone();
+            storage::save_state(data_dir, &persisted)
+        })();
+        results.push(match operation {
+            Ok(()) => OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: true,
+                status: "updated".to_string(),
+                message: "更新完成，可在操作中心回滚".to_string(),
+            },
+            Err(message) => OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "failed".to_string(),
+                message,
+            },
+        });
+    }
+    if persisted
+        .operation_journals
+        .iter()
+        .any(|journal| journal.id == journal_id)
+    {
+        let failures = results
+            .iter()
+            .filter(|result| !result.success && result.status == "failed")
+            .count();
+        finish_journal(
+            &mut persisted,
+            &journal_id,
+            if failures == 0 {
+                OperationJournalStatus::Completed
+            } else {
+                OperationJournalStatus::Partial
+            },
+            (failures > 0).then(|| format!("{failures} 个目标失败，可执行恢复")),
+        );
+        storage::save_state(data_dir, &persisted)?;
+    }
+    Ok(results)
+}
+
+#[tauri::command]
+pub fn apply_update_plan(
+    plan_id: String,
+    approved_entry_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<OperationResult>, String> {
+    let pending = state
+        .update_plans
+        .lock()
+        .map_err(|_| "更新计划锁已损坏".to_string())?
+        .remove(&plan_id)
+        .ok_or_else(|| "更新计划不存在或已执行".to_string())?;
+    apply_update_plan_inner(pending, &approved_entry_ids, &state.data_dir)
+}
+
 #[tauri::command]
 pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatus>, String> {
     let persisted = storage::load_state(&state.data_dir)?;
     let mut statuses = Vec::new();
     for installation in persisted.installations {
+        if persisted.pinned_installation_ids.contains(&installation.id) {
+            statuses.push(UpdateStatus {
+                installation_id: installation.id,
+                status: UpdateState::Pinned,
+                message: "已固定当前版本".to_string(),
+                current_hash: None,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
+            });
+            continue;
+        }
         let target_hash = storage::inspect_tree(Path::new(&installation.resolved_path))
             .ok()
             .map(|value| value.0);
@@ -1304,6 +1668,136 @@ mod tests {
             storage::load_state(data.path()).unwrap().operation_journals[0].status,
             OperationJournalStatus::RolledBack
         );
+    }
+
+    fn tracked_local_installation(
+        data_dir: &Path,
+        source: &Path,
+        target: &Path,
+    ) -> PhysicalInstallation {
+        let content_hash = storage::inspect_tree(target).unwrap().0;
+        let installation = PhysicalInstallation {
+            id: "demo-id".to_string(),
+            skill_name: "demo".to_string(),
+            resolved_path: target.display().to_string(),
+            source: Some(SkillSource::LocalDirectory {
+                path: source.display().to_string(),
+            }),
+            source_details: SkillSourceDetails::default(),
+            content_hash,
+            scope: InstallScope::Global,
+            consumers: vec!["codex".to_string()],
+            passive_consumers: Vec::new(),
+            adapter_version: 1,
+            installed_at: Utc::now().to_rfc3339(),
+            provenance: InstallationProvenance::Tool,
+            legacy_project: false,
+        };
+        let mut persisted = PersistedState::default();
+        persisted.installations.push(installation.clone());
+        storage::save_state(data_dir, &persisted).unwrap();
+        installation
+    }
+
+    #[test]
+    fn update_plan_applies_source_changes_and_can_roll_back() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let previous = tracked_local_installation(data.path(), &source, &target);
+
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            std::slice::from_ref(&previous.id),
+            data.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(pending.public.entries.len(), 1);
+        let entry = &pending.public.entries[0];
+        assert_eq!(entry.status, UpdateState::SourceChanged);
+        assert!(entry.requires_confirmation);
+        assert_eq!(entry.changes.as_ref().unwrap().modified, vec!["SKILL.md"]);
+
+        let results = apply_update_plan_inner(
+            pending.clone(),
+            std::slice::from_ref(&entry.entry_id),
+            data.path(),
+        )
+        .unwrap();
+
+        assert!(results[0].success);
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("New"));
+        let updated_state = storage::load_state(data.path()).unwrap();
+        let journal = updated_state.operation_journals.last().unwrap();
+        assert_eq!(journal.operation_type, "update");
+        assert_eq!(journal.status, OperationJournalStatus::Completed);
+        assert_eq!(updated_state.backups.len(), 1);
+        assert_ne!(
+            updated_state.installations[0].content_hash,
+            previous.content_hash
+        );
+
+        let rollback = rollback_operation_inner(&journal.id, data.path()).unwrap();
+
+        assert!(rollback[0].success);
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("Old"));
+        let rolled_back = storage::load_state(data.path()).unwrap();
+        assert_eq!(
+            rolled_back.installations[0].content_hash,
+            previous.content_hash
+        );
+        assert_eq!(
+            rolled_back.operation_journals[0].status,
+            OperationJournalStatus::RolledBack
+        );
+    }
+
+    #[test]
+    fn pinned_installation_is_excluded_from_updates() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let installation = tracked_local_installation(data.path(), &source, &target);
+
+        set_installation_pinned_inner(&installation.id, true, data.path()).unwrap();
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            &[installation.id],
+            data.path(),
+        ))
+        .unwrap();
+
+        assert_eq!(pending.public.entries[0].status, UpdateState::Pinned);
+        assert!(pending.metadata_by_entry.is_empty());
     }
 
     #[test]

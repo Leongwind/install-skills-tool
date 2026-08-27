@@ -130,7 +130,12 @@ const mocks = vi.hoisted(() => ({
   getAppOverview: vi.fn(),
   scanClientInventory: vi.fn(),
   recoverOperation: vi.fn(),
+  rollbackOperation: vi.fn(),
   exportSkillBundle: vi.fn(),
+  checkUpdates: vi.fn(),
+  planUpdates: vi.fn(),
+  applyUpdatePlan: vi.fn(),
+  setInstallationPinned: vi.fn(),
 }));
 
 vi.mock("../src/api", () => ({
@@ -141,12 +146,16 @@ vi.mock("../src/api", () => ({
     getAppOverview: mocks.getAppOverview,
     scanClientInventory: mocks.scanClientInventory,
     recoverOperation: mocks.recoverOperation,
+    rollbackOperation: mocks.rollbackOperation,
     exportSkillBundle: mocks.exportSkillBundle,
     inspectSource: mocks.inspectSource,
     planInstall: mocks.planInstall,
     adoptExternalSkill: mocks.adoptExternalSkill,
     applyInstallPlan: vi.fn(),
-    checkUpdates: vi.fn().mockResolvedValue([]),
+    checkUpdates: mocks.checkUpdates,
+    planUpdates: mocks.planUpdates,
+    applyUpdatePlan: mocks.applyUpdatePlan,
+    setInstallationPinned: mocks.setInstallationPinned,
     uninstall: vi.fn(),
     restoreBackup: vi.fn(),
     exportDiagnostics: vi.fn(),
@@ -168,9 +177,12 @@ describe("Skill Installer desktop UI", () => {
         retentionDays: 90,
       },
       operationJournals: [],
+      pinnedInstallationIds: [],
     });
     mocks.inspectSource.mockResolvedValue(inspection);
     mocks.adoptExternalSkill.mockResolvedValue({});
+    mocks.checkUpdates.mockResolvedValue([]);
+    mocks.setInstallationPinned.mockResolvedValue(undefined);
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
@@ -262,6 +274,7 @@ describe("Skill Installer desktop UI", () => {
           ],
         },
       ],
+      pinnedInstallationIds: [],
     });
     mocks.recoverOperation.mockResolvedValue([]);
     render(<App />);
@@ -271,6 +284,111 @@ describe("Skill Installer desktop UI", () => {
 
     await waitFor(() =>
       expect(mocks.recoverOperation).toHaveBeenCalledWith("journal-id"),
+    );
+  });
+
+  it("previews source changes before applying a managed Skill update", async () => {
+    const managedEnvironment: EnvironmentScan = {
+      ...environment,
+      inventories: environment.inventories.map((inventory) =>
+        inventory.clientId === "kiro"
+          ? {
+              ...inventory,
+              directSkills: [
+                ...inventory.directSkills,
+                {
+                  inventoryId: "managed-id",
+                  name: "demo",
+                  directoryName: "demo",
+                  resolvedPath: "/Users/test/.kiro/skills/demo",
+                  contentHash: "old-hash",
+                  validity: "valid",
+                  managementStatus: "toolManaged",
+                  installationId: "installation-id",
+                  issues: [],
+                  consumers: ["kiro"],
+                },
+              ],
+            }
+          : inventory,
+      ),
+    };
+    mocks.scanEnvironment.mockResolvedValueOnce(managedEnvironment);
+    mocks.listInstallations.mockResolvedValueOnce([
+      {
+        id: "installation-id",
+        skillName: "demo",
+        resolvedPath: "/Users/test/.kiro/skills/demo",
+        source: { kind: "github", url: "https://github.com/acme/skills" },
+        sourceDetails: { subpath: "skills/demo" },
+        contentHash: "old-hash",
+        scope: "global",
+        consumers: ["kiro"],
+        passiveConsumers: [],
+        adapterVersion: 1,
+        installedAt: "2026-08-27T00:00:00Z",
+        provenance: "tool",
+        legacyProject: false,
+      },
+    ]);
+    mocks.checkUpdates.mockResolvedValueOnce([
+      {
+        installationId: "installation-id",
+        status: "sourceChanged",
+        message: "来源有新内容",
+        currentHash: "old-hash",
+        sourceHash: "new-hash",
+        sourceRevision: "abcdef123456",
+        changes: { added: ["README.md"], modified: ["SKILL.md"], removed: [] },
+      },
+    ]);
+    mocks.planUpdates.mockResolvedValueOnce({
+      planId: "update-plan-id",
+      entries: [
+        {
+          entryId: "update-entry-id",
+          installationId: "installation-id",
+          skillName: "demo",
+          resolvedPath: "/Users/test/.kiro/skills/demo",
+          status: "sourceChanged",
+          message: "来源有新内容",
+          currentHash: "old-hash",
+          sourceHash: "new-hash",
+          sourceRevision: "abcdef123456",
+          changes: { added: ["README.md"], modified: ["SKILL.md"], removed: [] },
+          requiresConfirmation: true,
+        },
+      ],
+    });
+    mocks.applyUpdatePlan.mockResolvedValueOnce([
+      {
+        entryId: "update-entry-id",
+        skillName: "demo",
+        path: "/Users/test/.kiro/skills/demo",
+        success: true,
+        status: "updated",
+        message: "更新完成，可在操作中心回滚",
+      },
+    ]);
+
+    render(<App />);
+    await waitFor(() => expect(mocks.scanEnvironment).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: /IDE Skill 库存/ }));
+    fireEvent.click(screen.getByRole("button", { name: "检查更新" }));
+
+    expect(await screen.findByText(/来源有新内容/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "生成更新计划 (1)" }));
+    expect(await screen.findByText("确认更新内容")).toBeInTheDocument();
+    expect(screen.getAllByText("新增 1 · 修改 1 · 删除 0")).toHaveLength(2);
+    const applyButton = screen.getByRole("button", { name: "应用已确认更新" });
+    expect(applyButton).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: "确认更新 demo" }));
+    fireEvent.click(applyButton);
+
+    await waitFor(() =>
+      expect(mocks.applyUpdatePlan).toHaveBeenCalledWith("update-plan-id", [
+        "update-entry-id",
+      ]),
     );
   });
 });
