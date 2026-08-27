@@ -28,6 +28,26 @@ macOS 0.2.1 passed React, TypeScript, Rust, Clippy, Tauri build, DMG verificatio
 and GitHub Actions. The verified local DMG SHA-256 was
 `cb898336dc3ca08c93dacac779350126f9dc2051d231a252c0066575a0279abc`.
 
+## macOS lifecycle and reproducibility, 2026-08-27
+
+| Commit | Change |
+|---|---|
+| `67fe54c` | Added transparent client detection evidence and crash recovery state. |
+| `8ef2608` | Added resilient inventory management, update diffs, backup policy, and portable ZIP export. |
+| `aa66cb4` | Documented macOS 0.3.0 and enabled Apple Silicon plus Intel DMG artifacts. |
+| `47f9672` | Added planned, confirmed, backed-up and reversible Skill updates with version pinning. |
+| `8303874` | Added reproducible JSON lockfile export/import with source-hash and IDE reconciliation. |
+| `e9b4347` | Added the unified operation journal, rollback controls and managed backup policy UI. |
+
+macOS 0.4.0 uses state schema v4. Existing v1-v3 state migrates atomically. Portable ZIP
+bundles carry Skill content; JSON lockfiles carry source provenance, expected hashes, IDE
+assignments and pin state. Lockfile reconciliation does not automatically delete extra local
+installations. CI artifacts use ad-hoc signing and are not Developer ID signed or notarized.
+The locally verified Apple Silicon 0.4.0 DMG has SHA-256
+`234a73c39a905678b4d2848d0b867ed5f73e966c7ac8f575f8b1a86d0033309c`.
+`hdiutil verify`, bundle version/identifier inspection, arm64 Mach-O inspection and strict
+ad-hoc `codesign` verification all passed.
+
 ## Windows 0.1.0, started 2026-08-02
 
 | Commit | Change |

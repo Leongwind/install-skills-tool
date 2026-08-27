@@ -6,9 +6,11 @@ This is the entry point for continuing the project on another machine.
 
 - Repository: `Leongwind/install-skills-tool`
 - Default branch: `main`
-- macOS version: `0.2.1`
+- macOS version: `0.4.0`, local verification complete; dual-architecture CI pending the next push
 - Windows version: `0.1.0`, Windows CI passed, waiting for Win11 real-IDE validation
 - Latest Windows code milestone: `89cb9ed`, GitHub source revision tracking
+- Latest macOS milestones: `47f9672` safe update lifecycle, `8303874` reproducible
+  lockfiles, `e9b4347` unified operation center
 
 ## Platform boundary
 
@@ -42,7 +44,17 @@ Then run `git status -sb` and `git log -5 --oneline` before changing anything.
 - Neither layer proves that a real IDE displays the installed Skill.
 - Only the Win11 checklist with real Cursor and Kiro can mark real Skill-IDE assignment as verified.
 
-## Current next step
+## Current next steps
+
+### macOS
+
+Push the 0.4.0 milestone commits, wait for `.github/workflows/macos.yml`, and verify both
+`skill-installer-macos-arm64-dmg` and `skill-installer-macos-x64-dmg` artifacts plus their
+`SHA256SUMS.txt`. Builds use Tauri ad-hoc signing (`signingIdentity: "-"`); Developer ID
+signing and notarization remain blocked on Apple credentials. Never describe ad-hoc artifacts
+as Developer ID signed or notarized.
+
+### Windows
 
 Download the NSIS artifact recorded in `docs/handoffs/windows-win11-testing.md`, then
 complete real Windows 11 x64 validation with Cursor and Kiro. Record results in a dated

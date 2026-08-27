@@ -535,6 +535,10 @@ mod tests {
         let tree = parse_github_url("https://github.com/acme/skills/tree/v1/demo").unwrap();
         assert_eq!(tree.subpath, "demo");
         assert_eq!(tree.reference, "v1");
+        let pinned_root =
+            parse_github_url("https://github.com/acme/skills/tree/0123456789abcdef").unwrap();
+        assert_eq!(pinned_root.reference, "0123456789abcdef");
+        assert_eq!(pinned_root.subpath, "");
         let file =
             parse_github_url("https://github.com/acme/skills/blob/main/demo/SKILL.md").unwrap();
         assert_eq!(file.subpath, "demo");

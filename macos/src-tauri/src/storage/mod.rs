@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn loading_v2_state_adds_v3_recovery_defaults() {
+    fn loading_v2_state_adds_v4_recovery_and_pin_defaults() {
         let data = tempfile::tempdir().unwrap();
         fs::write(
             data.path().join("state.json"),
@@ -515,6 +515,38 @@ mod tests {
         assert!(state.operation_journals.is_empty());
         assert_eq!(state.backup_policy.max_backups_per_skill, 5);
         assert!(state.pinned_installation_ids.is_empty());
+    }
+
+    #[test]
+    fn loading_v3_state_marks_interrupted_operations_for_recovery() {
+        let data = tempfile::tempdir().unwrap();
+        fs::write(
+            data.path().join("state.json"),
+            r#"{
+              "schemaVersion": 3,
+              "installations": [],
+              "backups": [],
+              "operationJournals": [{
+                "id": "interrupted",
+                "operationType": "install",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "finishedAt": null,
+                "status": "applying",
+                "targets": [],
+                "message": null
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let state = load_state(data.path()).unwrap();
+
+        assert_eq!(state.schema_version, 4);
+        assert!(state.pinned_installation_ids.is_empty());
+        assert_eq!(
+            state.operation_journals[0].status,
+            crate::domain::OperationJournalStatus::RecoveryRequired
+        );
     }
 
     #[test]
