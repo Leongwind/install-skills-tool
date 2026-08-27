@@ -685,6 +685,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: root.to_string(),
+            inventory_skills_paths: vec![root.to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -737,6 +739,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -779,6 +783,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -816,6 +822,11 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: current_root.display().to_string(),
+            inventory_skills_paths: vec![
+                current_root.display().to_string(),
+                legacy_skill.parent().unwrap().display().to_string(),
+            ],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -874,6 +885,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: "/tmp/kiro".to_string(),
+            inventory_skills_paths: vec!["/tmp/kiro".to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };

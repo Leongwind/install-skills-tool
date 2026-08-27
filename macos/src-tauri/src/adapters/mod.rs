@@ -8,7 +8,8 @@ pub struct Adapter {
     pub id: &'static str,
     pub name: &'static str,
     pub edition: ClientEdition,
-    pub global_relative: &'static str,
+    pub install_relative: &'static str,
+    pub inventory_relatives: &'static [&'static str],
 }
 
 pub fn adapters() -> Vec<Adapter> {
@@ -17,49 +18,64 @@ pub fn adapters() -> Vec<Adapter> {
             id: "codex",
             name: "Codex",
             edition: ClientEdition::Standard,
-            global_relative: ".agents/skills",
+            install_relative: ".agents/skills",
+            inventory_relatives: &[".agents/skills", ".codex/skills"],
         },
         Adapter {
             id: "claude-code",
             name: "Claude Code",
             edition: ClientEdition::Standard,
-            global_relative: ".claude/skills",
+            install_relative: ".claude/skills",
+            inventory_relatives: &[".claude/skills"],
         },
         Adapter {
             id: "kiro",
             name: "Kiro",
             edition: ClientEdition::Standard,
-            global_relative: ".kiro/skills",
+            install_relative: ".kiro/skills",
+            inventory_relatives: &[".kiro/skills"],
         },
         Adapter {
             id: "cursor",
             name: "Cursor",
             edition: ClientEdition::Standard,
-            global_relative: ".cursor/skills",
+            install_relative: ".cursor/skills",
+            inventory_relatives: &[".cursor/skills"],
         },
         Adapter {
             id: "windsurf",
             name: "Windsurf",
             edition: ClientEdition::Standard,
-            global_relative: ".codeium/windsurf/skills",
+            install_relative: ".codeium/windsurf/skills",
+            inventory_relatives: &[".codeium/windsurf/skills"],
         },
         Adapter {
             id: "trae-international",
             name: "TRAE International",
             edition: ClientEdition::TraeInternational,
-            global_relative: ".trae/skills",
+            install_relative: ".trae/skills",
+            inventory_relatives: &[".trae/skills"],
         },
         Adapter {
             id: "trae-china",
             name: "TRAE China",
             edition: ClientEdition::TraeChina,
-            global_relative: ".trae-cn/skills",
+            install_relative: ".trae-cn/skills",
+            inventory_relatives: &[".trae-cn/skills"],
         },
     ]
 }
 
 pub fn resolve_global_target(adapter: &Adapter, home: &Path, skill_name: &str) -> PathBuf {
-    home.join(adapter.global_relative).join(skill_name)
+    home.join(adapter.install_relative).join(skill_name)
+}
+
+pub fn resolve_inventory_roots(adapter: &Adapter, home: &Path) -> Vec<PathBuf> {
+    adapter
+        .inventory_relatives
+        .iter()
+        .map(|relative| home.join(relative))
+        .collect()
 }
 
 pub fn detected_map(clients: &[DetectedClient]) -> HashMap<String, DetectedClient> {
@@ -128,6 +144,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_separates_install_root_from_inventory_roots() {
+        let codex = adapters()
+            .into_iter()
+            .find(|adapter| adapter.id == "codex")
+            .unwrap();
+        let home = Path::new("/Users/test");
+
+        assert_eq!(
+            resolve_global_target(&codex, home, "demo"),
+            home.join(".agents/skills/demo")
+        );
+        assert_eq!(
+            resolve_inventory_roots(&codex, home),
+            vec![home.join(".agents/skills"), home.join(".codex/skills"),]
+        );
+    }
+
+    #[test]
     fn trae_passive_discovery_obeys_version_gate() {
         let client = |version: &str| DetectedClient {
             id: "trae-international".to_string(),
@@ -138,6 +172,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: String::new(),
+            inventory_skills_paths: Vec::new(),
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };

@@ -192,6 +192,13 @@ pub fn scan_client_inventory(
 }
 
 pub fn inventory_roots(client: &DetectedClient) -> Vec<PathBuf> {
+    if !client.inventory_skills_paths.is_empty() {
+        return client
+            .inventory_skills_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+    }
     let primary = PathBuf::from(&client.global_skills_path);
     let mut roots = vec![primary.clone()];
     if client.id == "codex" {
@@ -274,7 +281,7 @@ mod tests {
         let managed_path = root.path().join("managed");
         let managed_hash = crate::storage::inspect_tree(&managed_path).unwrap().0;
         let state = PersistedState {
-            schema_version: 2,
+            schema_version: 3,
             installations: vec![PhysicalInstallation {
                 id: "managed-id".to_string(),
                 skill_name: "managed".to_string(),
@@ -291,6 +298,8 @@ mod tests {
                 legacy_project: false,
             }],
             backups: Vec::new(),
+            operation_journals: Vec::new(),
+            backup_policy: BackupPolicy::default(),
         };
         let client = DetectedClient {
             id: "kiro".to_string(),
@@ -301,6 +310,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -350,6 +361,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -379,6 +392,8 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };
@@ -422,6 +437,11 @@ mod tests {
             application_path: None,
             cli_path: None,
             global_skills_path: current_root.display().to_string(),
+            inventory_skills_paths: vec![
+                current_root.display().to_string(),
+                legacy_root.display().to_string(),
+            ],
+            detection_evidence: Vec::new(),
             supports_skills: true,
             notes: Vec::new(),
         };

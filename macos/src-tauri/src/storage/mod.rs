@@ -21,6 +21,7 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let mut state: PersistedState =
         serde_json::from_slice(&bytes).map_err(|error| format!("状态文件无效: {error}"))?;
+    let original_schema = state.schema_version;
     if state.schema_version == 1 {
         for installation in &mut state.installations {
             installation.legacy_project =
@@ -28,6 +29,23 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
             installation.provenance = crate::domain::InstallationProvenance::Tool;
         }
         state.schema_version = 2;
+    }
+    if state.schema_version == 2 {
+        state.schema_version = 3;
+    }
+    let mut changed = original_schema != state.schema_version;
+    for journal in &mut state.operation_journals {
+        if matches!(
+            journal.status,
+            crate::domain::OperationJournalStatus::Preparing
+                | crate::domain::OperationJournalStatus::Applying
+                | crate::domain::OperationJournalStatus::Partial
+        ) {
+            journal.status = crate::domain::OperationJournalStatus::RecoveryRequired;
+            changed = true;
+        }
+    }
+    if changed {
         save_state(data_dir, &state)?;
     }
     Ok(state)
@@ -318,12 +336,32 @@ mod tests {
 
         let state = load_state(data.path()).unwrap();
 
-        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.schema_version, 3);
         assert!(!state.installations[0].legacy_project);
         assert!(state.installations[1].legacy_project);
         assert_eq!(
             state.installations[0].provenance,
             crate::domain::InstallationProvenance::Tool
         );
+    }
+
+    #[test]
+    fn loading_v2_state_adds_v3_recovery_defaults() {
+        let data = tempfile::tempdir().unwrap();
+        fs::write(
+            data.path().join("state.json"),
+            r#"{
+              "schemaVersion": 2,
+              "installations": [],
+              "backups": []
+            }"#,
+        )
+        .unwrap();
+
+        let state = load_state(data.path()).unwrap();
+
+        assert_eq!(state.schema_version, 3);
+        assert!(state.operation_journals.is_empty());
+        assert_eq!(state.backup_policy.max_backups_per_skill, 5);
     }
 }

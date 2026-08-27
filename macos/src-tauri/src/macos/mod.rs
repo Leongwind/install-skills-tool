@@ -1,5 +1,7 @@
-use crate::adapters::adapters;
-use crate::domain::{ClientEdition, DetectedClient, DetectionStatus};
+use crate::adapters::{adapters, resolve_inventory_roots};
+use crate::domain::{
+    ClientEdition, DetectedClient, DetectionEvidence, DetectionEvidenceKind, DetectionStatus,
+};
 use plist::Value;
 use semver::Version;
 use serde_json::Value as JsonValue;
@@ -85,6 +87,54 @@ fn version_supported(raw: Option<&str>, minimum: &str) -> bool {
         Some(version) => version >= Version::parse(minimum).expect("valid minimum version"),
         None => true,
     }
+}
+
+fn build_detection_evidence(
+    application: Option<&Path>,
+    cli: Option<&Path>,
+    config: &Path,
+    inventory_paths: &[PathBuf],
+    install_root: &Path,
+    version: Option<&str>,
+) -> Vec<DetectionEvidence> {
+    let mut evidence = Vec::new();
+    if let Some(path) = application {
+        evidence.push(DetectionEvidence {
+            kind: DetectionEvidenceKind::Application,
+            path: path.display().to_string(),
+            version: version.map(str::to_owned),
+            message: "检测到 macOS 应用".to_string(),
+        });
+    }
+    if let Some(path) = cli {
+        evidence.push(DetectionEvidence {
+            kind: DetectionEvidenceKind::Cli,
+            path: path.display().to_string(),
+            version: None,
+            message: "检测到命令行工具".to_string(),
+        });
+    }
+    if config.is_dir() {
+        evidence.push(DetectionEvidence {
+            kind: DetectionEvidenceKind::Configuration,
+            path: config.display().to_string(),
+            version: None,
+            message: "检测到用户配置目录".to_string(),
+        });
+    }
+    for path in inventory_paths.iter().filter(|path| path.is_dir()) {
+        evidence.push(DetectionEvidence {
+            kind: DetectionEvidenceKind::SkillsDirectory,
+            path: path.display().to_string(),
+            version: None,
+            message: if path == install_root {
+                "默认写入目录".to_string()
+            } else {
+                "兼容库存目录".to_string()
+            },
+        });
+    }
+    evidence
 }
 
 pub fn scan_clients() -> Vec<DetectedClient> {
@@ -173,6 +223,16 @@ pub fn scan_clients() -> Vec<DetectedClient> {
                 status,
                 DetectionStatus::Installed | DetectionStatus::CliOnly
             );
+            let inventory_paths = resolve_inventory_roots(&adapter, &home);
+            let install_root = home.join(adapter.install_relative);
+            let detection_evidence = build_detection_evidence(
+                application.as_deref(),
+                cli.as_deref(),
+                &config,
+                &inventory_paths,
+                &install_root,
+                version.as_deref(),
+            );
             DetectedClient {
                 id: adapter.id.to_string(),
                 name: adapter.name.to_string(),
@@ -181,7 +241,12 @@ pub fn scan_clients() -> Vec<DetectedClient> {
                 status,
                 application_path: application.map(|path| path.display().to_string()),
                 cli_path: cli.map(|path| path.display().to_string()),
-                global_skills_path: home.join(adapter.global_relative).display().to_string(),
+                global_skills_path: install_root.display().to_string(),
+                inventory_skills_paths: inventory_paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                detection_evidence,
                 supports_skills: usable && supports_version,
                 notes,
             }
@@ -205,6 +270,28 @@ mod tests {
         assert!(is_codex_bundle_id(Some("com.openai.codex")));
         assert!(!is_codex_bundle_id(Some("com.openai.chat")));
         assert!(!is_codex_bundle_id(None));
+    }
+
+    #[test]
+    fn detection_evidence_distinguishes_default_and_compatible_skill_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install = temp.path().join(".agents/skills");
+        let legacy = temp.path().join(".codex/skills");
+        std::fs::create_dir_all(&install).expect("install root");
+        std::fs::create_dir_all(&legacy).expect("legacy root");
+
+        let evidence = build_detection_evidence(
+            None,
+            None,
+            &temp.path().join("missing-config"),
+            &[install.clone(), legacy.clone()],
+            &install,
+            None,
+        );
+
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(evidence[0].message, "默认写入目录");
+        assert_eq!(evidence[1].message, "兼容库存目录");
     }
 
     #[test]

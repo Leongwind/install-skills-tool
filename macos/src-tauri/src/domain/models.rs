@@ -19,6 +19,24 @@ pub enum DetectionStatus {
     NotInstalled,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DetectionEvidenceKind {
+    Application,
+    Cli,
+    Configuration,
+    SkillsDirectory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectionEvidence {
+    pub kind: DetectionEvidenceKind,
+    pub path: String,
+    pub version: Option<String>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DetectedClient {
@@ -30,6 +48,10 @@ pub struct DetectedClient {
     pub application_path: Option<String>,
     pub cli_path: Option<String>,
     pub global_skills_path: String,
+    #[serde(default)]
+    pub inventory_skills_paths: Vec<String>,
+    #[serde(default)]
+    pub detection_evidence: Vec<DetectionEvidence>,
     pub supports_skills: bool,
     pub notes: Vec<String>,
 }
@@ -198,20 +220,76 @@ pub struct BackupRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum OperationJournalStatus {
+    Preparing,
+    Applying,
+    Partial,
+    Completed,
+    RecoveryRequired,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationJournalTarget {
+    pub path: String,
+    pub existed_before: bool,
+    pub backup_id: Option<String>,
+    pub completed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationJournal {
+    pub id: String,
+    pub operation_type: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+    pub status: OperationJournalStatus,
+    pub targets: Vec<OperationJournalTarget>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupPolicy {
+    pub max_backups_per_skill: usize,
+    pub max_total_bytes: u64,
+    pub retention_days: u32,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            max_backups_per_skill: 5,
+            max_total_bytes: 1024 * 1024 * 1024,
+            retention_days: 90,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedState {
     pub schema_version: u32,
     pub installations: Vec<PhysicalInstallation>,
     pub backups: Vec<BackupRecord>,
+    #[serde(default)]
+    pub operation_journals: Vec<OperationJournal>,
+    #[serde(default)]
+    pub backup_policy: BackupPolicy,
 }
 
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             installations: Vec::new(),
             backups: Vec::new(),
+            operation_journals: Vec::new(),
+            backup_policy: BackupPolicy::default(),
         }
     }
 }
