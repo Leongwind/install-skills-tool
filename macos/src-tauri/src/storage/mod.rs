@@ -283,6 +283,21 @@ pub fn enforce_backup_policy(state: &mut PersistedState) -> Result<(), String> {
     let now = Utc::now();
     let retention_days = i64::from(state.backup_policy.retention_days);
     let mut remove_ids = HashSet::new();
+    let protected_ids = state
+        .operation_journals
+        .iter()
+        .filter(|journal| {
+            matches!(
+                journal.status,
+                crate::domain::OperationJournalStatus::Preparing
+                    | crate::domain::OperationJournalStatus::Applying
+                    | crate::domain::OperationJournalStatus::Partial
+                    | crate::domain::OperationJournalStatus::RecoveryRequired
+            )
+        })
+        .flat_map(|journal| journal.targets.iter())
+        .filter_map(|target| target.backup_id.clone())
+        .collect::<HashSet<_>>();
     let mut by_target: HashMap<&str, Vec<&BackupRecord>> = HashMap::new();
     for backup in &state.backups {
         by_target
@@ -328,7 +343,7 @@ pub fn enforce_backup_policy(state: &mut PersistedState) -> Result<(), String> {
     for backup in state
         .backups
         .iter()
-        .filter(|backup| remove_ids.contains(&backup.id))
+        .filter(|backup| remove_ids.contains(&backup.id) && !protected_ids.contains(&backup.id))
     {
         let path = Path::new(&backup.backup_path);
         if path.is_dir() {
@@ -339,7 +354,7 @@ pub fn enforce_backup_policy(state: &mut PersistedState) -> Result<(), String> {
     }
     state
         .backups
-        .retain(|backup| !remove_ids.contains(&backup.id));
+        .retain(|backup| !remove_ids.contains(&backup.id) || protected_ids.contains(&backup.id));
     Ok(())
 }
 

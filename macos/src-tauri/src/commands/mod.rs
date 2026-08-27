@@ -1140,6 +1140,21 @@ pub fn adopt_external_skill_inner(
         legacy_project: false,
     };
     persisted.installations.push(installation.clone());
+    persisted.operation_journals.push(OperationJournal {
+        id: Uuid::new_v4().to_string(),
+        operation_type: "adopt".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        finished_at: Some(Utc::now().to_rfc3339()),
+        status: OperationJournalStatus::Completed,
+        targets: vec![OperationJournalTarget {
+            path: installation.resolved_path.clone(),
+            existed_before: true,
+            backup_id: None,
+            completed: true,
+            previous_installation: None,
+        }],
+        message: Some("已纳入管理；回滚只移除管理记录，不删除 Skill".to_string()),
+    });
     storage::save_state(data_dir, &persisted)?;
     Ok(installation)
 }
@@ -1566,13 +1581,12 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
     Ok(statuses)
 }
 
-#[tauri::command]
-pub fn uninstall_installation(
-    installation_id: String,
+pub fn uninstall_installation_inner(
+    installation_id: &str,
     force: bool,
-    state: State<'_, AppState>,
+    data_dir: &Path,
 ) -> Result<OperationResult, String> {
-    let mut persisted = storage::load_state(&state.data_dir)?;
+    let mut persisted = storage::load_state(data_dir)?;
     let installation = persisted
         .installations
         .iter()
@@ -1593,13 +1607,59 @@ pub fn uninstall_installation(
         });
     }
     if path.exists() {
-        record_backup(&state.data_dir, &mut persisted, &path)?;
-        fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+        let journal_id = Uuid::new_v4().to_string();
+        persisted.operation_journals.push(OperationJournal {
+            id: journal_id.clone(),
+            operation_type: "uninstall".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            status: OperationJournalStatus::Applying,
+            targets: vec![OperationJournalTarget {
+                path: installation.resolved_path.clone(),
+                existed_before: true,
+                backup_id: None,
+                completed: false,
+                previous_installation: Some(installation.clone()),
+            }],
+            message: None,
+        });
+        storage::save_state(data_dir, &persisted)?;
+        let operation = (|| -> Result<(), String> {
+            let backup_id = record_backup(data_dir, &mut persisted, &path)?;
+            update_journal_target(
+                &mut persisted,
+                &journal_id,
+                &installation.resolved_path,
+                backup_id,
+                true,
+            );
+            storage::save_state(data_dir, &persisted)?;
+            fs::remove_dir_all(&path).map_err(|error| error.to_string())
+        })();
+        if let Err(message) = operation {
+            finish_journal(
+                &mut persisted,
+                &journal_id,
+                OperationJournalStatus::Partial,
+                Some(message.clone()),
+            );
+            storage::save_state(data_dir, &persisted)?;
+            return Err(message);
+        }
+        finish_journal(
+            &mut persisted,
+            &journal_id,
+            OperationJournalStatus::Completed,
+            None,
+        );
     }
     persisted
         .installations
         .retain(|item| item.id != installation_id);
-    storage::save_state(&state.data_dir, &persisted)?;
+    persisted
+        .pinned_installation_ids
+        .retain(|id| id != installation_id);
+    storage::save_state(data_dir, &persisted)?;
     Ok(OperationResult {
         entry_id: None,
         skill_name: Some(installation.skill_name),
@@ -1611,11 +1671,16 @@ pub fn uninstall_installation(
 }
 
 #[tauri::command]
-pub fn restore_backup(
-    backup_id: String,
+pub fn uninstall_installation(
+    installation_id: String,
+    force: bool,
     state: State<'_, AppState>,
 ) -> Result<OperationResult, String> {
-    let mut persisted = storage::load_state(&state.data_dir)?;
+    uninstall_installation_inner(&installation_id, force, &state.data_dir)
+}
+
+pub fn restore_backup_inner(backup_id: &str, data_dir: &Path) -> Result<OperationResult, String> {
+    let mut persisted = storage::load_state(data_dir)?;
     let backup = persisted
         .backups
         .iter()
@@ -1623,9 +1688,78 @@ pub fn restore_backup(
         .cloned()
         .ok_or_else(|| "备份不存在".to_string())?;
     let destination = PathBuf::from(&backup.original_path);
-    record_backup(&state.data_dir, &mut persisted, &destination)?;
-    storage::atomic_replace(Path::new(&backup.backup_path), &destination)?;
-    storage::save_state(&state.data_dir, &persisted)?;
+    let existed_before = destination.exists();
+    let journal_id = Uuid::new_v4().to_string();
+    persisted.operation_journals.push(OperationJournal {
+        id: journal_id.clone(),
+        operation_type: "restore".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        finished_at: None,
+        status: OperationJournalStatus::Applying,
+        targets: vec![OperationJournalTarget {
+            path: backup.original_path.clone(),
+            existed_before,
+            backup_id: None,
+            completed: false,
+            previous_installation: existed_before
+                .then(|| {
+                    persisted
+                        .installations
+                        .iter()
+                        .find(|installation| installation.resolved_path == backup.original_path)
+                        .cloned()
+                })
+                .flatten(),
+        }],
+        message: None,
+    });
+    storage::save_state(data_dir, &persisted)?;
+    let operation = (|| -> Result<(), String> {
+        let previous_backup_id = storage::create_backup(data_dir, &destination)?.map(|backup| {
+            let id = backup.id.clone();
+            persisted.backups.push(backup);
+            id
+        });
+        update_journal_target(
+            &mut persisted,
+            &journal_id,
+            &backup.original_path,
+            previous_backup_id,
+            true,
+        );
+        storage::save_state(data_dir, &persisted)?;
+        storage::atomic_replace(Path::new(&backup.backup_path), &destination)?;
+        if let Ok((hash, _, _, _)) = storage::inspect_tree(&destination) {
+            if let Some(installation) = persisted
+                .installations
+                .iter_mut()
+                .find(|installation| installation.resolved_path == backup.original_path)
+            {
+                installation.content_hash = hash;
+            }
+        }
+        storage::enforce_backup_policy(&mut persisted)?;
+        Ok(())
+    })();
+    match operation {
+        Ok(()) => finish_journal(
+            &mut persisted,
+            &journal_id,
+            OperationJournalStatus::Completed,
+            None,
+        ),
+        Err(message) => {
+            finish_journal(
+                &mut persisted,
+                &journal_id,
+                OperationJournalStatus::Partial,
+                Some(message.clone()),
+            );
+            storage::save_state(data_dir, &persisted)?;
+            return Err(message);
+        }
+    }
+    storage::save_state(data_dir, &persisted)?;
     Ok(OperationResult {
         entry_id: None,
         skill_name: None,
@@ -1634,6 +1768,84 @@ pub fn restore_backup(
         status: "restored".to_string(),
         message: "备份已恢复".to_string(),
     })
+}
+
+#[tauri::command]
+pub fn restore_backup(
+    backup_id: String,
+    state: State<'_, AppState>,
+) -> Result<OperationResult, String> {
+    restore_backup_inner(&backup_id, &state.data_dir)
+}
+
+pub fn set_backup_policy_inner(policy: BackupPolicy, data_dir: &Path) -> Result<(), String> {
+    if !(1..=100).contains(&policy.max_backups_per_skill) {
+        return Err("每个 Skill 的备份数必须在 1 到 100 之间".to_string());
+    }
+    if policy.max_total_bytes < 1024 * 1024 {
+        return Err("备份总空间至少为 1 MB".to_string());
+    }
+    if !(1..=3650).contains(&policy.retention_days) {
+        return Err("保留天数必须在 1 到 3650 之间".to_string());
+    }
+    let mut persisted = storage::load_state(data_dir)?;
+    persisted.backup_policy = policy;
+    storage::enforce_backup_policy(&mut persisted)?;
+    storage::save_state(data_dir, &persisted)
+}
+
+#[tauri::command]
+pub fn set_backup_policy(policy: BackupPolicy, state: State<'_, AppState>) -> Result<(), String> {
+    set_backup_policy_inner(policy, &state.data_dir)
+}
+
+pub fn delete_backup_inner(backup_id: &str, data_dir: &Path) -> Result<(), String> {
+    let mut persisted = storage::load_state(data_dir)?;
+    let backup = persisted
+        .backups
+        .iter()
+        .find(|backup| backup.id == backup_id)
+        .cloned()
+        .ok_or_else(|| "备份不存在".to_string())?;
+    let used_for_recovery = persisted.operation_journals.iter().any(|journal| {
+        matches!(
+            journal.status,
+            OperationJournalStatus::Preparing
+                | OperationJournalStatus::Applying
+                | OperationJournalStatus::Partial
+                | OperationJournalStatus::RecoveryRequired
+        ) && journal
+            .targets
+            .iter()
+            .any(|target| target.backup_id.as_deref() == Some(backup_id))
+    });
+    if used_for_recovery {
+        return Err("该备份仍用于未完成操作的故障恢复，不能删除".to_string());
+    }
+    let backup_root = data_dir.join("backups");
+    fs::create_dir_all(&backup_root).map_err(|error| error.to_string())?;
+    let canonical_root = backup_root
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let path = PathBuf::from(&backup.backup_path);
+    if path.exists() {
+        let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+        if !canonical.starts_with(&canonical_root) || canonical.parent() != Some(&canonical_root) {
+            return Err("备份路径超出应用备份目录".to_string());
+        }
+        if canonical.is_dir() {
+            fs::remove_dir_all(&canonical).map_err(|error| error.to_string())?;
+        } else {
+            fs::remove_file(&canonical).map_err(|error| error.to_string())?;
+        }
+    }
+    persisted.backups.retain(|backup| backup.id != backup_id);
+    storage::save_state(data_dir, &persisted)
+}
+
+#[tauri::command]
+pub fn delete_backup(backup_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    delete_backup_inner(&backup_id, &state.data_dir)
 }
 
 #[tauri::command]
@@ -2278,5 +2490,104 @@ mod tests {
         assert_eq!(pending.public.missing_client_ids, vec!["missing-client"]);
         assert_eq!(pending.public.unavailable_skills.len(), 1);
         assert!(pending.public.unavailable_skills[0].reason.contains("哈希"));
+    }
+
+    #[test]
+    fn uninstall_is_journaled_and_can_restore_the_previous_installation() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        for root in [&source, &target] {
+            fs::write(
+                root.join("SKILL.md"),
+                "---\nname: demo\ndescription: Demo\n---\n",
+            )
+            .unwrap();
+        }
+        let installation = tracked_local_installation(data.path(), &source, &target);
+
+        let removed = uninstall_installation_inner(&installation.id, false, data.path()).unwrap();
+
+        assert!(removed.success);
+        assert!(!target.exists());
+        let state = storage::load_state(data.path()).unwrap();
+        let journal = state.operation_journals.last().unwrap();
+        assert_eq!(journal.operation_type, "uninstall");
+        assert_eq!(journal.status, OperationJournalStatus::Completed);
+        assert!(state.installations.is_empty());
+
+        let rollback = rollback_operation_inner(&journal.id, data.path()).unwrap();
+
+        assert!(rollback[0].success);
+        assert!(target.join("SKILL.md").is_file());
+        assert_eq!(
+            storage::load_state(data.path())
+                .unwrap()
+                .installations
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn active_recovery_backups_cannot_be_deleted() {
+        let data = tempfile::tempdir().unwrap();
+        let target = data.path().join("installed/demo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "demo").unwrap();
+        let backup = storage::create_backup(data.path(), &target)
+            .unwrap()
+            .unwrap();
+        let mut persisted = PersistedState::default();
+        persisted.backups.push(backup.clone());
+        persisted.operation_journals.push(OperationJournal {
+            id: "recovery".to_string(),
+            operation_type: "update".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            status: OperationJournalStatus::RecoveryRequired,
+            targets: vec![OperationJournalTarget {
+                path: target.display().to_string(),
+                existed_before: true,
+                backup_id: Some(backup.id.clone()),
+                completed: true,
+                previous_installation: None,
+            }],
+            message: None,
+        });
+        storage::save_state(data.path(), &persisted).unwrap();
+
+        let error = delete_backup_inner(&backup.id, data.path()).unwrap_err();
+
+        assert!(error.contains("恢复"));
+        assert!(Path::new(&backup.backup_path).exists());
+    }
+
+    #[test]
+    fn backup_policy_updates_are_validated_and_persisted() {
+        let data = tempfile::tempdir().unwrap();
+        let policy = BackupPolicy {
+            max_backups_per_skill: 8,
+            max_total_bytes: 512 * 1024 * 1024,
+            retention_days: 120,
+        };
+
+        set_backup_policy_inner(policy.clone(), data.path()).unwrap();
+
+        assert_eq!(
+            storage::load_state(data.path())
+                .unwrap()
+                .backup_policy
+                .max_backups_per_skill,
+            8
+        );
+        let invalid = BackupPolicy {
+            max_backups_per_skill: 0,
+            ..policy
+        };
+        assert!(set_backup_policy_inner(invalid, data.path()).is_err());
     }
 }

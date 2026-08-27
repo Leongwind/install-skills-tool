@@ -362,6 +362,7 @@ input {
 .source-skill-row,
 .inventory-row,
 .backup-row,
+.operation-row,
 .plan-entry,
 .result-row {
   min-width: 0;
@@ -376,6 +377,7 @@ input {
 .source-skill-row:last-child,
 .inventory-row:last-child,
 .backup-row:last-child,
+.operation-row:last-child,
 .plan-entry:last-child,
 .result-row:last-child {
   border-bottom: 0;
@@ -604,6 +606,24 @@ input {
   padding-left: 16px;
 }
 
+.policy-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(110px, 1fr)) auto;
+  align-items: end;
+  gap: 10px;
+}
+
+.policy-grid label {
+  display: grid;
+  gap: 5px;
+}
+
+.operation-row {
+  margin: 0 -16px;
+  padding-right: 16px;
+  padding-left: 16px;
+}
+
 .empty-inline,
 .quiet-row {
   min-height: 58px;
@@ -629,6 +649,10 @@ input {
   top: 8px;
   z-index: 5;
   margin: 8px 24px -4px;
+}
+
+.global-results {
+  margin: 12px 24px -2px;
 }
 
 .skeleton-list {
@@ -770,6 +794,10 @@ code {
 
   .inventory-controls {
     grid-template-columns: 1fr;
+  }
+
+  .policy-grid {
+    grid-template-columns: repeat(2, minmax(110px, 1fr));
   }
 
   .inventory-row {

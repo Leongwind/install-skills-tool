@@ -53,6 +53,8 @@ pub fn run() {
             commands::set_installation_pinned,
             commands::uninstall_installation,
             commands::restore_backup,
+            commands::set_backup_policy,
+            commands::delete_backup,
             commands::export_diagnostics,
             commands::reveal_in_finder,
         ])

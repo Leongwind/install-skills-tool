@@ -3,6 +3,7 @@ import {
   ArrowRight,
   Archive,
   Check,
+  ClockCounterClockwise,
   CloudArrowDown,
   Code,
   Copy,
@@ -52,7 +53,7 @@ import type {
 } from "./types";
 import { conflictLabel, detectionLabel, formatBytes, shortPath } from "./ui";
 
-type Page = "dashboard" | "install" | "manage" | "diagnostics";
+type Page = "dashboard" | "install" | "manage" | "operations" | "diagnostics";
 type SourceMode = "localDirectory" | "localArchive" | "github";
 type InventoryFilter = "all" | "managed" | "external" | "issues";
 
@@ -66,6 +67,14 @@ const inventoryStatus: Record<
   modified: { label: "内容已修改", color: "orange" },
   unsafe: { label: "不安全", color: "red" },
   passive: { label: "被动发现", color: "blue" },
+};
+
+const operationLabels: Record<string, string> = {
+  install: "安装",
+  update: "更新",
+  adopt: "纳管",
+  uninstall: "卸载",
+  restore: "恢复",
 };
 
 function friendlyError(error: unknown): string {
@@ -161,6 +170,11 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [policyDraft, setPolicyDraft] = useState({
+    maxBackupsPerSkill: 5,
+    maxTotalMb: 1024,
+    retentionDays: 90,
+  });
 
   const clients = environment.clients;
 
@@ -189,6 +203,17 @@ export default function App() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    setPolicyDraft({
+      maxBackupsPerSkill: overview.backupPolicy.maxBackupsPerSkill,
+      maxTotalMb: Math.max(
+        1,
+        Math.round(overview.backupPolicy.maxTotalBytes / (1024 * 1024)),
+      ),
+      retentionDays: overview.backupPolicy.retentionDays,
+    });
+  }, [overview.backupPolicy]);
 
   const source: SkillSource | undefined = sourceValue
     ? sourceMode === "github"
@@ -505,6 +530,51 @@ export default function App() {
     }
   }
 
+  async function rollbackOperation(journalId: string) {
+    if (!window.confirm("回滚会恢复该操作涉及的文件与管理记录，是否继续？")) return;
+    setBusy(`rollback:${journalId}`);
+    setError("");
+    try {
+      setResults(await api.rollbackOperation(journalId));
+      await refresh();
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveBackupPolicy() {
+    setBusy("backup-policy");
+    setError("");
+    try {
+      await api.setBackupPolicy({
+        maxBackupsPerSkill: policyDraft.maxBackupsPerSkill,
+        maxTotalBytes: policyDraft.maxTotalMb * 1024 * 1024,
+        retentionDays: policyDraft.retentionDays,
+      });
+      await refresh();
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteBackup(backup: BackupRecord) {
+    if (!window.confirm(`永久删除此备份？\n\n${shortPath(backup.originalPath)}`)) return;
+    setBusy(`delete-backup:${backup.id}`);
+    setError("");
+    try {
+      await api.deleteBackup(backup.id);
+      await refresh();
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function exportPortableBundle() {
     const ids = installations
       .filter((installation) => !installation.legacyProject)
@@ -697,6 +767,13 @@ export default function App() {
                 <span className="nav-count">{managedCount}</span>
               </button>
               <button
+                className={page === "operations" ? "nav-item active" : "nav-item"}
+                onClick={() => setPage("operations")}
+              >
+                <ClockCounterClockwise />
+                操作中心
+              </button>
+              <button
                 className={page === "diagnostics" ? "nav-item active" : "nav-item"}
                 onClick={() => setPage("diagnostics")}
               >
@@ -721,6 +798,27 @@ export default function App() {
                 </Callout.Icon>
                 <Callout.Text>{error}</Callout.Text>
               </Callout.Root>
+            )}
+            {page !== "install" && results.length > 0 && (
+              <section className="panel global-results" aria-label="最近操作结果">
+                <div className="section-caption">
+                  <strong>最近操作结果</strong>
+                  <Button size="1" variant="ghost" onClick={() => setResults([])}>
+                    关闭
+                  </Button>
+                </div>
+                {results.map((result, index) => (
+                  <div className="result-row" key={result.entryId ?? `${result.path}-${index}`}>
+                    <span className={result.success ? "result-dot ok" : "result-dot failed"} />
+                    <strong>{result.skillName ?? "Skill"}</strong>
+                    <code className="truncate">{shortPath(result.path)}</code>
+                    <span className="grow" />
+                    <Text size="1" color={result.success ? "green" : "red"}>
+                      {result.message}
+                    </Text>
+                  </div>
+                ))}
+              </section>
             )}
 
             {page === "dashboard" && (
@@ -1529,6 +1627,159 @@ export default function App() {
                   </section>
                 )}
 
+              </div>
+            )}
+
+            {page === "operations" && (
+              <div className="page operations-page">
+                <div className="page-heading">
+                  <div>
+                    <Text as="div" size="5" weight="bold">
+                      操作与备份
+                    </Text>
+                    <Text as="div" size="2" color="gray">
+                      集中查看安装生命周期、故障恢复、回滚与备份保留策略。
+                    </Text>
+                  </div>
+                </div>
+
+                <section className="panel">
+                  <div className="section-caption">
+                    <strong>备份策略</strong>
+                    <Badge variant="soft">自动执行</Badge>
+                  </div>
+                  <div className="policy-grid">
+                    <label>
+                      <Text size="1" color="gray">每个 Skill 最多</Text>
+                      <TextField.Root
+                        type="number"
+                        min="1"
+                        max="100"
+                        value={policyDraft.maxBackupsPerSkill}
+                        onChange={(event) =>
+                          setPolicyDraft((current) => ({
+                            ...current,
+                            maxBackupsPerSkill: Number(event.target.value),
+                          }))
+                        }
+                      />
+                    </label>
+                    <label>
+                      <Text size="1" color="gray">总空间（MB）</Text>
+                      <TextField.Root
+                        type="number"
+                        min="1"
+                        value={policyDraft.maxTotalMb}
+                        onChange={(event) =>
+                          setPolicyDraft((current) => ({
+                            ...current,
+                            maxTotalMb: Number(event.target.value),
+                          }))
+                        }
+                      />
+                    </label>
+                    <label>
+                      <Text size="1" color="gray">保留天数</Text>
+                      <TextField.Root
+                        type="number"
+                        min="1"
+                        max="3650"
+                        value={policyDraft.retentionDays}
+                        onChange={(event) =>
+                          setPolicyDraft((current) => ({
+                            ...current,
+                            retentionDays: Number(event.target.value),
+                          }))
+                        }
+                      />
+                    </label>
+                    <Button
+                      disabled={busy === "backup-policy"}
+                      onClick={() => void saveBackupPolicy()}
+                    >
+                      {busy === "backup-policy" && <Spinner size="1" />}
+                      保存策略
+                    </Button>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="section-caption">
+                    <strong>操作记录</strong>
+                    <Badge variant="soft">{overview.operationJournals.length}</Badge>
+                  </div>
+                  {overview.operationJournals.length === 0 ? (
+                    <Text as="div" size="2" color="gray" className="quiet-row">
+                      尚无可显示的操作记录。
+                    </Text>
+                  ) : (
+                    overview.operationJournals
+                      .slice()
+                      .reverse()
+                      .map((journal) => {
+                        const recoverable = ["partial", "recoveryRequired"].includes(journal.status);
+                        const rollbackable = journal.status === "completed";
+                        return (
+                          <div className="operation-row" key={journal.id}>
+                            <ClockCounterClockwise />
+                            <div className="grow min-width-zero">
+                              <Flex align="center" gap="2" wrap="wrap">
+                                <strong>{operationLabels[journal.operationType] ?? journal.operationType}</strong>
+                                <Badge
+                                  color={
+                                    recoverable
+                                      ? "orange"
+                                      : journal.status === "completed"
+                                        ? "green"
+                                        : journal.status === "rolledBack"
+                                          ? "gray"
+                                          : "blue"
+                                  }
+                                  variant="soft"
+                                >
+                                  {journal.status === "completed"
+                                    ? "已完成"
+                                    : journal.status === "rolledBack"
+                                      ? "已回滚"
+                                      : recoverable
+                                        ? "待恢复"
+                                        : "进行中"}
+                                </Badge>
+                              </Flex>
+                              <Text as="div" size="1" color="gray">
+                                {new Date(journal.createdAt).toLocaleString()} · {journal.targets.length} 个目标
+                              </Text>
+                              {journal.message && (
+                                <Text as="div" size="1" color="gray">{journal.message}</Text>
+                              )}
+                            </div>
+                            {recoverable && (
+                              <Button
+                                size="1"
+                                variant="soft"
+                                color="orange"
+                                disabled={busy === `recover:${journal.id}`}
+                                onClick={() => void recoverOperation(journal.id)}
+                              >
+                                恢复到操作前
+                              </Button>
+                            )}
+                            {rollbackable && (
+                              <Button
+                                size="1"
+                                variant="soft"
+                                disabled={busy === `rollback:${journal.id}`}
+                                onClick={() => void rollbackOperation(journal.id)}
+                              >
+                                回滚此操作
+                              </Button>
+                            )}
+                          </div>
+                        );
+                      })
+                  )}
+                </section>
+
                 <section className="panel">
                   <div className="section-caption">
                     <strong>自动备份</strong>
@@ -1536,7 +1787,7 @@ export default function App() {
                   </div>
                   {backups.length === 0 ? (
                     <Text as="div" size="2" color="gray" className="quiet-row">
-                      覆盖、纳管后卸载或恢复前生成的备份会显示在这里。
+                      覆盖、卸载或恢复前生成的备份会显示在这里。
                     </Text>
                   ) : (
                     backups
@@ -1556,6 +1807,7 @@ export default function App() {
                           <Button
                             size="1"
                             variant="ghost"
+                            aria-label="在 Finder 中显示备份"
                             onClick={() => void api.revealInFinder(backup.backupPath)}
                           >
                             <FolderSimple />
@@ -1567,6 +1819,16 @@ export default function App() {
                             onClick={() => void restore(backup)}
                           >
                             恢复
+                          </Button>
+                          <Button
+                            size="1"
+                            variant="ghost"
+                            color="red"
+                            disabled={busy === `delete-backup:${backup.id}`}
+                            onClick={() => void deleteBackup(backup)}
+                          >
+                            <Trash />
+                            删除
                           </Button>
                         </div>
                       ))

@@ -141,6 +141,8 @@ const mocks = vi.hoisted(() => ({
   applyInstallPlan: vi.fn(),
   openDialog: vi.fn(),
   saveDialog: vi.fn(),
+  setBackupPolicy: vi.fn(),
+  deleteBackup: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -168,6 +170,8 @@ vi.mock("../src/api", () => ({
     planUpdates: mocks.planUpdates,
     applyUpdatePlan: mocks.applyUpdatePlan,
     setInstallationPinned: mocks.setInstallationPinned,
+    setBackupPolicy: mocks.setBackupPolicy,
+    deleteBackup: mocks.deleteBackup,
     uninstall: vi.fn(),
     restoreBackup: vi.fn(),
     exportDiagnostics: vi.fn(),
@@ -197,6 +201,9 @@ describe("Skill Installer desktop UI", () => {
     mocks.setInstallationPinned.mockResolvedValue(undefined);
     mocks.openDialog.mockResolvedValue(null);
     mocks.saveDialog.mockResolvedValue(null);
+    mocks.rollbackOperation.mockResolvedValue([]);
+    mocks.setBackupPolicy.mockResolvedValue(undefined);
+    mocks.deleteBackup.mockResolvedValue(undefined);
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
@@ -430,6 +437,55 @@ describe("Skill Installer desktop UI", () => {
     ).toBeInTheDocument();
     expect(mocks.planLockfileImport).toHaveBeenCalledWith(
       "/tmp/skills.lock.json",
+    );
+  });
+
+  it("centralizes completed operations, rollback and backup policy", async () => {
+    mocks.listBackups.mockResolvedValueOnce([
+      {
+        id: "backup-id",
+        originalPath: "/Users/test/.agents/skills/demo",
+        backupPath: "/tmp/backups/backup-id",
+        createdAt: "2026-08-27T00:00:00Z",
+      },
+    ]);
+    mocks.getAppOverview.mockResolvedValueOnce({
+      backupPolicy: {
+        maxBackupsPerSkill: 5,
+        maxTotalBytes: 1024 * 1024 * 1024,
+        retentionDays: 90,
+      },
+      operationJournals: [
+        {
+          id: "completed-update",
+          operationType: "update",
+          createdAt: "2026-08-27T00:00:00Z",
+          finishedAt: "2026-08-27T00:01:00Z",
+          status: "completed",
+          targets: [
+            {
+              path: "/Users/test/.agents/skills/demo",
+              existedBefore: true,
+              backupId: "backup-id",
+              completed: true,
+            },
+          ],
+        },
+      ],
+      pinnedInstallationIds: [],
+    });
+
+    render(<App />);
+    await waitFor(() => expect(mocks.getAppOverview).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "操作中心" }));
+
+    expect(screen.getByText("操作与备份")).toBeInTheDocument();
+    expect(screen.getByText("更新")).toBeInTheDocument();
+    expect(screen.getByText("自动备份")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "回滚此操作" }));
+
+    await waitFor(() =>
+      expect(mocks.rollbackOperation).toHaveBeenCalledWith("completed-update"),
     );
   });
 });

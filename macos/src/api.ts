@@ -72,6 +72,13 @@ export const api = {
     }),
   restoreBackup: (backupId: string) =>
     invoke<OperationResult>("restore_backup", { backupId }),
+  setBackupPolicy: (policy: {
+    maxBackupsPerSkill: number;
+    maxTotalBytes: number;
+    retentionDays: number;
+  }) => invoke<void>("set_backup_policy", { policy }),
+  deleteBackup: (backupId: string) =>
+    invoke<void>("delete_backup", { backupId }),
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
   revealInFinder: (path: string) => invoke<void>("reveal_in_finder", { path }),
 };
