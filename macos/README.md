@@ -1,8 +1,23 @@
 # Skill Installer for macOS
 
-Skill Installer 0.2.1 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
+Skill Installer 0.3.0 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
 Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 应用数据只保存在本机，不采集遥测，不上传 Skill 内容。
+
+## 0.3.0 功能
+
+- 新增本机概览，集中显示可用 IDE、受管理/外部 Skill 和需要处理的问题。
+- IDE 检测结果会列出应用、CLI、配置目录和 Skills 目录等实际依据；Codex 明确
+  区分默认写入的 `~/.agents/skills` 与兼容读取的 `~/.codex/skills`。
+- 单个 IDE 可独立重新扫描；受管理 Skill 可进入现有分配矩阵同步到其他 IDE。
+- 更新检查显示来源 commit、当前/来源哈希，并汇总新增、修改和删除的文件。
+- 安装使用 schema v3 操作日志。应用异常退出后，下次启动会将未完成操作标为
+  待恢复，用户可从概览回滚到操作前状态。
+- 自动备份默认每个 Skill 保留 5 份、最多占用 1 GiB、保留 90 天；执行备份后
+  自动清理超出策略的旧记录。
+- 可将全部受管理 Skill 导出为带清单的 ZIP 便携包，在另一台机器通过 ZIP 来源
+  直接检查、选择和安装。
+- GitHub Actions 分别在 Apple Silicon 与 Intel runner 生成 DMG 和 SHA-256 文件。
 
 ## 0.2.1 修复
 
@@ -86,7 +101,8 @@ TRAE 国际版通过 `com.trae.app`、应用内 `product.json` 和 `.trae` 数�
 └── logs/
 ```
 
-`state.json` 当前为 schema v2。诊断预览会将用户目录替换为 `~`，包含库存数量、
+`state.json` 当前为 schema v3。v1/v2 会原子迁移，不会删除 Skill 或备份。诊断
+预览会将用户目录替换为 `~`，包含库存数量、检测依据、操作日志、备份策略、
 规范和管理状态，但不包含 Skill 文件内容。
 
 ## 开发
@@ -110,7 +126,9 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer pnpm tauri build
 macos/src-tauri/target/release/bundle/dmg/
 ```
 
-首次打开未签名版本时，可在 Finder 中右键应用并选择“打开”。0.2.1 不包含
+CI 产物分别为 `skill-installer-macos-arm64-dmg` 与
+`skill-installer-macos-x64-dmg`，每个产物同时包含 `SHA256SUMS.txt`。首次打开
+未签名版本时，可在 Finder 中右键应用并选择“打开”。0.3.0 不包含
 Developer ID 签名、公证、自动更新、私有 GitHub、OAuth 或 Skill 市场。
 
 ## Windows 边界

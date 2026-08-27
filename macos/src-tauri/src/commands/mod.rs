@@ -650,9 +650,10 @@ pub fn export_skill_bundle_inner(
     if unique_names.len() != selected.len() {
         return Err("所选记录包含同名 Skill，不能写入同一个便携包".to_string());
     }
-    if selected.iter().any(|installation| {
-        destination.starts_with(Path::new(&installation.resolved_path))
-    }) {
+    if selected
+        .iter()
+        .any(|installation| destination.starts_with(Path::new(&installation.resolved_path)))
+    {
         return Err("便携包不能保存到被导出的 Skill 目录中".to_string());
     }
     let parent = destination
