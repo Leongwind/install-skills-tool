@@ -136,6 +136,16 @@ const mocks = vi.hoisted(() => ({
   planUpdates: vi.fn(),
   applyUpdatePlan: vi.fn(),
   setInstallationPinned: vi.fn(),
+  exportLockfile: vi.fn(),
+  planLockfileImport: vi.fn(),
+  applyInstallPlan: vi.fn(),
+  openDialog: vi.fn(),
+  saveDialog: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: mocks.openDialog,
+  save: mocks.saveDialog,
 }));
 
 vi.mock("../src/api", () => ({
@@ -148,10 +158,12 @@ vi.mock("../src/api", () => ({
     recoverOperation: mocks.recoverOperation,
     rollbackOperation: mocks.rollbackOperation,
     exportSkillBundle: mocks.exportSkillBundle,
+    exportLockfile: mocks.exportLockfile,
+    planLockfileImport: mocks.planLockfileImport,
     inspectSource: mocks.inspectSource,
     planInstall: mocks.planInstall,
     adoptExternalSkill: mocks.adoptExternalSkill,
-    applyInstallPlan: vi.fn(),
+    applyInstallPlan: mocks.applyInstallPlan,
     checkUpdates: mocks.checkUpdates,
     planUpdates: mocks.planUpdates,
     applyUpdatePlan: mocks.applyUpdatePlan,
@@ -183,6 +195,8 @@ describe("Skill Installer desktop UI", () => {
     mocks.adoptExternalSkill.mockResolvedValue({});
     mocks.checkUpdates.mockResolvedValue([]);
     mocks.setInstallationPinned.mockResolvedValue(undefined);
+    mocks.openDialog.mockResolvedValue(null);
+    mocks.saveDialog.mockResolvedValue(null);
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
 
@@ -389,6 +403,33 @@ describe("Skill Installer desktop UI", () => {
       expect(mocks.applyUpdatePlan).toHaveBeenCalledWith("update-plan-id", [
         "update-entry-id",
       ]),
+    );
+  });
+
+  it("previews lockfile migration gaps without deleting extra Skills", async () => {
+    mocks.openDialog.mockResolvedValueOnce("/tmp/skills.lock.json");
+    mocks.planLockfileImport.mockResolvedValueOnce({
+      installPlan: { planId: "lock-plan", skills: [], entries: [] },
+      missingClientIds: ["cursor"],
+      unavailableSkills: [
+        { skillName: "private-skill", reason: "来源未绑定" },
+      ],
+      extraInstallationIds: ["extra-id"],
+    });
+
+    render(<App />);
+    await waitFor(() => expect(mocks.scanEnvironment).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: /IDE Skill 库存/ }));
+    fireEvent.click(screen.getByRole("button", { name: "从锁文件迁移" }));
+
+    expect(await screen.findByText("锁文件迁移预览")).toBeInTheDocument();
+    expect(screen.getByText(/缺少 IDE：cursor/)).toBeInTheDocument();
+    expect(screen.getByText(/private-skill：来源未绑定/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/额外 1 条安装记录不会自动删除/),
+    ).toBeInTheDocument();
+    expect(mocks.planLockfileImport).toHaveBeenCalledWith(
+      "/tmp/skills.lock.json",
     );
   });
 });

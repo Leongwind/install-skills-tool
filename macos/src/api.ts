@@ -5,10 +5,12 @@ import type {
   ClientSkillInventory,
   EnvironmentScan,
   InstallPlan,
+  LockfileImportPlan,
   OperationResult,
   PhysicalInstallation,
   PortableBundleManifest,
   SkillAssignment,
+  SkillLockfile,
   SkillSource,
   SourceInspection,
   UpdateStatus,
@@ -41,6 +43,13 @@ export const api = {
       installationIds,
       destination,
     }),
+  exportLockfile: (installationIds: string[], destination: string) =>
+    invoke<SkillLockfile>("export_lockfile", {
+      installationIds,
+      destination,
+    }),
+  planLockfileImport: (path: string) =>
+    invoke<LockfileImportPlan>("plan_lockfile_import", { path }),
   adoptExternalSkill: (clientId: string, resolvedPath: string) =>
     invoke<PhysicalInstallation>("adopt_external_skill", {
       clientId,

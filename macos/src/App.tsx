@@ -41,6 +41,7 @@ import type {
   EnvironmentScan,
   InstallPlan,
   InventorySkill,
+  LockfileImportPlan,
   OperationResult,
   PhysicalInstallation,
   SkillManagementStatus,
@@ -152,6 +153,8 @@ export default function App() {
   const [updates, setUpdates] = useState<UpdateStatus[]>([]);
   const [updatePlan, setUpdatePlan] = useState<UpdatePlan>();
   const [approvedUpdateIds, setApprovedUpdateIds] = useState<string[]>([]);
+  const [lockfilePlan, setLockfilePlan] = useState<LockfileImportPlan>();
+  const [lockfileOverwrites, setLockfileOverwrites] = useState<string[]>([]);
   const [inventorySearch, setInventorySearch] = useState("");
   const [inventoryFilter, setInventoryFilter] =
     useState<InventoryFilter>("all");
@@ -517,6 +520,68 @@ export default function App() {
     try {
       const manifest = await api.exportSkillBundle(ids, destination);
       window.alert(`已导出 ${manifest.skills.length} 个 Skill。此 ZIP 可在另一台机器直接导入。`);
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function exportLockfile() {
+    const ids = installations
+      .filter((installation) => !installation.legacyProject)
+      .map((installation) => installation.id);
+    if (ids.length === 0) return;
+    const destination = await save({
+      defaultPath: `skills-${new Date().toISOString().slice(0, 10)}.lock.json`,
+      filters: [{ name: "Skill Installer 锁文件", extensions: ["json"] }],
+    });
+    if (!destination) return;
+    setBusy("lock-export");
+    setError("");
+    try {
+      const lockfile = await api.exportLockfile(ids, destination);
+      window.alert(`已导出 ${lockfile.skills.length} 个可复现 Skill 配置。`);
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function importLockfile() {
+    const path = await open({
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Skill Installer 锁文件", extensions: ["json"] }],
+    });
+    if (typeof path !== "string") return;
+    setBusy("lock-import");
+    setError("");
+    try {
+      setLockfilePlan(await api.planLockfileImport(path));
+      setLockfileOverwrites([]);
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function applyLockfilePlan() {
+    if (!lockfilePlan) return;
+    setBusy("lock-apply");
+    setError("");
+    try {
+      setResults(
+        await api.applyInstallPlan(
+          lockfilePlan.installPlan.planId,
+          lockfileOverwrites,
+        ),
+      );
+      setLockfilePlan(undefined);
+      setLockfileOverwrites([]);
+      await refresh();
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -1178,6 +1243,22 @@ export default function App() {
                   <Flex gap="2" wrap="wrap" justify="end">
                     <Button
                       variant="soft"
+                      disabled={busy === "lock-import"}
+                      onClick={() => void importLockfile()}
+                    >
+                      {busy === "lock-import" ? <Spinner size="1" /> : <CloudArrowDown />}
+                      从锁文件迁移
+                    </Button>
+                    <Button
+                      variant="soft"
+                      disabled={installations.every((item) => item.legacyProject) || busy === "lock-export"}
+                      onClick={() => void exportLockfile()}
+                    >
+                      {busy === "lock-export" ? <Spinner size="1" /> : <Archive />}
+                      导出锁文件
+                    </Button>
+                    <Button
+                      variant="soft"
                       disabled={installations.every((item) => item.legacyProject) || busy === "export"}
                       onClick={() => void exportPortableBundle()}
                     >
@@ -1199,6 +1280,90 @@ export default function App() {
                     )}
                   </Flex>
                 </div>
+                {lockfilePlan && (
+                  <section className="panel lockfile-plan-panel">
+                    <div className="section-caption">
+                      <div>
+                        <strong>锁文件迁移预览</strong>
+                        <Text as="div" size="1" color="gray">
+                          仅安装哈希验证通过且本机 IDE 可用的条目。
+                        </Text>
+                      </div>
+                      <Badge variant="soft">
+                        {lockfilePlan.installPlan.entries.length} 个目标
+                      </Badge>
+                    </div>
+                    {lockfilePlan.missingClientIds.length > 0 && (
+                      <Callout.Root color="orange" size="1">
+                        <Callout.Icon><WarningCircle /></Callout.Icon>
+                        <Callout.Text>
+                          缺少 IDE：{lockfilePlan.missingClientIds.join("、")}
+                        </Callout.Text>
+                      </Callout.Root>
+                    )}
+                    {lockfilePlan.unavailableSkills.map((issue) => (
+                      <Callout.Root color="red" size="1" key={`${issue.skillName}-${issue.reason}`}>
+                        <Callout.Icon><WarningCircle /></Callout.Icon>
+                        <Callout.Text>{issue.skillName}：{issue.reason}</Callout.Text>
+                      </Callout.Root>
+                    ))}
+                    {lockfilePlan.extraInstallationIds.length > 0 && (
+                      <Callout.Root color="blue" size="1">
+                        <Callout.Icon><Info /></Callout.Icon>
+                        <Callout.Text>
+                          当前机器额外 {lockfilePlan.extraInstallationIds.length} 条安装记录不会自动删除；请在库存中逐项确认。
+                        </Callout.Text>
+                      </Callout.Root>
+                    )}
+                    <div className="plan-list">
+                      {lockfilePlan.installPlan.entries.map((entry) => {
+                        const needsOverwrite = ["conflict", "updateAvailable"].includes(entry.conflict);
+                        return (
+                          <div className="plan-entry" key={entry.entryId}>
+                            <div className="grow min-width-zero">
+                              <strong>{entry.skillName}</strong>
+                              <Text as="div" size="1" className="mono truncate" color="gray">
+                                {shortPath(entry.resolvedPath)} · {conflictLabel[entry.conflict]}
+                              </Text>
+                            </div>
+                            {needsOverwrite && (
+                              <label className="overwrite">
+                                <Checkbox
+                                  checked={lockfileOverwrites.includes(entry.entryId)}
+                                  onCheckedChange={(value) =>
+                                    setLockfileOverwrites((current) =>
+                                      value
+                                        ? [...current, entry.entryId]
+                                        : current.filter((id) => id !== entry.entryId),
+                                    )
+                                  }
+                                />
+                                覆盖并备份
+                              </label>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <Flex justify="end">
+                      <Button
+                        disabled={
+                          busy === "lock-apply" ||
+                          lockfilePlan.installPlan.entries.length === 0 ||
+                          lockfilePlan.installPlan.entries.some(
+                            (entry) =>
+                              ["conflict", "updateAvailable"].includes(entry.conflict) &&
+                              !lockfileOverwrites.includes(entry.entryId),
+                          )
+                        }
+                        onClick={() => void applyLockfilePlan()}
+                      >
+                        {busy === "lock-apply" && <Spinner size="1" />}
+                        应用迁移计划
+                      </Button>
+                    </Flex>
+                  </section>
+                )}
                 {updatePlan && (
                   <section className="panel update-plan-panel">
                     <div className="section-caption">

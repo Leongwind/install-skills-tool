@@ -45,7 +45,7 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
         return Err("GitHub URL 需要 owner/repository".to_string());
     }
     let repository = parts[1].trim_end_matches(".git").to_string();
-    let (reference, mut subpath) = if parts.len() >= 5 && (parts[2] == "tree" || parts[2] == "blob")
+    let (reference, mut subpath) = if parts.len() >= 4 && (parts[2] == "tree" || parts[2] == "blob")
     {
         (parts[3].to_string(), parts[4..].join("/"))
     } else {

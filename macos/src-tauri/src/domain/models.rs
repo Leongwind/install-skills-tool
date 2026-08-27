@@ -56,7 +56,7 @@ pub struct DetectedClient {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum SkillSource {
     #[serde(alias = "local")]
@@ -71,7 +71,7 @@ pub enum SkillSource {
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillSourceDetails {
     pub owner: Option<String>,
@@ -160,6 +160,7 @@ pub struct InstallPlan {
 pub struct PendingPlan {
     pub public: InstallPlan,
     pub source_paths: std::collections::HashMap<String, PathBuf>,
+    pub pinned_skill_ids: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,6 +379,50 @@ pub struct PortableBundleManifest {
     pub exported_at: String,
     pub app_version: String,
     pub skills: Vec<PortableBundleEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillLockEntry {
+    pub skill_name: String,
+    pub source: Option<SkillSource>,
+    #[serde(default)]
+    pub source_details: SkillSourceDetails,
+    pub content_hash: String,
+    pub consumers: Vec<String>,
+    #[serde(default)]
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillLockfile {
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub app_version: String,
+    pub skills: Vec<SkillLockEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockfileIssue {
+    pub skill_name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockfileImportPlan {
+    pub install_plan: InstallPlan,
+    pub missing_client_ids: Vec<String>,
+    pub unavailable_skills: Vec<LockfileIssue>,
+    pub extra_installation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingLockfilePlan {
+    pub public: LockfileImportPlan,
+    pub pending_install: PendingPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

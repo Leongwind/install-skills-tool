@@ -44,6 +44,8 @@ pub fn run() {
             commands::recover_operation,
             commands::rollback_operation,
             commands::export_skill_bundle,
+            commands::export_lockfile,
+            commands::plan_lockfile_import,
             commands::adopt_external_skill,
             commands::check_updates,
             commands::plan_updates,

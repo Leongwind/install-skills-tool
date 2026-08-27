@@ -255,3 +255,26 @@ export interface PortableBundleManifest {
     archivePath: string;
   }>;
 }
+
+export interface SkillLockEntry {
+  skillName: string;
+  source?: SkillSource;
+  sourceDetails: SkillSourceDetails;
+  contentHash: string;
+  consumers: string[];
+  pinned: boolean;
+}
+
+export interface SkillLockfile {
+  schemaVersion: number;
+  generatedAt: string;
+  appVersion: string;
+  skills: SkillLockEntry[];
+}
+
+export interface LockfileImportPlan {
+  installPlan: InstallPlan;
+  missingClientIds: string[];
+  unavailableSkills: Array<{ skillName: string; reason: string }>;
+  extraInstallationIds: string[];
+}

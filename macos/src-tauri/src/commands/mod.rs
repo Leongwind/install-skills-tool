@@ -117,6 +117,45 @@ fn inspected_update<'a>(
     }
 }
 
+fn replace_installation_record(
+    persisted: &mut PersistedState,
+    entry: &InstallPlanEntry,
+    metadata: &SkillMetadata,
+    pinned: bool,
+) {
+    let removed_ids = persisted
+        .installations
+        .iter()
+        .filter(|installation| installation.resolved_path == entry.resolved_path)
+        .map(|installation| installation.id.clone())
+        .collect::<HashSet<_>>();
+    persisted
+        .installations
+        .retain(|installation| installation.resolved_path != entry.resolved_path);
+    persisted
+        .pinned_installation_ids
+        .retain(|id| !removed_ids.contains(id));
+    let installation_id = Uuid::new_v4().to_string();
+    persisted.installations.push(PhysicalInstallation {
+        id: installation_id.clone(),
+        skill_name: metadata.name.clone(),
+        resolved_path: entry.resolved_path.clone(),
+        source: Some(metadata.source.clone()),
+        source_details: metadata.source_details.clone(),
+        content_hash: metadata.content_hash.clone(),
+        scope: InstallScope::Global,
+        consumers: entry.consumers.clone(),
+        passive_consumers: entry.passive_consumers.clone(),
+        adapter_version: 1,
+        installed_at: Utc::now().to_rfc3339(),
+        provenance: InstallationProvenance::Tool,
+        legacy_project: false,
+    });
+    if pinned {
+        persisted.pinned_installation_ids.push(installation_id);
+    }
+}
+
 #[tauri::command]
 pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, String> {
     let clients = macos::scan_clients();
@@ -301,6 +340,7 @@ pub async fn plan_install(
             PendingPlan {
                 public: plan.clone(),
                 source_paths,
+                pinned_skill_ids: HashSet::new(),
             },
         );
     Ok(plan)
@@ -397,24 +437,12 @@ pub fn apply_install_plan(
             continue;
         }
         if entry.conflict == ConflictState::Identical {
-            persisted
-                .installations
-                .retain(|item| item.resolved_path != entry.resolved_path);
-            persisted.installations.push(PhysicalInstallation {
-                id: Uuid::new_v4().to_string(),
-                skill_name: metadata.name.clone(),
-                resolved_path: entry.resolved_path.clone(),
-                source: Some(metadata.source.clone()),
-                source_details: metadata.source_details.clone(),
-                content_hash: metadata.content_hash.clone(),
-                scope: InstallScope::Global,
-                consumers: entry.consumers.clone(),
-                passive_consumers: entry.passive_consumers.clone(),
-                adapter_version: 1,
-                installed_at: Utc::now().to_rfc3339(),
-                provenance: InstallationProvenance::Tool,
-                legacy_project: false,
-            });
+            replace_installation_record(
+                &mut persisted,
+                entry,
+                metadata,
+                pending.pinned_skill_ids.contains(&entry.skill_id),
+            );
             storage::save_state(&state.data_dir, &persisted)?;
             results.push(OperationResult {
                 entry_id: Some(entry.entry_id.clone()),
@@ -437,24 +465,12 @@ pub fn apply_install_plan(
             );
             storage::save_state(&state.data_dir, &persisted)?;
             storage::atomic_replace(source_path, &destination)?;
-            persisted
-                .installations
-                .retain(|item| item.resolved_path != entry.resolved_path);
-            persisted.installations.push(PhysicalInstallation {
-                id: Uuid::new_v4().to_string(),
-                skill_name: metadata.name.clone(),
-                resolved_path: entry.resolved_path.clone(),
-                source: Some(metadata.source.clone()),
-                source_details: metadata.source_details.clone(),
-                content_hash: metadata.content_hash.clone(),
-                scope: InstallScope::Global,
-                consumers: entry.consumers.clone(),
-                passive_consumers: entry.passive_consumers.clone(),
-                adapter_version: 1,
-                installed_at: Utc::now().to_rfc3339(),
-                provenance: InstallationProvenance::Tool,
-                legacy_project: false,
-            });
+            replace_installation_record(
+                &mut persisted,
+                entry,
+                metadata,
+                pending.pinned_skill_ids.contains(&entry.skill_id),
+            );
             storage::save_state(&state.data_dir, &persisted)
         })();
         results.push(match operation {
@@ -754,6 +770,312 @@ pub fn export_skill_bundle(
     state: State<'_, AppState>,
 ) -> Result<PortableBundleManifest, String> {
     export_skill_bundle_inner(&installation_ids, Path::new(&destination), &state.data_dir)
+}
+
+pub fn export_lockfile_inner(
+    installation_ids: &[String],
+    destination: &Path,
+    data_dir: &Path,
+) -> Result<SkillLockfile, String> {
+    if installation_ids.is_empty() {
+        return Err("请至少选择一个受管理 Skill".to_string());
+    }
+    let persisted = storage::load_state(data_dir)?;
+    let selected = installation_ids
+        .iter()
+        .map(|id| {
+            persisted
+                .installations
+                .iter()
+                .find(|installation| installation.id == *id && !installation.legacy_project)
+                .cloned()
+                .ok_or_else(|| format!("安装记录不存在或不可导出: {id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries = BTreeMap::<String, SkillLockEntry>::new();
+    for installation in selected {
+        let current_hash = storage::inspect_tree(Path::new(&installation.resolved_path))?.0;
+        let pinned = persisted.pinned_installation_ids.contains(&installation.id);
+        if let Some(existing) = entries.get_mut(&installation.skill_name) {
+            if existing.content_hash != current_hash
+                || existing.source != installation.source
+                || existing.source_details != installation.source_details
+            {
+                return Err(format!(
+                    "同名 Skill {} 的内容或来源不同，不能写入同一锁文件",
+                    installation.skill_name
+                ));
+            }
+            existing.consumers.extend(installation.consumers);
+            existing.consumers.sort();
+            existing.consumers.dedup();
+            existing.pinned |= pinned;
+            continue;
+        }
+        entries.insert(
+            installation.skill_name.clone(),
+            SkillLockEntry {
+                skill_name: installation.skill_name,
+                source: installation.source,
+                source_details: installation.source_details,
+                content_hash: current_hash,
+                consumers: installation.consumers,
+                pinned,
+            },
+        );
+    }
+    let lockfile = SkillLockfile {
+        schema_version: 1,
+        generated_at: Utc::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        skills: entries.into_values().collect(),
+    };
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "锁文件路径无父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(".skill-lock-{}.tmp", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(&lockfile).map_err(|error| error.to_string())?;
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, destination).map_err(|error| error.to_string())?;
+    Ok(lockfile)
+}
+
+#[tauri::command]
+pub fn export_lockfile(
+    installation_ids: Vec<String>,
+    destination: String,
+    state: State<'_, AppState>,
+) -> Result<SkillLockfile, String> {
+    export_lockfile_inner(&installation_ids, Path::new(&destination), &state.data_dir)
+}
+
+fn reproducible_source(entry: &SkillLockEntry) -> Option<SkillSource> {
+    match (&entry.source, entry.source_details.commit_sha.as_deref()) {
+        (Some(SkillSource::Github { .. }), Some(commit))
+            if entry.source_details.owner.is_some()
+                && entry.source_details.repository.is_some() =>
+        {
+            let owner = entry.source_details.owner.as_deref().unwrap_or_default();
+            let repository = entry
+                .source_details
+                .repository
+                .as_deref()
+                .unwrap_or_default();
+            let subpath = entry.source_details.subpath.as_deref().unwrap_or_default();
+            let suffix = if subpath.is_empty() {
+                String::new()
+            } else {
+                format!("/{subpath}")
+            };
+            Some(SkillSource::Github {
+                url: format!("https://github.com/{owner}/{repository}/tree/{commit}{suffix}"),
+            })
+        }
+        (source, _) => source.clone(),
+    }
+}
+
+pub async fn prepare_lockfile_import_inner(
+    path: &Path,
+    data_dir: &Path,
+    clients: &[DetectedClient],
+    home: &Path,
+) -> Result<PendingLockfilePlan, String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("锁文件无效: {error}"))?;
+    if metadata.len() > 1024 * 1024 {
+        return Err("锁文件不能超过 1 MB".to_string());
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let lockfile: SkillLockfile =
+        serde_json::from_slice(&bytes).map_err(|error| format!("锁文件 JSON 无效: {error}"))?;
+    if lockfile.schema_version != 1 {
+        return Err(format!("不支持的锁文件版本: {}", lockfile.schema_version));
+    }
+    if lockfile.skills.len() > storage::MAX_FILES {
+        return Err("锁文件包含过多 Skill".to_string());
+    }
+    let persisted = storage::load_state(data_dir)?;
+    let available_clients = clients
+        .iter()
+        .filter(|client| client.supports_skills)
+        .map(|client| client.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut missing_client_ids = Vec::new();
+    let mut unavailable_skills = Vec::new();
+    let mut resolved_skills = Vec::new();
+    let mut assignments = Vec::new();
+    let mut pinned_skill_ids = HashSet::new();
+    let mut inspections = HashMap::<String, SourceInspection>::new();
+    let expected_names = lockfile
+        .skills
+        .iter()
+        .map(|entry| entry.skill_name.as_str())
+        .collect::<HashSet<_>>();
+
+    for entry in &lockfile.skills {
+        let Some(source) = reproducible_source(entry) else {
+            unavailable_skills.push(LockfileIssue {
+                skill_name: entry.skill_name.clone(),
+                reason: "来源未绑定；请改用包含内容的便携 ZIP".to_string(),
+            });
+            continue;
+        };
+        let source_key = serde_json::to_string(&source).map_err(|error| error.to_string())?;
+        if !inspections.contains_key(&source_key) {
+            match skill::inspect_source(source, data_dir).await {
+                Ok(inspection) => {
+                    inspections.insert(source_key.clone(), inspection);
+                }
+                Err(reason) => {
+                    unavailable_skills.push(LockfileIssue {
+                        skill_name: entry.skill_name.clone(),
+                        reason,
+                    });
+                    continue;
+                }
+            }
+        }
+        let inspection = inspections.get(&source_key).expect("inspection inserted");
+        let candidates = inspection
+            .skills
+            .iter()
+            .filter(|skill| skill.name == entry.skill_name)
+            .collect::<Vec<_>>();
+        let selected = if let Some(expected) = entry.source_details.subpath.as_deref() {
+            candidates
+                .into_iter()
+                .find(|skill| skill.source_details.subpath.as_deref() == Some(expected))
+        } else if candidates.len() == 1 {
+            candidates.first().copied()
+        } else {
+            None
+        };
+        let Some(skill) = selected else {
+            unavailable_skills.push(LockfileIssue {
+                skill_name: entry.skill_name.clone(),
+                reason: "来源中无法唯一定位该 Skill".to_string(),
+            });
+            continue;
+        };
+        if skill.content_hash != entry.content_hash {
+            unavailable_skills.push(LockfileIssue {
+                skill_name: entry.skill_name.clone(),
+                reason: format!(
+                    "来源哈希与锁文件不一致（期望 {}，实际 {}）",
+                    &entry.content_hash[..entry.content_hash.len().min(10)],
+                    &skill.content_hash[..skill.content_hash.len().min(10)]
+                ),
+            });
+            for client_id in &entry.consumers {
+                if !available_clients.contains(client_id.as_str()) {
+                    missing_client_ids.push(client_id.clone());
+                }
+            }
+            continue;
+        }
+        let client_ids = entry
+            .consumers
+            .iter()
+            .filter_map(|client_id| {
+                if available_clients.contains(client_id.as_str()) {
+                    Some(client_id.clone())
+                } else {
+                    missing_client_ids.push(client_id.clone());
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if client_ids.is_empty() {
+            unavailable_skills.push(LockfileIssue {
+                skill_name: entry.skill_name.clone(),
+                reason: "锁文件中的目标 IDE 当前均不可用".to_string(),
+            });
+            continue;
+        }
+        let metadata = (*skill).clone();
+        if entry.pinned {
+            pinned_skill_ids.insert(metadata.skill_id.clone());
+        }
+        assignments.push(SkillAssignment {
+            skill_id: metadata.skill_id.clone(),
+            client_ids,
+        });
+        resolved_skills.push(metadata);
+    }
+    missing_client_ids.sort();
+    missing_client_ids.dedup();
+    let install_plan = if resolved_skills.is_empty() {
+        InstallPlan {
+            plan_id: Uuid::new_v4().to_string(),
+            skills: Vec::new(),
+            entries: Vec::new(),
+        }
+    } else {
+        build_install_plan(
+            &SourceInspection {
+                inspection_id: Uuid::new_v4().to_string(),
+                source: SkillSource::LocalDirectory {
+                    path: path.display().to_string(),
+                },
+                skills: resolved_skills,
+                rejected: Vec::new(),
+                warnings: Vec::new(),
+            },
+            &assignments,
+            clients,
+            home,
+            &persisted,
+        )?
+    };
+    let extra_installation_ids = persisted
+        .installations
+        .iter()
+        .filter(|installation| {
+            !installation.legacy_project
+                && !expected_names.contains(installation.skill_name.as_str())
+        })
+        .map(|installation| installation.id.clone())
+        .collect::<Vec<_>>();
+    let source_paths = install_plan
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
+        .collect();
+    Ok(PendingLockfilePlan {
+        public: LockfileImportPlan {
+            install_plan: install_plan.clone(),
+            missing_client_ids,
+            unavailable_skills,
+            extra_installation_ids,
+        },
+        pending_install: PendingPlan {
+            public: install_plan,
+            source_paths,
+            pinned_skill_ids,
+        },
+    })
+}
+
+#[tauri::command]
+pub async fn plan_lockfile_import(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<LockfileImportPlan, String> {
+    let pending = prepare_lockfile_import_inner(
+        Path::new(&path),
+        &state.data_dir,
+        &macos::scan_clients(),
+        &home_dir()?,
+    )
+    .await?;
+    let public = pending.public.clone();
+    state
+        .plans
+        .lock()
+        .map_err(|_| "安装计划锁已损坏".to_string())?
+        .insert(public.install_plan.plan_id.clone(), pending.pending_install);
+    Ok(public)
 }
 
 pub fn adopt_external_skill_inner(
@@ -1838,5 +2160,123 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         assert!(archive.by_name("demo/SKILL.md").is_ok());
         assert!(archive.by_name("skill-installer-manifest.json").is_ok());
+    }
+
+    #[test]
+    fn lockfile_round_trip_preserves_source_targets_hash_and_pin() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        for root in [&source, &target] {
+            fs::write(
+                root.join("SKILL.md"),
+                "---\nname: demo\ndescription: Demo\n---\n",
+            )
+            .unwrap();
+        }
+        let installation = tracked_local_installation(data.path(), &source, &target);
+        set_installation_pinned_inner(&installation.id, true, data.path()).unwrap();
+        let destination = data.path().join("skills.lock.json");
+
+        let exported = export_lockfile_inner(
+            std::slice::from_ref(&installation.id),
+            &destination,
+            data.path(),
+        )
+        .unwrap();
+
+        assert_eq!(exported.schema_version, 1);
+        assert_eq!(exported.skills[0].content_hash, installation.content_hash);
+        assert_eq!(exported.skills[0].consumers, vec!["codex"]);
+        assert!(exported.skills[0].pinned);
+        assert_eq!(
+            exported.skills[0].source,
+            Some(SkillSource::LocalDirectory {
+                path: source.display().to_string()
+            })
+        );
+
+        let import_data = tempfile::tempdir().unwrap();
+        let import_home = tempfile::tempdir().unwrap();
+        let client = DetectedClient {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: import_home
+                .path()
+                .join(".agents/skills")
+                .display()
+                .to_string(),
+            inventory_skills_paths: Vec::new(),
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let pending = tauri::async_runtime::block_on(prepare_lockfile_import_inner(
+            &destination,
+            import_data.path(),
+            &[client],
+            import_home.path(),
+        ))
+        .unwrap();
+
+        assert!(pending.public.unavailable_skills.is_empty());
+        assert!(pending.public.missing_client_ids.is_empty());
+        assert_eq!(pending.public.install_plan.entries.len(), 1);
+        assert!(pending
+            .pending_install
+            .pinned_skill_ids
+            .contains(&pending.public.install_plan.skills[0].skill_id));
+    }
+
+    #[test]
+    fn lockfile_import_reports_changed_sources_instead_of_installing_them() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Changed\n---\n",
+        )
+        .unwrap();
+        let lockfile = SkillLockfile {
+            schema_version: 1,
+            generated_at: Utc::now().to_rfc3339(),
+            app_version: "0.4.0".to_string(),
+            skills: vec![SkillLockEntry {
+                skill_name: "demo".to_string(),
+                source: Some(SkillSource::LocalDirectory {
+                    path: source.display().to_string(),
+                }),
+                source_details: SkillSourceDetails::default(),
+                content_hash: "stale-hash".to_string(),
+                consumers: vec!["missing-client".to_string()],
+                pinned: false,
+            }],
+        };
+        let path = data.path().join("skills.lock.json");
+        fs::write(&path, serde_json::to_vec_pretty(&lockfile).unwrap()).unwrap();
+
+        let pending = tauri::async_runtime::block_on(prepare_lockfile_import_inner(
+            &path,
+            data.path(),
+            &[],
+            workspace.path(),
+        ))
+        .unwrap();
+
+        assert!(pending.public.install_plan.entries.is_empty());
+        assert_eq!(pending.public.missing_client_ids, vec!["missing-client"]);
+        assert_eq!(pending.public.unavailable_skills.len(), 1);
+        assert!(pending.public.unavailable_skills[0].reason.contains("哈希"));
     }
 }
