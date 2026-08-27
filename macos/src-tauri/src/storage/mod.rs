@@ -1,6 +1,7 @@
-use crate::domain::{BackupRecord, PersistedState};
+use crate::domain::{BackupRecord, FileChangeSummary, PersistedState};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 #[cfg(unix)]
@@ -138,6 +139,63 @@ pub fn inspect_tree(root: &Path) -> Result<(String, usize, u64, bool), String> {
     Ok((hex::encode(digest.finalize()), count, bytes, has_scripts))
 }
 
+fn tree_file_hashes(root: &Path) -> Result<BTreeMap<String, String>, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("无法读取 Skill 目录: {error}"))?;
+    let mut result = BTreeMap::new();
+    for item in WalkDir::new(&canonical_root).follow_links(false) {
+        let item = item.map_err(|error| error.to_string())?;
+        if item.path() == canonical_root || item.file_type().is_dir() {
+            continue;
+        }
+        if item.file_type().is_symlink() {
+            return Err(format!("不比较软链接: {}", item.path().display()));
+        }
+        let relative = item
+            .path()
+            .strip_prefix(&canonical_root)
+            .map_err(|error| error.to_string())?
+            .to_str()
+            .ok_or_else(|| "文件名不是有效 UTF-8".to_string())?
+            .replace('\\', "/");
+        let mut file = fs::File::open(item.path()).map_err(|error| error.to_string())?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        result.insert(relative, hex::encode(digest.finalize()));
+    }
+    Ok(result)
+}
+
+pub fn compare_trees(current: &Path, source: &Path) -> Result<FileChangeSummary, String> {
+    let current = tree_file_hashes(current)?;
+    let source = tree_file_hashes(source)?;
+    Ok(FileChangeSummary {
+        added: source
+            .keys()
+            .filter(|path| !current.contains_key(*path))
+            .cloned()
+            .collect(),
+        modified: source
+            .iter()
+            .filter(|(path, hash)| current.get(*path).is_some_and(|value| value != *hash))
+            .map(|(path, _)| path.clone())
+            .collect(),
+        removed: current
+            .keys()
+            .filter(|path| !source.contains_key(*path))
+            .cloned()
+            .collect(),
+    })
+}
+
 pub fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
     fs::create_dir_all(destination).map_err(|error| error.to_string())?;
     for item in WalkDir::new(source).follow_links(false) {
@@ -205,6 +263,81 @@ pub fn create_backup(data_dir: &Path, source: &Path) -> Result<Option<BackupReco
         backup_path: backup.display().to_string(),
         created_at: Utc::now().to_rfc3339(),
     }))
+}
+
+fn backup_size(path: &Path) -> u64 {
+    WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+pub fn enforce_backup_policy(state: &mut PersistedState) -> Result<(), String> {
+    let now = Utc::now();
+    let retention_days = i64::from(state.backup_policy.retention_days);
+    let mut remove_ids = HashSet::new();
+    let mut by_target: HashMap<&str, Vec<&BackupRecord>> = HashMap::new();
+    for backup in &state.backups {
+        by_target
+            .entry(backup.original_path.as_str())
+            .or_default()
+            .push(backup);
+        if retention_days != i64::from(u32::MAX)
+            && chrono::DateTime::parse_from_rfc3339(&backup.created_at).is_ok_and(|created| {
+                now.signed_duration_since(created.with_timezone(&Utc))
+                    .num_days()
+                    > retention_days
+            })
+        {
+            remove_ids.insert(backup.id.clone());
+        }
+    }
+    for backups in by_target.values_mut() {
+        backups.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        for backup in backups
+            .iter()
+            .skip(state.backup_policy.max_backups_per_skill)
+        {
+            remove_ids.insert(backup.id.clone());
+        }
+    }
+
+    let mut kept = state
+        .backups
+        .iter()
+        .filter(|backup| !remove_ids.contains(&backup.id))
+        .collect::<Vec<_>>();
+    kept.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    let mut total_bytes = 0u64;
+    for backup in kept {
+        let size = backup_size(Path::new(&backup.backup_path));
+        if total_bytes.saturating_add(size) > state.backup_policy.max_total_bytes {
+            remove_ids.insert(backup.id.clone());
+        } else {
+            total_bytes = total_bytes.saturating_add(size);
+        }
+    }
+
+    for backup in state
+        .backups
+        .iter()
+        .filter(|backup| remove_ids.contains(&backup.id))
+    {
+        let path = Path::new(&backup.backup_path);
+        if path.is_dir() {
+            fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        } else if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())?;
+        }
+    }
+    state
+        .backups
+        .retain(|backup| !remove_ids.contains(&backup.id));
+    Ok(())
 }
 
 pub fn writable_target(path: &Path) -> bool {
@@ -363,5 +496,59 @@ mod tests {
         assert_eq!(state.schema_version, 3);
         assert!(state.operation_journals.is_empty());
         assert_eq!(state.backup_policy.max_backups_per_skill, 5);
+    }
+
+    #[test]
+    fn tree_changes_report_added_modified_and_removed_files() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        let source = root.path().join("source");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(current.join("same.txt"), "same").unwrap();
+        fs::write(source.join("same.txt"), "same").unwrap();
+        fs::write(current.join("changed.txt"), "old").unwrap();
+        fs::write(source.join("changed.txt"), "new").unwrap();
+        fs::write(current.join("removed.txt"), "removed").unwrap();
+        fs::write(source.join("added.txt"), "added").unwrap();
+
+        let changes = compare_trees(&current, &source).unwrap();
+
+        assert_eq!(changes.added, ["added.txt"]);
+        assert_eq!(changes.modified, ["changed.txt"]);
+        assert_eq!(changes.removed, ["removed.txt"]);
+    }
+
+    #[test]
+    fn backup_policy_keeps_latest_backups_per_skill() {
+        let root = tempfile::tempdir().unwrap();
+        let backup_root = root.path().join("backups");
+        fs::create_dir_all(&backup_root).unwrap();
+        let make = |id: &str, created_at: &str| {
+            let path = backup_root.join(id);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), id).unwrap();
+            BackupRecord {
+                id: id.to_string(),
+                original_path: "/tmp/demo".to_string(),
+                backup_path: path.display().to_string(),
+                created_at: created_at.to_string(),
+            }
+        };
+        let mut state = PersistedState::default();
+        state.backup_policy.max_backups_per_skill = 2;
+        state.backup_policy.max_total_bytes = u64::MAX;
+        state.backup_policy.retention_days = u32::MAX;
+        state.backups = vec![
+            make("old", "2026-01-01T00:00:00Z"),
+            make("middle", "2026-01-02T00:00:00Z"),
+            make("new", "2026-01-03T00:00:00Z"),
+        ];
+
+        enforce_backup_policy(&mut state).unwrap();
+
+        assert_eq!(state.backups.len(), 2);
+        assert!(!backup_root.join("old").exists());
+        assert!(backup_root.join("new").exists());
     }
 }

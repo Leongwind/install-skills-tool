@@ -5,6 +5,11 @@ export type DetectionStatus =
   | "configOnly"
   | "unsupportedVersion"
   | "notInstalled";
+export type DetectionEvidenceKind =
+  | "application"
+  | "cli"
+  | "configuration"
+  | "skillsDirectory";
 export type ConflictState =
   | "notInstalled"
   | "identical"
@@ -30,8 +35,17 @@ export interface DetectedClient {
   applicationPath?: string;
   cliPath?: string;
   globalSkillsPath: string;
+  inventorySkillsPaths?: string[];
+  detectionEvidence?: DetectionEvidence[];
   supportsSkills: boolean;
   notes: string[];
+}
+
+export interface DetectionEvidence {
+  kind: DetectionEvidenceKind;
+  path: string;
+  version?: string;
+  message: string;
 }
 
 export type SkillSource =
@@ -164,4 +178,62 @@ export interface UpdateStatus {
   installationId: string;
   status: "current" | "sourceChanged" | "targetModified" | "sourceUnavailable";
   message: string;
+  currentHash?: string;
+  sourceHash?: string;
+  sourceRevision?: string;
+  changes?: FileChangeSummary;
+}
+
+export interface FileChangeSummary {
+  added: string[];
+  modified: string[];
+  removed: string[];
+}
+
+export type OperationJournalStatus =
+  | "preparing"
+  | "applying"
+  | "partial"
+  | "completed"
+  | "recoveryRequired"
+  | "rolledBack";
+
+export interface OperationJournalTarget {
+  path: string;
+  existedBefore: boolean;
+  backupId?: string;
+  completed: boolean;
+}
+
+export interface OperationJournal {
+  id: string;
+  operationType: string;
+  createdAt: string;
+  finishedAt?: string;
+  status: OperationJournalStatus;
+  targets: OperationJournalTarget[];
+  message?: string;
+}
+
+export interface BackupPolicy {
+  maxBackupsPerSkill: number;
+  maxTotalBytes: number;
+  retentionDays: number;
+}
+
+export interface AppOverview {
+  backupPolicy: BackupPolicy;
+  operationJournals: OperationJournal[];
+}
+
+export interface PortableBundleManifest {
+  schemaVersion: number;
+  exportedAt: string;
+  appVersion: string;
+  skills: Array<{
+    skillName: string;
+    contentHash: string;
+    consumers: string[];
+    archivePath: string;
+  }>;
 }

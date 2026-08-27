@@ -1,10 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   BackupRecord,
+  AppOverview,
+  ClientSkillInventory,
   EnvironmentScan,
   InstallPlan,
   OperationResult,
   PhysicalInstallation,
+  PortableBundleManifest,
   SkillAssignment,
   SkillSource,
   SourceInspection,
@@ -25,6 +28,16 @@ export const api = {
   listInstallations: () =>
     invoke<PhysicalInstallation[]>("list_installations"),
   listBackups: () => invoke<BackupRecord[]>("list_backups"),
+  getAppOverview: () => invoke<AppOverview>("get_app_overview"),
+  scanClientInventory: (clientId: string) =>
+    invoke<ClientSkillInventory>("scan_client_inventory", { clientId }),
+  recoverOperation: (journalId: string) =>
+    invoke<OperationResult[]>("recover_operation", { journalId }),
+  exportSkillBundle: (installationIds: string[], destination: string) =>
+    invoke<PortableBundleManifest>("export_skill_bundle", {
+      installationIds,
+      destination,
+    }),
   adoptExternalSkill: (clientId: string, resolvedPath: string) =>
     invoke<PhysicalInstallation>("adopt_external_skill", {
       clientId,

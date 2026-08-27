@@ -22,6 +22,15 @@ const clients: DetectedClient[] = [
     status: "installed",
     applicationPath: "/Applications/Kiro.app",
     globalSkillsPath: "/Users/test/.kiro/skills",
+    inventorySkillsPaths: ["/Users/test/.kiro/skills"],
+    detectionEvidence: [
+      {
+        kind: "application",
+        path: "/Applications/Kiro.app",
+        version: "1.0.228",
+        message: "检测到 macOS 应用",
+      },
+    ],
     supportsSkills: true,
     notes: [],
   },
@@ -118,6 +127,10 @@ const mocks = vi.hoisted(() => ({
   inspectSource: vi.fn(),
   planInstall: vi.fn(),
   adoptExternalSkill: vi.fn(),
+  getAppOverview: vi.fn(),
+  scanClientInventory: vi.fn(),
+  recoverOperation: vi.fn(),
+  exportSkillBundle: vi.fn(),
 }));
 
 vi.mock("../src/api", () => ({
@@ -125,6 +138,10 @@ vi.mock("../src/api", () => ({
     scanEnvironment: mocks.scanEnvironment,
     listInstallations: mocks.listInstallations,
     listBackups: mocks.listBackups,
+    getAppOverview: mocks.getAppOverview,
+    scanClientInventory: mocks.scanClientInventory,
+    recoverOperation: mocks.recoverOperation,
+    exportSkillBundle: mocks.exportSkillBundle,
     inspectSource: mocks.inspectSource,
     planInstall: mocks.planInstall,
     adoptExternalSkill: mocks.adoptExternalSkill,
@@ -144,6 +161,14 @@ describe("Skill Installer desktop UI", () => {
     mocks.scanEnvironment.mockResolvedValue(environment);
     mocks.listInstallations.mockResolvedValue([]);
     mocks.listBackups.mockResolvedValue([]);
+    mocks.getAppOverview.mockResolvedValue({
+      backupPolicy: {
+        maxBackupsPerSkill: 5,
+        maxTotalBytes: 1024 * 1024 * 1024,
+        retentionDays: 90,
+      },
+      operationJournals: [],
+    });
     mocks.inspectSource.mockResolvedValue(inspection);
     mocks.adoptExternalSkill.mockResolvedValue({});
     vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -152,6 +177,7 @@ describe("Skill Installer desktop UI", () => {
   it("offers directory, ZIP and GitHub sources without project install controls", async () => {
     render(<App />);
     await waitFor(() => expect(mocks.scanEnvironment).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "批量安装" }));
 
     expect(screen.getByRole("button", { name: "本地目录" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "ZIP" })).toBeInTheDocument();
@@ -163,6 +189,7 @@ describe("Skill Installer desktop UI", () => {
   it("discovers multiple skills, keeps rejected rows and leaves IDEs unassigned", async () => {
     render(<App />);
     await waitFor(() => expect(mocks.scanEnvironment).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "批量安装" }));
     fireEvent.click(screen.getByRole("button", { name: "GitHub" }));
     fireEvent.change(
       screen.getByPlaceholderText("https://github.com/owner/repository"),
@@ -200,6 +227,50 @@ describe("Skill Installer desktop UI", () => {
         "kiro",
         "/Users/test/.kiro/skills/external",
       ),
+    );
+  });
+
+  it("opens on an environment overview with transparent detection evidence", async () => {
+    render(<App />);
+    await waitFor(() => expect(mocks.scanEnvironment).toHaveBeenCalled());
+
+    expect(screen.getByText("本机 Skill 概览")).toBeInTheDocument();
+    expect(screen.getByText("可用 IDE")).toBeInTheDocument();
+    expect(screen.getByText("1 条依据")).toBeInTheDocument();
+    expect(screen.getByText("每个 Skill 最多 5 份", { exact: false })).toBeInTheDocument();
+  });
+
+  it("offers recovery for an interrupted operation", async () => {
+    mocks.getAppOverview.mockResolvedValueOnce({
+      backupPolicy: {
+        maxBackupsPerSkill: 5,
+        maxTotalBytes: 1024 * 1024 * 1024,
+        retentionDays: 90,
+      },
+      operationJournals: [
+        {
+          id: "journal-id",
+          operationType: "install",
+          createdAt: "2026-08-27T00:00:00Z",
+          status: "recoveryRequired",
+          targets: [
+            {
+              path: "/Users/test/.agents/skills/demo",
+              existedBefore: false,
+              completed: true,
+            },
+          ],
+        },
+      ],
+    });
+    mocks.recoverOperation.mockResolvedValue([]);
+    render(<App />);
+
+    const button = await screen.findByRole("button", { name: "恢复到操作前" });
+    fireEvent.click(button);
+
+    await waitFor(() =>
+      expect(mocks.recoverOperation).toHaveBeenCalledWith("journal-id"),
     );
   });
 });

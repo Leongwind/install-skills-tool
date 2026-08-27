@@ -5,10 +5,14 @@ use chrono::Utc;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
 use uuid::Uuid;
+use walkdir::WalkDir;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
 
 pub struct AppState {
     pub data_dir: PathBuf,
@@ -34,6 +38,60 @@ fn normalized(path: &Path) -> String {
         }
     }
     result.display().to_string()
+}
+
+fn record_backup(
+    data_dir: &Path,
+    persisted: &mut PersistedState,
+    source: &Path,
+) -> Result<Option<String>, String> {
+    let id = storage::create_backup(data_dir, source)?.map(|backup| {
+        let id = backup.id.clone();
+        persisted.backups.push(backup);
+        id
+    });
+    storage::enforce_backup_policy(persisted)?;
+    Ok(id)
+}
+
+fn update_journal_target(
+    persisted: &mut PersistedState,
+    journal_id: &str,
+    path: &str,
+    backup_id: Option<String>,
+    completed: bool,
+) {
+    if let Some(target) = persisted
+        .operation_journals
+        .iter_mut()
+        .find(|journal| journal.id == journal_id)
+        .and_then(|journal| {
+            journal
+                .targets
+                .iter_mut()
+                .find(|target| target.path == path)
+        })
+    {
+        target.backup_id = backup_id;
+        target.completed = completed;
+    }
+}
+
+fn finish_journal(
+    persisted: &mut PersistedState,
+    journal_id: &str,
+    status: OperationJournalStatus,
+    message: Option<String>,
+) {
+    if let Some(journal) = persisted
+        .operation_journals
+        .iter_mut()
+        .find(|journal| journal.id == journal_id)
+    {
+        journal.status = status;
+        journal.finished_at = Some(Utc::now().to_rfc3339());
+        journal.message = message;
+    }
 }
 
 fn inspected_update<'a>(
@@ -261,6 +319,44 @@ pub fn apply_install_plan(
         .ok_or_else(|| "安装计划不存在或已执行".to_string())?;
     let mut persisted = storage::load_state(&state.data_dir)?;
     let mut results = Vec::new();
+    let journal_id = Uuid::new_v4().to_string();
+    let journal_targets = pending
+        .public
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.conflict != ConflictState::NotWritable
+                && entry.conflict != ConflictState::Identical
+                && (!matches!(
+                    entry.conflict,
+                    ConflictState::Conflict | ConflictState::UpdateAvailable
+                ) || overwrite_entry_ids.contains(&entry.entry_id))
+        })
+        .map(|entry| OperationJournalTarget {
+            path: entry.resolved_path.clone(),
+            existed_before: Path::new(&entry.resolved_path).exists(),
+            backup_id: None,
+            completed: false,
+            previous_installation: persisted
+                .installations
+                .iter()
+                .find(|installation| installation.resolved_path == entry.resolved_path)
+                .cloned(),
+        })
+        .collect::<Vec<_>>();
+    let has_journal_targets = !journal_targets.is_empty();
+    if has_journal_targets {
+        persisted.operation_journals.push(OperationJournal {
+            id: journal_id.clone(),
+            operation_type: "install".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            status: OperationJournalStatus::Applying,
+            targets: journal_targets,
+            message: None,
+        });
+        storage::save_state(&state.data_dir, &persisted)?;
+    }
     for entry in &pending.public.entries {
         let metadata = pending
             .public
@@ -330,9 +426,15 @@ pub fn apply_install_plan(
             continue;
         }
         let operation = (|| -> Result<(), String> {
-            if let Some(backup) = storage::create_backup(&state.data_dir, &destination)? {
-                persisted.backups.push(backup);
-            }
+            let backup_id = record_backup(&state.data_dir, &mut persisted, &destination)?;
+            update_journal_target(
+                &mut persisted,
+                &journal_id,
+                &entry.resolved_path,
+                backup_id,
+                true,
+            );
+            storage::save_state(&state.data_dir, &persisted)?;
             storage::atomic_replace(source_path, &destination)?;
             persisted
                 .installations
@@ -373,6 +475,23 @@ pub fn apply_install_plan(
             },
         });
     }
+    if has_journal_targets {
+        let failures = results
+            .iter()
+            .filter(|result| !result.success && result.status == "failed")
+            .count();
+        finish_journal(
+            &mut persisted,
+            &journal_id,
+            if failures == 0 {
+                OperationJournalStatus::Completed
+            } else {
+                OperationJournalStatus::Partial
+            },
+            (failures > 0).then(|| format!("{failures} 个目标失败，可执行恢复")),
+        );
+        storage::save_state(&state.data_dir, &persisted)?;
+    }
     Ok(results)
 }
 
@@ -384,6 +503,226 @@ pub fn list_installations(state: State<'_, AppState>) -> Result<Vec<PhysicalInst
 #[tauri::command]
 pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupRecord>, String> {
     Ok(storage::load_state(&state.data_dir)?.backups)
+}
+
+#[tauri::command]
+pub fn get_app_overview(state: State<'_, AppState>) -> Result<AppOverview, String> {
+    let persisted = storage::load_state(&state.data_dir)?;
+    Ok(AppOverview {
+        backup_policy: persisted.backup_policy,
+        operation_journals: persisted.operation_journals,
+    })
+}
+
+#[tauri::command]
+pub fn scan_client_inventory(
+    client_id: String,
+    state: State<'_, AppState>,
+) -> Result<ClientSkillInventory, String> {
+    let client = macos::scan_clients()
+        .into_iter()
+        .find(|client| client.id == client_id)
+        .ok_or_else(|| format!("未知 Agent: {client_id}"))?;
+    let persisted = storage::load_state(&state.data_dir)?;
+    Ok(crate::inventory::scan_client_inventory(&client, &persisted))
+}
+
+pub fn recover_operation_inner(
+    journal_id: &str,
+    data_dir: &Path,
+) -> Result<Vec<OperationResult>, String> {
+    let mut persisted = storage::load_state(data_dir)?;
+    let journal = persisted
+        .operation_journals
+        .iter()
+        .find(|journal| journal.id == journal_id)
+        .cloned()
+        .ok_or_else(|| "恢复记录不存在".to_string())?;
+    if !matches!(
+        journal.status,
+        OperationJournalStatus::RecoveryRequired | OperationJournalStatus::Partial
+    ) {
+        return Err("该操作当前不需要恢复".to_string());
+    }
+    let mut results = Vec::new();
+    for target in journal
+        .targets
+        .iter()
+        .rev()
+        .filter(|target| target.completed)
+    {
+        let destination = PathBuf::from(&target.path);
+        let recovered = if let Some(backup_id) = target.backup_id.as_deref() {
+            persisted
+                .backups
+                .iter()
+                .find(|backup| backup.id == backup_id)
+                .ok_or_else(|| format!("恢复所需备份不存在: {backup_id}"))
+                .and_then(|backup| {
+                    storage::atomic_replace(Path::new(&backup.backup_path), &destination)
+                })
+        } else if !target.existed_before && destination.exists() {
+            if destination.is_dir() {
+                fs::remove_dir_all(&destination).map_err(|error| error.to_string())
+            } else {
+                fs::remove_file(&destination).map_err(|error| error.to_string())
+            }
+        } else {
+            Ok(())
+        };
+        match recovered {
+            Ok(()) => {
+                persisted
+                    .installations
+                    .retain(|installation| installation.resolved_path != target.path);
+                if let Some(previous) = target.previous_installation.clone() {
+                    persisted.installations.push(previous);
+                }
+                results.push(OperationResult {
+                    entry_id: None,
+                    skill_name: target
+                        .previous_installation
+                        .as_ref()
+                        .map(|installation| installation.skill_name.clone()),
+                    path: target.path.clone(),
+                    success: true,
+                    status: "rolledBack".to_string(),
+                    message: "已恢复到操作前状态".to_string(),
+                });
+            }
+            Err(message) => results.push(OperationResult {
+                entry_id: None,
+                skill_name: None,
+                path: target.path.clone(),
+                success: false,
+                status: "recoveryFailed".to_string(),
+                message,
+            }),
+        }
+    }
+    let failures = results.iter().filter(|result| !result.success).count();
+    finish_journal(
+        &mut persisted,
+        journal_id,
+        if failures == 0 {
+            OperationJournalStatus::RolledBack
+        } else {
+            OperationJournalStatus::RecoveryRequired
+        },
+        (failures > 0).then(|| format!("{failures} 个目标恢复失败")),
+    );
+    storage::save_state(data_dir, &persisted)?;
+    Ok(results)
+}
+
+#[tauri::command]
+pub fn recover_operation(
+    journal_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OperationResult>, String> {
+    recover_operation_inner(&journal_id, &state.data_dir)
+}
+
+pub fn export_skill_bundle_inner(
+    installation_ids: &[String],
+    destination: &Path,
+    data_dir: &Path,
+) -> Result<PortableBundleManifest, String> {
+    if installation_ids.is_empty() {
+        return Err("请至少选择一个受管理 Skill".to_string());
+    }
+    let persisted = storage::load_state(data_dir)?;
+    let selected = installation_ids
+        .iter()
+        .map(|id| {
+            persisted
+                .installations
+                .iter()
+                .find(|installation| installation.id == *id && !installation.legacy_project)
+                .cloned()
+                .ok_or_else(|| format!("安装记录不存在或不可导出: {id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let unique_names = selected
+        .iter()
+        .map(|installation| installation.skill_name.as_str())
+        .collect::<HashSet<_>>();
+    if unique_names.len() != selected.len() {
+        return Err("所选记录包含同名 Skill，不能写入同一个便携包".to_string());
+    }
+    if selected.iter().any(|installation| {
+        destination.starts_with(Path::new(&installation.resolved_path))
+    }) {
+        return Err("便携包不能保存到被导出的 Skill 目录中".to_string());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "导出路径无父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = parent.join(format!(".skill-bundle-{}.tmp", Uuid::new_v4()));
+    let file = fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut manifest = PortableBundleManifest {
+        schema_version: 1,
+        exported_at: Utc::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        skills: Vec::new(),
+    };
+    for installation in selected {
+        let root = PathBuf::from(&installation.resolved_path);
+        let (current_hash, _, _, _) = storage::inspect_tree(&root)?;
+        for item in WalkDir::new(&root).follow_links(false) {
+            let item = item.map_err(|error| error.to_string())?;
+            if item.file_type().is_symlink() {
+                return Err(format!("便携包不接受软链接: {}", item.path().display()));
+            }
+            if !item.file_type().is_file() {
+                continue;
+            }
+            let relative = item
+                .path()
+                .strip_prefix(&root)
+                .map_err(|error| error.to_string())?
+                .to_str()
+                .ok_or_else(|| "文件名不是有效 UTF-8".to_string())?
+                .replace('\\', "/");
+            let archive_path = format!("{}/{relative}", installation.skill_name);
+            writer
+                .start_file(archive_path, options)
+                .map_err(|error| error.to_string())?;
+            let mut source = fs::File::open(item.path()).map_err(|error| error.to_string())?;
+            std::io::copy(&mut source, &mut writer).map_err(|error| error.to_string())?;
+        }
+        manifest.skills.push(PortableBundleEntry {
+            skill_name: installation.skill_name.clone(),
+            content_hash: current_hash,
+            consumers: installation.consumers,
+            archive_path: installation.skill_name,
+        });
+    }
+    writer
+        .start_file("skill-installer-manifest.json", options)
+        .map_err(|error| error.to_string())?;
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
+    writer
+        .write_all(&manifest_bytes)
+        .map_err(|error| error.to_string())?;
+    writer.finish().map_err(|error| error.to_string())?;
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| error.to_string())?;
+    }
+    fs::rename(temporary, destination).map_err(|error| error.to_string())?;
+    Ok(manifest)
+}
+
+#[tauri::command]
+pub fn export_skill_bundle(
+    installation_ids: Vec<String>,
+    destination: String,
+    state: State<'_, AppState>,
+) -> Result<PortableBundleManifest, String> {
+    export_skill_bundle_inner(&installation_ids, Path::new(&destination), &state.data_dir)
 }
 
 pub fn adopt_external_skill_inner(
@@ -479,6 +818,10 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 installation_id: installation.id,
                 status: UpdateState::TargetModified,
                 message: "目标内容已被手工修改".to_string(),
+                current_hash: target_hash,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
             });
             continue;
         }
@@ -487,6 +830,10 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 installation_id: installation.id,
                 status: UpdateState::SourceUnavailable,
                 message: "来源未绑定，仅管理本地副本".to_string(),
+                current_hash: target_hash,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
             });
             continue;
         };
@@ -499,17 +846,33 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                     installation_id: installation.id,
                     status: UpdateState::SourceChanged,
                     message: "来源有新内容".to_string(),
+                    current_hash: target_hash,
+                    source_hash: Some(metadata.content_hash.clone()),
+                    source_revision: metadata.source_details.commit_sha.clone(),
+                    changes: storage::compare_trees(
+                        Path::new(&installation.resolved_path),
+                        Path::new(&metadata.prepared_path),
+                    )
+                    .ok(),
                 });
             }
-            Ok(_) => statuses.push(UpdateStatus {
+            Ok(metadata) => statuses.push(UpdateStatus {
                 installation_id: installation.id,
                 status: UpdateState::Current,
                 message: "已是最新".to_string(),
+                current_hash: target_hash,
+                source_hash: Some(metadata.content_hash),
+                source_revision: metadata.source_details.commit_sha,
+                changes: Some(FileChangeSummary::default()),
             }),
             Err(message) => statuses.push(UpdateStatus {
                 installation_id: installation.id,
                 status: UpdateState::SourceUnavailable,
                 message,
+                current_hash: target_hash,
+                source_hash: None,
+                source_revision: None,
+                changes: None,
             }),
         }
     }
@@ -543,9 +906,7 @@ pub fn uninstall_installation(
         });
     }
     if path.exists() {
-        if let Some(backup) = storage::create_backup(&state.data_dir, &path)? {
-            persisted.backups.push(backup);
-        }
+        record_backup(&state.data_dir, &mut persisted, &path)?;
         fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
     }
     persisted
@@ -575,9 +936,7 @@ pub fn restore_backup(
         .cloned()
         .ok_or_else(|| "备份不存在".to_string())?;
     let destination = PathBuf::from(&backup.original_path);
-    if let Some(new_backup) = storage::create_backup(&state.data_dir, &destination)? {
-        persisted.backups.push(new_backup);
-    }
+    record_backup(&state.data_dir, &mut persisted, &destination)?;
     storage::atomic_replace(Path::new(&backup.backup_path), &destination)?;
     storage::save_state(&state.data_dir, &persisted)?;
     Ok(OperationResult {
@@ -910,5 +1269,79 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("同名但内容不同"));
+    }
+
+    #[test]
+    fn recovery_removes_a_new_target_from_an_interrupted_install() {
+        let data = tempfile::tempdir().unwrap();
+        let target = data.path().join("target/demo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "new").unwrap();
+        let mut persisted = PersistedState::default();
+        persisted.operation_journals.push(OperationJournal {
+            id: "journal".to_string(),
+            operation_type: "install".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: None,
+            status: OperationJournalStatus::RecoveryRequired,
+            targets: vec![OperationJournalTarget {
+                path: target.display().to_string(),
+                existed_before: false,
+                backup_id: None,
+                completed: true,
+                previous_installation: None,
+            }],
+            message: None,
+        });
+        storage::save_state(data.path(), &persisted).unwrap();
+
+        let results = recover_operation_inner("journal", data.path()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(!target.exists());
+        assert_eq!(
+            storage::load_state(data.path()).unwrap().operation_journals[0].status,
+            OperationJournalStatus::RolledBack
+        );
+    }
+
+    #[test]
+    fn portable_bundle_contains_skills_and_manifest() {
+        let data = tempfile::tempdir().unwrap();
+        let skill = data.path().join("installed/demo");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\n",
+        )
+        .unwrap();
+        let hash = storage::inspect_tree(&skill).unwrap().0;
+        let mut persisted = PersistedState::default();
+        persisted.installations.push(PhysicalInstallation {
+            id: "demo-id".to_string(),
+            skill_name: "demo".to_string(),
+            resolved_path: skill.display().to_string(),
+            source: None,
+            source_details: SkillSourceDetails::default(),
+            content_hash: hash,
+            scope: InstallScope::Global,
+            consumers: vec!["codex".to_string()],
+            passive_consumers: Vec::new(),
+            adapter_version: 1,
+            installed_at: Utc::now().to_rfc3339(),
+            provenance: InstallationProvenance::Adopted,
+            legacy_project: false,
+        });
+        storage::save_state(data.path(), &persisted).unwrap();
+        let destination = data.path().join("portable.zip");
+
+        let manifest =
+            export_skill_bundle_inner(&["demo-id".to_string()], &destination, data.path()).unwrap();
+
+        assert_eq!(manifest.skills.len(), 1);
+        let file = fs::File::open(destination).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        assert!(archive.by_name("demo/SKILL.md").is_ok());
+        assert!(archive.by_name("skill-installer-manifest.json").is_ok());
     }
 }

@@ -238,6 +238,8 @@ pub struct OperationJournalTarget {
     pub existed_before: bool,
     pub backup_id: Option<String>,
     pub completed: bool,
+    #[serde(default)]
+    pub previous_installation: Option<PhysicalInstallation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +311,47 @@ pub struct UpdateStatus {
     pub installation_id: String,
     pub status: UpdateState,
     pub message: String,
+    #[serde(default)]
+    pub current_hash: Option<String>,
+    #[serde(default)]
+    pub source_hash: Option<String>,
+    #[serde(default)]
+    pub source_revision: Option<String>,
+    #[serde(default)]
+    pub changes: Option<FileChangeSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeSummary {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableBundleEntry {
+    pub skill_name: String,
+    pub content_hash: String,
+    pub consumers: Vec<String>,
+    pub archive_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortableBundleManifest {
+    pub schema_version: u32,
+    pub exported_at: String,
+    pub app_version: String,
+    pub skills: Vec<PortableBundleEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppOverview {
+    pub backup_policy: BackupPolicy,
+    pub operation_journals: Vec<OperationJournal>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

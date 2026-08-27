@@ -30,11 +30,12 @@ import {
   TextField,
   Theme,
 } from "@radix-ui/themes";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 import type {
   BackupRecord,
+  AppOverview,
   ClientSkillInventory,
   DetectedClient,
   EnvironmentScan,
@@ -49,7 +50,7 @@ import type {
 } from "./types";
 import { conflictLabel, detectionLabel, formatBytes, shortPath } from "./ui";
 
-type Page = "install" | "manage" | "diagnostics";
+type Page = "dashboard" | "install" | "manage" | "diagnostics";
 type SourceMode = "localDirectory" | "localArchive" | "github";
 type InventoryFilter = "all" | "managed" | "external" | "issues";
 
@@ -121,13 +122,21 @@ function LoadingRows() {
 }
 
 export default function App() {
-  const [page, setPage] = useState<Page>("install");
+  const [page, setPage] = useState<Page>("dashboard");
   const [environment, setEnvironment] = useState<EnvironmentScan>({
     clients: [],
     inventories: [],
   });
   const [installations, setInstallations] = useState<PhysicalInstallation[]>([]);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
+  const [overview, setOverview] = useState<AppOverview>({
+    backupPolicy: {
+      maxBackupsPerSkill: 5,
+      maxTotalBytes: 1024 * 1024 * 1024,
+      retentionDays: 90,
+    },
+    operationJournals: [],
+  });
   const [sourceMode, setSourceMode] =
     useState<SourceMode>("localDirectory");
   const [sourceValue, setSourceValue] = useState("");
@@ -152,15 +161,17 @@ export default function App() {
     setBusy("scan");
     setError("");
     try {
-      const [nextEnvironment, nextInstallations, nextBackups] =
+      const [nextEnvironment, nextInstallations, nextBackups, nextOverview] =
         await Promise.all([
           api.scanEnvironment(),
           api.listInstallations(),
           api.listBackups(),
+          api.getAppOverview(),
         ]);
       setEnvironment(nextEnvironment);
       setInstallations(nextInstallations);
       setBackups(nextBackups);
+      setOverview(nextOverview);
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -402,6 +413,85 @@ export default function App() {
     }
   }
 
+  async function refreshClient(clientId: string) {
+    setBusy(`scan:${clientId}`);
+    setError("");
+    try {
+      const inventory = await api.scanClientInventory(clientId);
+      setEnvironment((current) => ({
+        ...current,
+        inventories: current.inventories.map((item) =>
+          item.clientId === clientId ? inventory : item,
+        ),
+      }));
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function recoverOperation(journalId: string) {
+    if (!window.confirm("恢复会将已写入目标回滚到本次操作前的状态，是否继续？")) return;
+    setBusy(`recover:${journalId}`);
+    setError("");
+    try {
+      setResults(await api.recoverOperation(journalId));
+      await refresh();
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function exportPortableBundle() {
+    const ids = installations
+      .filter((installation) => !installation.legacyProject)
+      .map((installation) => installation.id);
+    if (ids.length === 0) return;
+    const destination = await save({
+      defaultPath: `skill-installer-bundle-${new Date().toISOString().slice(0, 10)}.zip`,
+      filters: [{ name: "Skill 便携包", extensions: ["zip"] }],
+    });
+    if (!destination) return;
+    setBusy("export");
+    setError("");
+    try {
+      const manifest = await api.exportSkillBundle(ids, destination);
+      window.alert(`已导出 ${manifest.skills.length} 个 Skill。此 ZIP 可在另一台机器直接导入。`);
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function beginSync(skill: InventorySkill) {
+    setBusy(`sync:${skill.inventoryId}`);
+    setError("");
+    try {
+      const next = await api.inspectSource({
+        kind: "localDirectory",
+        path: skill.resolvedPath,
+      });
+      const selected = next.skills[0];
+      if (!selected) throw new Error("当前目录中没有可同步的有效 Skill");
+      setSourceMode("localDirectory");
+      setSourceValue(skill.resolvedPath);
+      setInspection(next);
+      setSelectedSkillIds([selected.skillId]);
+      setAssignments({ [selected.skillId]: [...skill.consumers] });
+      setPlan(undefined);
+      setResults([]);
+      setPage("install");
+    } catch (reason) {
+      setError(friendlyError(reason));
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function loadDiagnostics() {
     setBusy("diagnostics");
     try {
@@ -422,6 +512,24 @@ export default function App() {
     0,
   );
   const legacyInstallations = installations.filter((item) => item.legacyProject);
+  const externalCount = environment.inventories.reduce(
+    (count, inventory) =>
+      count +
+      inventory.directSkills.filter((skill) => skill.managementStatus === "external")
+        .length,
+    0,
+  );
+  const issueCount = environment.inventories.reduce(
+    (count, inventory) =>
+      count +
+      inventory.directSkills.filter((skill) =>
+        ["modified", "unsafe"].includes(skill.managementStatus),
+      ).length,
+    0,
+  );
+  const recoverableJournals = overview.operationJournals.filter((journal) =>
+    ["partial", "recoveryRequired"].includes(journal.status),
+  );
 
   return (
     <Theme accentColor="blue" grayColor="slate" radius="medium" scaling="95%">
@@ -430,7 +538,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS 0.2.1</Badge>
+          <Badge variant="outline">macOS 0.3.0</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
@@ -441,6 +549,13 @@ export default function App() {
         <div className="workspace">
           <aside className="sidebar">
             <nav aria-label="主导航">
+              <button
+                className={page === "dashboard" ? "nav-item active" : "nav-item"}
+                onClick={() => setPage("dashboard")}
+              >
+                <Package />
+                概览
+              </button>
               <button
                 className={page === "install" ? "nav-item active" : "nav-item"}
                 onClick={() => setPage("install")}
@@ -481,6 +596,101 @@ export default function App() {
                 </Callout.Icon>
                 <Callout.Text>{error}</Callout.Text>
               </Callout.Root>
+            )}
+
+            {page === "dashboard" && (
+              <div className="page dashboard-page">
+                <div className="page-heading">
+                  <div>
+                    <Text as="div" size="5" weight="bold">
+                      本机 Skill 概览
+                    </Text>
+                    <Text as="div" size="2" color="gray">
+                      先看环境状态，再决定安装、同步或修复。
+                    </Text>
+                  </div>
+                  <Button variant="soft" onClick={() => void refresh()}>
+                    {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
+                    刷新全部
+                  </Button>
+                </div>
+
+                <section className="overview-grid" aria-label="环境统计">
+                  <div className="overview-card">
+                    <span>可用 IDE</span>
+                    <strong>{clients.filter((client) => client.supportsSkills).length}</strong>
+                    <small>共检测 {clients.filter((client) => client.status !== "notInstalled").length} 个</small>
+                  </div>
+                  <div className="overview-card">
+                    <span>受管理 Skills</span>
+                    <strong>{managedCount}</strong>
+                    <small>{installations.length} 条安装记录</small>
+                  </div>
+                  <div className="overview-card">
+                    <span>外部 Skills</span>
+                    <strong>{externalCount}</strong>
+                    <small>可在库存页主动纳管</small>
+                  </div>
+                  <div className={issueCount || recoverableJournals.length ? "overview-card attention" : "overview-card"}>
+                    <span>需要处理</span>
+                    <strong>{issueCount + recoverableJournals.length}</strong>
+                    <small>修改、风险或待恢复操作</small>
+                  </div>
+                </section>
+
+                {recoverableJournals.map((journal) => (
+                  <Callout.Root color="orange" size="1" key={journal.id}>
+                    <Callout.Icon><WarningCircle /></Callout.Icon>
+                    <Callout.Text>
+                      上次{journal.operationType === "install" ? "安装" : "操作"}未完整结束，
+                      涉及 {journal.targets.length} 个目录。
+                    </Callout.Text>
+                    <Button
+                      size="1"
+                      color="orange"
+                      variant="soft"
+                      disabled={busy === `recover:${journal.id}`}
+                      onClick={() => void recoverOperation(journal.id)}
+                    >
+                      {busy === `recover:${journal.id}` && <Spinner size="1" />}
+                      恢复到操作前
+                    </Button>
+                  </Callout.Root>
+                ))}
+
+                <section className="panel">
+                  <div className="section-caption">
+                    <strong>IDE 检测结果</strong>
+                    <Badge variant="soft">{clients.length}</Badge>
+                  </div>
+                  <div className="client-overview-list">
+                    {clients.map((client) => (
+                      <div className="client-overview-row" key={client.id}>
+                        <div className="client-mark">{client.name.slice(0, 1)}</div>
+                        <div className="grow min-width-zero">
+                          <Flex align="center" gap="2" wrap="wrap">
+                            <strong>{client.name}</strong>
+                            <StatusBadge client={client} />
+                            {client.version && <Text size="1" color="gray">{client.version}</Text>}
+                          </Flex>
+                          <Text as="div" size="1" className="mono truncate" color="gray">
+                            写入 {shortPath(client.globalSkillsPath)}
+                          </Text>
+                        </div>
+                        <Text size="1" color="gray">
+                          {client.detectionEvidence?.length ?? 0} 条依据
+                        </Text>
+                      </div>
+                    ))}
+                  </div>
+                  <Flex justify="between" align="center" wrap="wrap" gap="2">
+                    <Text size="1" color="gray">
+                      备份策略：每个 Skill 最多 {overview.backupPolicy.maxBackupsPerSkill} 份，保留 {overview.backupPolicy.retentionDays} 天。
+                    </Text>
+                    <Button variant="soft" onClick={() => setPage("manage")}>打开库存管理</Button>
+                  </Flex>
+                </section>
+              </div>
             )}
 
             {page === "install" && (
@@ -905,10 +1115,20 @@ export default function App() {
                       查看每个 IDE 的直接安装、外部内容和被动发现项。
                     </Text>
                   </div>
-                  <Button variant="soft" onClick={() => void checkUpdates()}>
-                    {busy === "updates" ? <Spinner size="1" /> : <ArrowClockwise />}
-                    检查更新
-                  </Button>
+                  <Flex gap="2" wrap="wrap" justify="end">
+                    <Button
+                      variant="soft"
+                      disabled={installations.every((item) => item.legacyProject) || busy === "export"}
+                      onClick={() => void exportPortableBundle()}
+                    >
+                      {busy === "export" ? <Spinner size="1" /> : <Archive />}
+                      导出便携包
+                    </Button>
+                    <Button variant="soft" onClick={() => void checkUpdates()}>
+                      {busy === "updates" ? <Spinner size="1" /> : <ArrowClockwise />}
+                      检查更新
+                    </Button>
+                  </Flex>
                 </div>
                 <section className="panel inventory-controls">
                   <SearchBox
@@ -952,6 +1172,8 @@ export default function App() {
                       clients={clients}
                       onAdopt={adopt}
                       onUninstall={uninstallById}
+                      onRefresh={refreshClient}
+                      onSync={beginSync}
                       key={inventory.clientId}
                     />
                   ))
@@ -1101,6 +1323,8 @@ function InventoryGroup({
   clients,
   onAdopt,
   onUninstall,
+  onRefresh,
+  onSync,
 }: {
   client?: DetectedClient;
   inventory: ClientSkillInventory;
@@ -1115,6 +1339,8 @@ function InventoryGroup({
     displayPath: string,
     force?: boolean,
   ) => Promise<void>;
+  onRefresh: (clientId: string) => Promise<void>;
+  onSync: (skill: InventorySkill) => Promise<void>;
 }) {
   if (!client) return null;
   const allSkills = [...inventory.directSkills, ...inventory.passiveSkills];
@@ -1163,8 +1389,30 @@ function InventoryGroup({
           <Badge color="blue" variant="soft">
             被动 {count(["passive"])}
           </Badge>
+          <Button
+            size="1"
+            variant="ghost"
+            aria-label={`重新扫描 ${client.name}`}
+            disabled={busy === `scan:${client.id}`}
+            onClick={() => void onRefresh(client.id)}
+          >
+            {busy === `scan:${client.id}` ? <Spinner size="1" /> : <ArrowClockwise />}
+          </Button>
         </div>
       </div>
+      {(client.detectionEvidence?.length ?? 0) > 0 && (
+        <details className="detection-evidence">
+          <summary>查看检测依据与库存目录</summary>
+          <div>
+            {client.detectionEvidence?.map((evidence) => (
+              <Text as="div" size="1" color="gray" key={`${evidence.kind}-${evidence.path}`}>
+                {evidence.message} · <span className="mono">{shortPath(evidence.path)}</span>
+                {evidence.version ? ` · ${evidence.version}` : ""}
+              </Text>
+            ))}
+          </div>
+        </details>
+      )}
       {inventory.scanError ? (
         <Callout.Root color="red" size="1">
           <Callout.Icon>
@@ -1217,13 +1465,22 @@ function InventoryGroup({
                     </Text>
                   ))}
                   {update && (
-                    <Text
-                      as="div"
-                      size="1"
-                      color={update.status === "current" ? "green" : "orange"}
-                    >
-                      {update.message}
-                    </Text>
+                    <div className="update-summary">
+                      <Text
+                        as="div"
+                        size="1"
+                        color={update.status === "current" ? "green" : "orange"}
+                      >
+                        {update.message}
+                        {update.sourceRevision ? ` · ${update.sourceRevision.slice(0, 8)}` : ""}
+                      </Text>
+                      {update.changes &&
+                        update.changes.added.length + update.changes.modified.length + update.changes.removed.length > 0 && (
+                          <Text as="div" size="1" color="gray">
+                            新增 {update.changes.added.length} · 修改 {update.changes.modified.length} · 删除 {update.changes.removed.length}
+                          </Text>
+                        )}
+                    </div>
                   )}
                 </div>
                 <div className="row-actions">
@@ -1261,12 +1518,22 @@ function InventoryGroup({
                     ["toolManaged", "adopted", "modified"].includes(
                       skill.managementStatus,
                     ) && (
-                      <Button
-                        size="1"
-                        variant="ghost"
-                        color="red"
-                        disabled={busy === skill.installationId}
-                        onClick={() => {
+                      <>
+                        <Button
+                          size="1"
+                          variant="ghost"
+                          disabled={busy === `sync:${skill.inventoryId}`}
+                          onClick={() => void onSync(skill)}
+                        >
+                          <ArrowRight />
+                          同步
+                        </Button>
+                        <Button
+                          size="1"
+                          variant="ghost"
+                          color="red"
+                          disabled={busy === skill.installationId}
+                          onClick={() => {
                           const consumers = skill.consumers
                             .map(
                               (id) =>
@@ -1283,11 +1550,12 @@ function InventoryGroup({
                               skill.resolvedPath,
                             );
                           }
-                        }}
-                      >
-                        <Trash />
-                        卸载
-                      </Button>
+                          }}
+                        >
+                          <Trash />
+                          卸载
+                        </Button>
+                      </>
                     )}
                 </div>
               </div>
