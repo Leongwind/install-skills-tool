@@ -28,7 +28,7 @@ macOS 0.2.1 passed React, TypeScript, Rust, Clippy, Tauri build, DMG verificatio
 and GitHub Actions. The verified local DMG SHA-256 was
 `cb898336dc3ca08c93dacac779350126f9dc2051d231a252c0066575a0279abc`.
 
-## macOS lifecycle and reproducibility, 2026-08-27
+## macOS lifecycle and reproducibility, 2026-08-27 to 2026-08-28
 
 | Commit | Change |
 |---|---|
@@ -38,6 +38,7 @@ and GitHub Actions. The verified local DMG SHA-256 was
 | `47f9672` | Added planned, confirmed, backed-up and reversible Skill updates with version pinning. |
 | `8303874` | Added reproducible JSON lockfile export/import with source-hash and IDE reconciliation. |
 | `e9b4347` | Added the unified operation journal, rollback controls and managed backup policy UI. |
+| `0e2b68b` | Prepared the 0.4.0 delivery, state migrations, ad-hoc packaging and dual-architecture CI. |
 
 macOS 0.4.0 uses state schema v4. Existing v1-v3 state migrates atomically. Portable ZIP
 bundles carry Skill content; JSON lockfiles carry source provenance, expected hashes, IDE
@@ -47,6 +48,18 @@ The locally verified Apple Silicon 0.4.0 DMG has SHA-256
 `234a73c39a905678b4d2848d0b867ed5f73e966c7ac8f575f8b1a86d0033309c`.
 `hdiutil verify`, bundle version/identifier inspection, arm64 Mach-O inspection and strict
 ad-hoc `codesign` verification all passed.
+
+macOS workflow run
+[`33089545359`](https://github.com/Leongwind/install-skills-tool/actions/runs/33089545359)
+passed frontend build and tests, Rust format, Clippy and tests, then built both architectures
+for commit `0e2b68b5d842730ec7ad0d6b25c28e7143c1fb8d`. The downloaded artifacts matched their
+workflow-generated checksum files, passed `hdiutil verify`, contained strict-valid ad-hoc
+signed app bundles, and exposed the expected `0.4.0` bundle metadata:
+
+| Artifact | Binary | SHA-256 |
+|---|---|---|
+| `skill-installer-macos-arm64-dmg` | arm64 | `8f41a1311c2e7bb219f8c4a25a5dce6f24c20e1314b369962a08296c27146c2d` |
+| `skill-installer-macos-x64-dmg` | x86_64 | `036a0adff32bfcc1e1e9138e029578d8deb069ce045d748c47ee257225f9bc1d` |
 
 ## Windows 0.1.0, started 2026-08-02
 
