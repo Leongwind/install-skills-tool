@@ -663,7 +663,12 @@ pub async fn inspect_source(
         SkillSource::LocalArchive { path } => extract_local_archive(Path::new(path), data_dir)?,
         SkillSource::Github { url } => download_github(url, data_dir).await?,
     };
-    let (skills, rejected, warnings) = discover_skills(&root, source.clone(), source_details)?;
+    let github_sha_unavailable =
+        matches!(&source, SkillSource::Github { .. }) && source_details.commit_sha.is_none();
+    let (skills, rejected, mut warnings) = discover_skills(&root, source.clone(), source_details)?;
+    if github_sha_unavailable {
+        warnings.push("GitHub API 未返回 commit SHA；本次来源仅按 ref 固定。".to_string());
+    }
     Ok(SourceInspection {
         inspection_id: Uuid::new_v4().to_string(),
         source,
