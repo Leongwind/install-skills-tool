@@ -6,11 +6,12 @@ This is the entry point for continuing the project on another machine.
 
 - Repository: `Leongwind/install-skills-tool`
 - Default branch: `main`
-- macOS version: `0.4.0`, local and dual-architecture CI verification complete
+- macOS version: `0.5.1`, local verification and dual-architecture CI packaging complete
 - Windows version: `0.1.0`, Windows CI passed, waiting for Win11 real-IDE validation
 - Latest Windows code milestone: `89cb9ed`, GitHub source revision tracking
-- Latest macOS milestones: `47f9672` safe update lifecycle, `8303874` reproducible
-  lockfiles, `e9b4347` unified operation center, `0e2b68b` 0.4.0 delivery
+- Latest macOS milestones: `5a91737` durable schema v5 state, `cb4b0d1` Adapter V2
+  inventory, `ea3bb28` GitHub source ergonomics, `afa4f9f` lifecycle safety and
+  `5afe99c` operation ownership plus verified packaging
 
 ## Platform boundary
 
@@ -49,18 +50,18 @@ Then run `git status -sb` and `git log -5 --oneline` before changing anything.
 ### macOS
 
 Workflow run
-[`33089545359`](https://github.com/Leongwind/install-skills-tool/actions/runs/33089545359)
-passed for commit `0e2b68b5d842730ec7ad0d6b25c28e7143c1fb8d`. Both
+[`33254849319`](https://github.com/Leongwind/install-skills-tool/actions/runs/33254849319)
+passed for commit `5afe99c20ed63efe82c89da2932ccc997e222ec9`. Both
 `skill-installer-macos-arm64-dmg` and `skill-installer-macos-x64-dmg` were downloaded and
-verified against their `SHA256SUMS.txt`; their hashes are recorded in
+verified against their `SHA256SUMS.txt`; their 0.5.1 hashes are recorded in
 `docs/development-history.md`.
 
 The next macOS gate is a real user-flow smoke test on this Mac: install the arm64 artifact,
 scan the installed Codex/Kiro/TRAE clients and legacy inventory, exercise a multi-Skill
 GitHub or ZIP install, then verify update diff/backup/rollback, pinning, lockfile round-trip,
-and the operation center. Public distribution additionally requires Apple Developer ID
-credentials and notarization. Current builds use Tauri ad-hoc signing
-(`signingIdentity: "-"`) and must never be described as Developer ID signed or notarized.
+and the operation center. Apple distribution work remains outside the current plan. Builds
+use Tauri ad-hoc signing (`signingIdentity: "-"`) and must never be described as Developer
+ID signed or notarized.
 
 ### Windows
 

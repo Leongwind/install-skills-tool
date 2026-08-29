@@ -2,6 +2,17 @@
 
 此模板用于发布前在真实 macOS 机器上记录“检测到 IDE”和“IDE 原生页面可见”两件不同的结论。固定夹具只能证明安装器的分配计划与文件写入逻辑。
 
+## 当前待测构建
+
+- 提交：`5afe99c20ed63efe82c89da2932ccc997e222ec9`
+- CI：[macOS run 33254849319](https://github.com/Leongwind/install-skills-tool/actions/runs/33254849319)
+- Apple Silicon：`skill-installer-macos-arm64-dmg` / `Skill Installer_0.5.1_aarch64.dmg`
+  / `ca3f83d5da71eaf7fb6d0afb21c999fa4beef5cc20c49cd22f77910091f8c6ad`
+- Intel：`skill-installer-macos-x64-dmg` / `Skill Installer_0.5.1_x64.dmg`
+  / `e519c95f27113d51ee5fdbf11e66b4e11b8b4463920be742c8e02dfeb75e1431`
+- 自动验证：构建、checksum、DMG、bundle metadata、架构和 ad-hoc 签名均通过。
+- 尚未验证：真实 IDE 原生 Skills 页面可见性和下面的人工操作流程。
+
 ## 测试信息
 
 - 提交 SHA：

@@ -101,6 +101,36 @@ repository access or marketplace integration.
 | `58f48ca` | Split page boundaries and snapshot/inventory hooks; replaced browser confirmation with Radix dialog, added stale-plan retry affordance, inventory source labels and scan timestamps, plus progress/cancellation IPC. |
 | `2b25476` | Added contributing, security, changelog, issue templates, smoke-test, release, privacy and dependency-license documentation. |
 
+## macOS 0.5.1 safety closeout, 2026-08-29
+
+| Commit | Change |
+|---|---|
+| `6b7b514` | Added installation-record guards so a changed record invalidates an old apply plan before disk writes. |
+| `409d735` | Added DMG checksum generation and package-level verification to macOS CI. |
+| `592394f` | Documented operation progress, cancellation and inventory refresh behavior. |
+| `9ed9155` | Added public progress and cancellation guard coverage. |
+| `afa4f9f` | Closed rollback stale-state checks, pinned GitHub downloads to resolved commits, serialized state migration, bounded recursive inventory and added a safety data-flow integration test. |
+| `5afe99c` | Scoped progress and cancellation to an owning operation, prevented background inventory scans from replacing foreground state, corrected indeterminate download progress and made checksum verification safe for DMG names containing spaces. |
+
+Independent review approved commit `5afe99c20ed63efe82c89da2932ccc997e222ec9` after
+72 Rust unit tests, one Rust integration test and 12 React tests passed. Two real-network
+GitHub tests remain ignored by design; deterministic local transport tests cover the same
+revision-pinning and cancellation rules.
+
+macOS workflow run
+[`33254849319`](https://github.com/Leongwind/install-skills-tool/actions/runs/33254849319)
+passed verification and both package jobs. The downloaded artifacts matched their own
+`SHA256SUMS.txt`, and CI also passed `hdiutil verify`, bundle metadata, architecture and
+strict ad-hoc `codesign` checks:
+
+| Artifact | DMG | SHA-256 |
+|---|---|---|
+| `skill-installer-macos-arm64-dmg` | `Skill Installer_0.5.1_aarch64.dmg` | `ca3f83d5da71eaf7fb6d0afb21c999fa4beef5cc20c49cd22f77910091f8c6ad` |
+| `skill-installer-macos-x64-dmg` | `Skill Installer_0.5.1_x64.dmg` | `e519c95f27113d51ee5fdbf11e66b4e11b8b4463920be742c8e02dfeb75e1431` |
+
+These are ad-hoc preview artifacts. Apple Developer ID, notarization, Stapling, Homebrew
+and automatic updates remain outside the macOS plan.
+
 ## Windows 0.1.0, started 2026-08-02
 
 | Commit | Change |
