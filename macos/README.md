@@ -1,8 +1,14 @@
 # Skill Installer for macOS
 
-Skill Installer 0.5.0 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
+Skill Installer 0.5.1 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
 Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 应用数据只保存在本机，不采集遥测，不上传 Skill 内容。
+
+## 0.5.1 功能
+
+- GitHub 来源支持 `owner/repository` 简写、`@ref`、`@commit` 和精确目录路径，
+  也接受 `/tree/<ref>/...`、`/blob/<ref>/.../SKILL.md`、`/commit/<sha>` 以及
+  `?ref=...&path=...` 链接。所有 ref 和路径都会经过安全校验，仍只访问公开仓库。
 
 ## 0.5.0 功能
 

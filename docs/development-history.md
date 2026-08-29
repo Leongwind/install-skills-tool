@@ -80,6 +80,15 @@ notarization, Stapling, Homebrew and automatic updates are outside this mileston
 The 0.5.0 package remains an ad-hoc macOS DMG for local testing. No Apple Developer ID,
 notarization, Stapling, Homebrew or automatic-update distribution was added.
 
+## macOS 0.5.1 GitHub source ergonomics, 2026-08-29
+
+| Commit | Change |
+|---|---|
+| _pending_ | Added public GitHub shorthand, explicit ref/commit and exact Skill path parsing with validation and documentation. |
+
+The 0.5.1 source resolver remains public-repository only and does not add OAuth, private
+repository access or marketplace integration.
+
 ## Windows 0.1.0, started 2026-08-02
 
 | Commit | Change |

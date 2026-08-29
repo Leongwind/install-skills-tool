@@ -4,7 +4,7 @@ use crate::domain::{
 use crate::storage::{cache_dir, inspect_tree, MAX_BYTES, MAX_FILES};
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Seek};
 use std::path::{Component, Path, PathBuf};
@@ -40,6 +40,42 @@ struct GithubLocation {
 type DiscoveryResult = (Vec<SkillMetadata>, Vec<RejectedSkill>, Vec<String>);
 
 fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("GitHub 来源不能为空".to_string());
+    }
+
+    // The compact `owner/repository[@ref[:path]]` form is useful when a
+    // repository URL is copied from a README or terminal.  Keep it strict so
+    // arbitrary local paths are not accidentally treated as public sources.
+    if !raw.contains("://") {
+        let (repository_spec, shorthand_path) = raw
+            .split_once(':')
+            .map_or((raw, None), |(left, right)| (left, Some(right)));
+        let (repository_spec, reference) = repository_spec
+            .split_once('@')
+            .map_or((repository_spec, "HEAD"), |(repository, reference)| {
+                (repository, reference)
+            });
+        let mut parts = repository_spec.split('/').filter(|part| !part.is_empty());
+        let owner = parts.next().unwrap_or_default();
+        let repository = parts.next().unwrap_or_default();
+        if owner.is_empty() || repository.is_empty() || parts.next().is_some() {
+            return Err("GitHub 简写需要 owner/repository".to_string());
+        }
+        let repository = repository.trim_end_matches(".git");
+        validate_github_component(owner, "owner")?;
+        validate_github_component(repository, "repository")?;
+        validate_github_reference(reference)?;
+        let subpath = normalize_github_subpath(shorthand_path.unwrap_or_default())?;
+        return Ok(GithubLocation {
+            owner: owner.to_string(),
+            repository: repository.to_string(),
+            reference: reference.to_string(),
+            subpath,
+        });
+    }
+
     let url = url::Url::parse(raw).map_err(|_| "GitHub URL 无效".to_string())?;
     if url.host_str() != Some("github.com") {
         return Err("仅支持 github.com 公共仓库".to_string());
@@ -52,24 +88,90 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
     if parts.len() < 2 {
         return Err("GitHub URL 需要 owner/repository".to_string());
     }
-    let repository = parts[1].trim_end_matches(".git").to_string();
-    let (reference, mut subpath) = if parts.len() >= 4 && (parts[2] == "tree" || parts[2] == "blob")
+    let owner = parts[0];
+    let repository = parts[1].trim_end_matches(".git");
+    validate_github_component(owner, "owner")?;
+    validate_github_component(repository, "repository")?;
+    let (mut reference, mut subpath) =
+        if parts.len() >= 4 && (parts[2] == "tree" || parts[2] == "blob") {
+            (parts[3].to_string(), parts[4..].join("/"))
+        } else if parts.len() >= 4 && parts[2] == "commit" {
+            // A commit URL pins the archive to that exact SHA.  Commit pages do
+            // not normally contain a directory path, but accepting the optional
+            // suffix makes copied deep links deterministic as well.
+            (parts[3].to_string(), parts[4..].join("/"))
+        } else {
+            ("HEAD".to_string(), String::new())
+        };
+    let query = url.query_pairs().collect::<HashMap<_, _>>();
+    if !matches!(
+        parts.get(2),
+        Some(&"tree") | Some(&"blob") | Some(&"commit")
+    ) {
+        if let Some(value) = query.get("ref") {
+            reference = value.to_string();
+        }
+        if let Some(value) = query.get("path") {
+            subpath = value.to_string();
+        }
+    }
+    validate_github_reference(&reference)?;
+    let subpath = normalize_github_subpath(&subpath)?;
+    Ok(GithubLocation {
+        owner: owner.to_string(),
+        repository: repository.to_string(),
+        reference,
+        subpath,
+    })
+}
+
+fn validate_github_component(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
     {
-        (parts[3].to_string(), parts[4..].join("/"))
-    } else {
-        ("HEAD".to_string(), String::new())
-    };
+        return Err(format!("GitHub {label} 无效"));
+    }
+    Ok(())
+}
+
+fn validate_github_reference(reference: &str) -> Result<(), String> {
+    if reference.is_empty()
+        || reference == "."
+        || reference == ".."
+        || reference.chars().any(char::is_control)
+        || reference
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("GitHub ref 无效".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_github_subpath(path: &str) -> Result<String, String> {
+    if path.chars().any(char::is_control) || path.contains('\\') {
+        return Err("GitHub Skill 子路径无效".to_string());
+    }
+    let mut normalized = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(value) => normalized.push(value.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
+                return Err("GitHub Skill 子路径无效".to_string())
+            }
+        }
+    }
+    let mut subpath = normalized.join("/");
     if subpath.ends_with("/SKILL.md") {
         subpath.truncate(subpath.len() - "/SKILL.md".len());
     } else if subpath == "SKILL.md" {
         subpath.clear();
     }
-    Ok(GithubLocation {
-        owner: parts[0].to_string(),
-        repository,
-        reference,
-        subpath,
-    })
+    Ok(subpath)
 }
 
 fn validate_skill(
@@ -452,7 +554,7 @@ async fn download_github(
         location.owner, location.repository, location.reference
     );
     let client = reqwest::Client::builder()
-        .user_agent("Skill-Installer/0.1")
+        .user_agent("Skill-Installer/0.5.1")
         .build()
         .map_err(|error| error.to_string())?;
     let commit_sha = client
@@ -611,6 +713,38 @@ mod tests {
         let file =
             parse_github_url("https://github.com/acme/skills/blob/main/demo/SKILL.md").unwrap();
         assert_eq!(file.subpath, "demo");
+    }
+
+    #[test]
+    fn parses_github_shorthand_refs_commits_and_exact_paths() {
+        let root = parse_github_url("acme/skills").unwrap();
+        assert_eq!(root.owner, "acme");
+        assert_eq!(root.repository, "skills");
+        assert_eq!(root.reference, "HEAD");
+        assert_eq!(root.subpath, "");
+
+        let shorthand =
+            parse_github_url("acme/skills@feature/agent:catalog/demo/SKILL.md").unwrap();
+        assert_eq!(shorthand.reference, "feature/agent");
+        assert_eq!(shorthand.subpath, "catalog/demo");
+
+        let commit =
+            parse_github_url("https://github.com/acme/skills/commit/0123456789abcdef").unwrap();
+        assert_eq!(commit.reference, "0123456789abcdef");
+        assert_eq!(commit.subpath, "");
+
+        let query =
+            parse_github_url("https://github.com/acme/skills?ref=v2&path=catalog/demo/SKILL.md")
+                .unwrap();
+        assert_eq!(query.reference, "v2");
+        assert_eq!(query.subpath, "catalog/demo");
+    }
+
+    #[test]
+    fn rejects_unsafe_github_shorthand_components() {
+        assert!(parse_github_url("../skills").is_err());
+        assert!(parse_github_url("acme/skills@../main").is_err());
+        assert!(parse_github_url("acme/skills@main:../demo").is_err());
     }
 
     #[test]

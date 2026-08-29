@@ -756,7 +756,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS 0.5.0</Badge>
+          <Badge variant="outline">macOS 0.5.1</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}

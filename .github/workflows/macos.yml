@@ -36,9 +36,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Verify macOS version metadata
         run: |
-          test "$(node -p "require('./package.json').version")" = "0.5.0"
-          test "$(node -p "require('./src-tauri/tauri.conf.json').version")" = "0.5.0"
-          grep -q '^version = "0.5.0"' src-tauri/Cargo.toml
+          test "$(node -p "require('./package.json').version")" = "0.5.1"
+          test "$(node -p "require('./src-tauri/tauri.conf.json').version")" = "0.5.1"
+          grep -q '^version = "0.5.1"' src-tauri/Cargo.toml
       - run: pnpm run build
       - run: pnpm test
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
@@ -99,7 +99,7 @@ jobs:
           bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
           bundle_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
           test "$bundle_id" = "com.leongwind.skillinstaller"
-          test "$bundle_version" = "0.5.0"
+          test "$bundle_version" = "0.5.1"
           executable=$(find "$app/Contents/MacOS" -type f -perm -111 -maxdepth 1 -print -quit)
           test -n "$executable"
           test "$(lipo -archs "$executable")" = "$EXPECTED_ARCH"
