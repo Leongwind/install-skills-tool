@@ -39,3 +39,7 @@ pnpm tauri build
 
 开发、路径和安全模型参见 [`macos/README.md`](macos/README.md) 与
 [`windows/README.md`](windows/README.md)。
+
+社区贡献、漏洞报告和版本变化参见 [`CONTRIBUTING.md`](CONTRIBUTING.md)、
+[`SECURITY.md`](SECURITY.md) 与 [`CHANGELOG.md`](CHANGELOG.md)。跨机器交接和
+macOS 真实 IDE 验收记录位于 [`docs/`](docs/)。

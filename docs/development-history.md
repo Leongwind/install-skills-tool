@@ -94,6 +94,13 @@ notarization, Stapling, Homebrew or automatic-update distribution was added.
 The 0.5.1 source resolver remains public-repository only and does not add OAuth, private
 repository access or marketplace integration.
 
+## macOS 0.5.1 UX and community docs, 2026-08-29
+
+| Commit | Change |
+|---|---|
+| pending | Split page boundaries and snapshot/inventory hooks; replaced browser confirmation with Radix dialog, added stale-plan retry affordance, inventory source labels and scan timestamps. |
+| pending | Added contributing, security, changelog, issue templates, smoke-test, release, privacy and dependency-license documentation. |
+
 ## Windows 0.1.0, started 2026-08-02
 
 | Commit | Change |

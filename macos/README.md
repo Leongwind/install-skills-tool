@@ -179,3 +179,11 @@ CI 产物分别为 `skill-installer-macos-arm64-dmg` 与
 
 未来 Windows 版本创建顶层 `windows/`，拥有独立源码、依赖、测试、CI 和安装包。
 它可以参考 macOS 版本稳定的数据模型与流程，但不会导入或依赖 `macos/` 源码。
+
+## 社区与验收文档
+
+- [贡献指南](../CONTRIBUTING.md) 和 [安全策略](../SECURITY.md)
+- [真实 IDE Smoke 测试模板](../docs/handoffs/macos-ide-smoke-testing.md)
+- [macOS 发布清单](../docs/release-checklist-macos.md)
+- [隐私与诊断边界](../docs/privacy-diagnostics.md)
+- [第三方依赖许可证说明](../docs/dependency-licenses.md)
