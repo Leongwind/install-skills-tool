@@ -2024,6 +2024,10 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
 pub fn get_operation_progress(
     state: State<'_, AppState>,
 ) -> Result<Option<OperationProgress>, String> {
+    get_operation_progress_inner(&state)
+}
+
+pub fn get_operation_progress_inner(state: &AppState) -> Result<Option<OperationProgress>, String> {
     state
         .operation_progress
         .lock()
@@ -2033,6 +2037,10 @@ pub fn get_operation_progress(
 
 #[tauri::command]
 pub fn cancel_operation(state: State<'_, AppState>) -> Result<bool, String> {
+    cancel_operation_inner(&state)
+}
+
+pub fn cancel_operation_inner(state: &AppState) -> Result<bool, String> {
     let cancellable = state
         .operation_progress
         .lock()
@@ -3388,6 +3396,8 @@ mod tests {
                 .completed,
             3
         );
+        assert!(cancel_operation_inner(&state).unwrap());
+        assert!(state.cancel_requested.load(Ordering::Acquire));
         finish_progress(&state);
         assert!(state.operation_progress.lock().unwrap().is_none());
         assert!(!state.cancel_requested.load(Ordering::Acquire));
@@ -3407,13 +3417,7 @@ mod tests {
         };
 
         begin_progress(&state, "apply", "写入安装目标", 1, false);
-        let cancellable = state
-            .operation_progress
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|progress| progress.cancellable);
-        assert!(!cancellable);
+        assert!(!cancel_operation_inner(&state).unwrap());
         assert!(!state.cancel_requested.load(Ordering::Acquire));
         finish_progress(&state);
     }
