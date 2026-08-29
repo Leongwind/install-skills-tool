@@ -557,7 +557,7 @@ async fn download_github_with_transport<C, CFut, D, DFut>(
     raw: &str,
     data_dir: &Path,
     cancel_requested: Option<&AtomicBool>,
-    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+    on_progress: Option<&(dyn Fn(usize, Option<usize>) + Send + Sync)>,
     resolve_commit: C,
     download_archive: D,
 ) -> Result<(PathBuf, SkillSourceDetails), String>
@@ -594,7 +594,7 @@ where
         return Err("下载内容超过 50 MB".to_string());
     }
     if let Some(callback) = on_progress {
-        callback(bytes.len());
+        callback(bytes.len(), Some(bytes.len()));
     }
 
     let destination = cache_dir(data_dir).join(Uuid::new_v4().to_string());
@@ -625,7 +625,7 @@ async fn download_github(
     raw: &str,
     data_dir: &Path,
     cancel_requested: Option<&AtomicBool>,
-    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+    on_progress: Option<&(dyn Fn(usize, Option<usize>) + Send + Sync)>,
 ) -> Result<(PathBuf, SkillSourceDetails), String> {
     let client = reqwest::Client::builder()
         .user_agent("Skill-Installer/0.5.1")
@@ -669,6 +669,9 @@ async fn download_github(
             {
                 return Err("下载内容超过 50 MB".to_string());
             }
+            let content_length = response
+                .content_length()
+                .and_then(|size| usize::try_from(size).ok());
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
@@ -683,7 +686,7 @@ async fn download_github(
                     return Err("下载内容超过 50 MB".to_string());
                 }
                 if let Some(callback) = on_progress {
-                    callback(bytes.len());
+                    callback(bytes.len(), content_length);
                 }
             }
             Ok(bytes)
@@ -722,7 +725,7 @@ pub async fn inspect_source_with_control(
     source: SkillSource,
     data_dir: &Path,
     cancel_requested: Option<&AtomicBool>,
-    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+    on_progress: Option<&(dyn Fn(usize, Option<usize>) + Send + Sync)>,
 ) -> Result<SourceInspection, String> {
     crate::storage::cleanup_cache(data_dir, Duration::from_secs(24 * 60 * 60))?;
     if cancel_requested.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {

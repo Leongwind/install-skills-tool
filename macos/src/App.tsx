@@ -268,7 +268,7 @@ export default function App() {
     [],
   );
   const { lastInventoryScanAt } = useInventoryEvents(
-    page === "manage",
+    page === "manage" && !busy,
     applyEnvironment,
   );
 
@@ -403,7 +403,7 @@ export default function App() {
   async function cancelCurrentOperation() {
     if (typeof api.cancelOperation !== "function") return;
     try {
-      const accepted = await api.cancelOperation();
+      const accepted = await api.cancelOperation(operationProgress?.operationId);
       setNotice(
         accepted
           ? "已请求取消，当前步骤会在安全边界结束。"
@@ -1001,9 +1001,14 @@ export default function App() {
                       "lock-export": "导出锁文件",
                       "lock-import": "读取锁文件",
                     } as Record<string, string>)[busy] ?? "正在处理"}
-                  {operationProgress && operationProgress.total > 0
+                  {operationProgress &&
+                  !operationProgress.indeterminate &&
+                  operationProgress.total > 0 &&
+                  operationProgress.completed < operationProgress.total
                     ? ` · ${operationProgress.completed}/${operationProgress.total}`
-                    : ""}
+                    : operationProgress?.indeterminate
+                      ? " · 处理中"
+                      : ""}
                 </Callout.Text>
                 {operationProgress?.cancellable && (
                   <Button size="1" variant="soft" onClick={() => void cancelCurrentOperation()}>

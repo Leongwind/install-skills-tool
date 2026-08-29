@@ -66,7 +66,8 @@ export const api = {
     }),
   getOperationProgress: () =>
     invoke<OperationProgress | null>("get_operation_progress"),
-  cancelOperation: () => invoke<boolean>("cancel_operation"),
+  cancelOperation: (operationId?: string) =>
+    invoke<boolean>("cancel_operation", { operationId }),
   setInstallationPinned: (installationId: string, pinned: boolean) =>
     invoke<void>("set_installation_pinned", { installationId, pinned }),
   uninstall: (installationId: string, force: boolean) =>

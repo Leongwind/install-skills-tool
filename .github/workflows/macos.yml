@@ -93,10 +93,8 @@ jobs:
           dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
           dmg=$(find "$dmg_dir" -type f -name '*.dmg' -print -quit)
           test -n "$dmg"
-          expected_sha=$(awk -v file="$(basename "$dmg")" '$2 == file {print $1}' "$dmg_dir/SHA256SUMS.txt")
-          actual_sha=$(shasum -a 256 "$dmg" | awk '{print $1}')
-          test -n "$expected_sha"
-          test "$expected_sha" = "$actual_sha"
+          test -f "$dmg_dir/SHA256SUMS.txt"
+          (cd "$dmg_dir" && shasum -a 256 -c SHA256SUMS.txt)
           hdiutil verify "$dmg"
           mount_output=$(hdiutil attach "$dmg" -nobrowse -readonly)
           mount_point=$(printf '%s\n' "$mount_output" | awk '/\/Volumes\// {print substr($0, index($0, "/Volumes/")); exit}')
@@ -109,7 +107,7 @@ jobs:
           bundle_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
           test "$bundle_id" = "com.leongwind.skillinstaller"
           test "$bundle_version" = "0.5.1"
-          executable=$(find "$app/Contents/MacOS" -type f -perm -111 -maxdepth 1 -print -quit)
+          executable=$(find "$app/Contents/MacOS" -type f -perm -111 -print -quit)
           test -n "$executable"
           test "$(lipo -archs "$executable")" = "$EXPECTED_ARCH"
           codesign --verify --deep --strict --verbose=2 "$app"

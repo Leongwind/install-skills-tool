@@ -219,6 +219,10 @@ pub struct OperationProgress {
     pub completed: usize,
     pub total: usize,
     pub cancellable: bool,
+    /// True when the operation cannot provide a meaningful total yet (for
+    /// example, a streamed response without Content-Length).
+    #[serde(default)]
+    pub indeterminate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

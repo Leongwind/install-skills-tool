@@ -213,31 +213,61 @@ fn begin_progress(
     phase: &str,
     total: usize,
     cancellable: bool,
-) {
-    state.cancel_requested.store(false, Ordering::Release);
-    if let Ok(mut progress) = state.operation_progress.lock() {
-        *progress = Some(OperationProgress {
-            operation_id: operation_id.to_string(),
-            phase: phase.to_string(),
-            completed: 0,
-            total,
-            cancellable,
-        });
+) -> Option<String> {
+    let mut progress = state.operation_progress.lock().ok()?;
+    if progress.is_some() {
+        return None;
     }
+    let owner = format!("{operation_id}:{}", Uuid::new_v4());
+    state.cancel_requested.store(false, Ordering::Release);
+    *progress = Some(OperationProgress {
+        operation_id: owner.clone(),
+        phase: phase.to_string(),
+        completed: 0,
+        total,
+        cancellable,
+        indeterminate: total == 0,
+    });
+    Some(owner)
 }
 
-fn update_progress(state: &AppState, completed: usize) {
+fn update_progress(state: &AppState, owner: &str, completed: usize) {
     if let Ok(mut progress) = state.operation_progress.lock() {
-        if let Some(value) = progress.as_mut() {
-            value.completed = completed.min(value.total);
+        if let Some(value) = progress
+            .as_mut()
+            .filter(|value| value.operation_id == owner)
+        {
+            value.completed = if value.total == 0 {
+                completed
+            } else {
+                completed.min(value.total)
+            };
         }
     }
 }
 
-fn finish_progress(state: &AppState) {
-    state.cancel_requested.store(false, Ordering::Release);
+fn set_progress_total(state: &AppState, owner: &str, total: usize) {
     if let Ok(mut progress) = state.operation_progress.lock() {
-        *progress = None;
+        if let Some(value) = progress
+            .as_mut()
+            .filter(|value| value.operation_id == owner)
+        {
+            value.total = total;
+            value.indeterminate = total == 0;
+            value.completed = value.completed.min(total);
+        }
+    }
+}
+
+fn finish_progress(state: &AppState, owner: &str) {
+    if let Ok(mut progress) = state.operation_progress.lock() {
+        if progress
+            .as_ref()
+            .is_some_and(|value| value.operation_id == owner)
+        {
+            *progress = None;
+            state.cancel_requested.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -481,15 +511,17 @@ fn replace_installation_record(
 pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, String> {
     let clients = macos::scan_clients();
     let persisted = storage::load_state(&state.data_dir)?;
-    begin_progress(
+    let Some(owner) = begin_progress(
         &state,
         "scan-environment",
         "扫描 IDE Skill 库存",
         clients.len(),
         true,
-    );
+    ) else {
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let progress_state = &state;
-    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let on_progress = |completed: usize| update_progress(progress_state, &owner, completed);
     let scan = crate::inventory::build_environment_scan_with_control(
         clients,
         &persisted,
@@ -497,7 +529,7 @@ pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, S
         Some(&on_progress),
     );
     let cancelled = state.cancel_requested.load(Ordering::Acquire);
-    finish_progress(&state);
+    finish_progress(&state, &owner);
     if cancelled {
         return Err("库存扫描已取消".to_string());
     }
@@ -509,9 +541,16 @@ pub async fn inspect_source(
     source: SkillSource,
     state: State<'_, AppState>,
 ) -> Result<SourceInspection, String> {
-    begin_progress(&state, "inspect-source", "检查来源", 1, true);
+    let Some(owner) = begin_progress(&state, "inspect-source", "检查来源", 0, true) else {
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let progress_state = &state;
-    let on_progress = |bytes: usize| update_progress(progress_state, bytes);
+    let on_progress = |bytes: usize, total: Option<usize>| {
+        if let Some(total) = total {
+            set_progress_total(progress_state, &owner, total);
+        }
+        update_progress(progress_state, &owner, bytes);
+    };
     let inspection = match skill::inspect_source_with_control(
         source,
         &state.data_dir,
@@ -522,21 +561,34 @@ pub async fn inspect_source(
     {
         Ok(inspection) => inspection,
         Err(error) => {
-            finish_progress(&state);
+            finish_progress(&state, &owner);
             return Err(error);
         }
     };
     if state.cancel_requested.load(Ordering::Acquire) {
-        finish_progress(&state);
+        finish_progress(&state, &owner);
         return Err("来源检查已取消".to_string());
     }
-    update_progress(&state, 1);
+    let indeterminate = state
+        .operation_progress
+        .lock()
+        .ok()
+        .and_then(|progress| {
+            progress
+                .as_ref()
+                .filter(|value| value.operation_id == owner)
+                .map(|value| value.indeterminate)
+        })
+        .unwrap_or(true);
+    if indeterminate {
+        update_progress(&state, &owner, 1);
+    }
     state
         .inspections
         .lock()
         .map_err(|_| "来源检查锁已损坏".to_string())?
         .insert(inspection.inspection_id.clone(), inspection.clone());
-    finish_progress(&state);
+    finish_progress(&state, &owner);
     Ok(inspection)
 }
 
@@ -989,9 +1041,16 @@ pub fn apply_install_plan(
         .remove(&plan_id)
         .ok_or_else(|| "安装计划不存在或已执行".to_string())?;
     let total = pending.public.entries.len();
-    begin_progress(&state, &plan_id, "写入安装目标", total, true);
+    let Some(owner) = begin_progress(&state, &plan_id, "写入安装目标", total, true) else {
+        state
+            .plans
+            .lock()
+            .map_err(|_| "安装计划锁已损坏".to_string())?
+            .insert(plan_id.clone(), pending);
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let progress_state = &state;
-    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let on_progress = |completed: usize| update_progress(progress_state, &owner, completed);
     let result = apply_install_plan_inner_controlled(
         pending,
         &overwrite_entry_ids,
@@ -999,7 +1058,7 @@ pub fn apply_install_plan(
         Some(&state.cancel_requested),
         Some(&on_progress),
     );
-    finish_progress(&state);
+    finish_progress(&state, &owner);
     result
 }
 
@@ -1036,15 +1095,17 @@ pub fn scan_client_inventory(
         .find(|client| client.id == client_id)
         .ok_or_else(|| format!("未知 Agent: {client_id}"))?;
     let persisted = storage::load_state(&state.data_dir)?;
-    begin_progress(
+    let Some(owner) = begin_progress(
         &state,
         &format!("scan-client-{client_id}"),
         "扫描 IDE Skill 库存",
         0,
         true,
-    );
+    ) else {
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let progress_state = &state;
-    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let on_progress = |completed: usize| update_progress(progress_state, &owner, completed);
     let inventory = crate::inventory::scan_client_inventory_with_control(
         &client,
         &persisted,
@@ -1052,7 +1113,7 @@ pub fn scan_client_inventory(
         Some(&on_progress),
     );
     let cancelled = state.cancel_requested.load(Ordering::Acquire);
-    finish_progress(&state);
+    finish_progress(&state, &owner);
     if cancelled {
         return Err("库存扫描已取消".to_string());
     }
@@ -2219,9 +2280,16 @@ pub fn apply_update_plan(
         return Ok(stale_update_results(&pending.public, &message));
     }
     let total = pending.public.entries.len();
-    begin_progress(&state, &plan_id, "写入更新目标", total, true);
+    let Some(owner) = begin_progress(&state, &plan_id, "写入更新目标", total, true) else {
+        state
+            .update_plans
+            .lock()
+            .map_err(|_| "更新计划锁已损坏".to_string())?
+            .insert(plan_id.clone(), pending);
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let progress_state = &state;
-    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let on_progress = |completed: usize| update_progress(progress_state, &owner, completed);
     let result = apply_update_plan_inner_controlled(
         pending,
         &approved_entry_ids,
@@ -2229,7 +2297,7 @@ pub fn apply_update_plan(
         Some(&state.cancel_requested),
         Some(&on_progress),
     );
-    finish_progress(&state);
+    finish_progress(&state, &owner);
     result
 }
 
@@ -2237,11 +2305,14 @@ pub fn apply_update_plan(
 pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatus>, String> {
     let persisted = storage::load_state(&state.data_dir)?;
     let total = persisted.installations.len();
-    begin_progress(&state, "check-updates", "检查来源更新", total, true);
+    let Some(owner) = begin_progress(&state, "check-updates", "检查来源更新", total, true)
+    else {
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let mut statuses = Vec::new();
     for (index, installation) in persisted.installations.into_iter().enumerate() {
         if state.cancel_requested.load(Ordering::Acquire) {
-            finish_progress(&state);
+            finish_progress(&state, &owner);
             return Err("更新检查已取消".to_string());
         }
         if persisted.pinned_installation_ids.contains(&installation.id) {
@@ -2254,7 +2325,7 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             });
-            update_progress(&state, index + 1);
+            update_progress(&state, &owner, index + 1);
             continue;
         }
         let target_hash = storage::inspect_tree(Path::new(&installation.resolved_path))
@@ -2270,7 +2341,7 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             });
-            update_progress(&state, index + 1);
+            update_progress(&state, &owner, index + 1);
             continue;
         }
         let Some(source) = installation.source.clone() else {
@@ -2283,7 +2354,7 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             });
-            update_progress(&state, index + 1);
+            update_progress(&state, &owner, index + 1);
             continue;
         };
         match skill::inspect_source_with_control(
@@ -2330,12 +2401,12 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
             }),
         }
         if state.cancel_requested.load(Ordering::Acquire) {
-            finish_progress(&state);
+            finish_progress(&state, &owner);
             return Err("更新检查已取消".to_string());
         }
-        update_progress(&state, index + 1);
+        update_progress(&state, &owner, index + 1);
     }
-    finish_progress(&state);
+    finish_progress(&state, &owner);
     Ok(statuses)
 }
 
@@ -2355,17 +2426,38 @@ pub fn get_operation_progress_inner(state: &AppState) -> Result<Option<Operation
 }
 
 #[tauri::command]
-pub fn cancel_operation(state: State<'_, AppState>) -> Result<bool, String> {
-    cancel_operation_inner(&state)
+pub fn cancel_operation(
+    operation_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let Some(owner) = operation_id.as_deref() else {
+        // An operation token is required so a stale UI request cannot cancel
+        // whichever operation happens to be active now.
+        return Ok(false);
+    };
+    cancel_operation_for_owner_inner(&state, owner)
 }
 
 pub fn cancel_operation_inner(state: &AppState) -> Result<bool, String> {
+    let owner = state
+        .operation_progress
+        .lock()
+        .map_err(|_| "操作进度锁已损坏".to_string())?
+        .as_ref()
+        .map(|progress| progress.operation_id.clone());
+    let Some(owner) = owner else {
+        return Ok(false);
+    };
+    cancel_operation_for_owner_inner(state, &owner)
+}
+
+pub fn cancel_operation_for_owner_inner(state: &AppState, owner: &str) -> Result<bool, String> {
     let cancellable = state
         .operation_progress
         .lock()
         .map_err(|_| "操作进度锁已损坏".to_string())?
         .as_ref()
-        .is_some_and(|progress| progress.cancellable);
+        .is_some_and(|progress| progress.cancellable && owner == progress.operation_id);
     if cancellable {
         state.cancel_requested.store(true, Ordering::Release);
     }
@@ -3302,6 +3394,165 @@ mod tests {
     }
 
     #[test]
+    fn rollback_rejects_adopted_skill_edits_without_writing_state() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("external");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: external\ndescription: External\n---\noriginal\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let adopted = adopt_external_skill_inner(
+            "kiro",
+            &skill.display().to_string(),
+            data.path(),
+            &[client],
+        )
+        .unwrap();
+        let journal_id = storage::load_state(data.path())
+            .unwrap()
+            .operation_journals
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        fs::write(skill.join("SKILL.md"), "manual adopt edit\n").unwrap();
+        let before = fs::read(data.path().join("state.json")).unwrap();
+
+        let result = rollback_operation_inner(&journal_id, data.path()).unwrap();
+
+        assert!(result.iter().all(|item| item.status == "stale"));
+        assert_eq!(fs::read(data.path().join("state.json")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(skill.join("SKILL.md")).unwrap(),
+            "manual adopt edit\n"
+        );
+        assert!(storage::load_state(data.path())
+            .unwrap()
+            .installations
+            .iter()
+            .any(|item| item.id == adopted.id));
+    }
+
+    #[test]
+    fn rollback_rejects_rebuilt_uninstall_target_without_writing_backup() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\nsource\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\ninstalled\n",
+        )
+        .unwrap();
+        let installation = tracked_local_installation(data.path(), &source, &target);
+        uninstall_installation_inner(&installation.id, false, data.path()).unwrap();
+        let state = storage::load_state(data.path()).unwrap();
+        let journal = state.operation_journals.last().unwrap().clone();
+        let backup = state.backups.last().unwrap().clone();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "rebuilt after uninstall\n").unwrap();
+        let before_state = fs::read(data.path().join("state.json")).unwrap();
+        let before_backup = storage::inspect_tree(Path::new(&backup.backup_path))
+            .unwrap()
+            .0;
+
+        let result = rollback_operation_inner(&journal.id, data.path()).unwrap();
+
+        assert!(result.iter().all(|item| item.status == "stale"));
+        assert_eq!(
+            fs::read(data.path().join("state.json")).unwrap(),
+            before_state
+        );
+        assert_eq!(
+            storage::inspect_tree(Path::new(&backup.backup_path))
+                .unwrap()
+                .0,
+            before_backup
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "rebuilt after uninstall\n"
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_restore_target_edits_without_writing_backup() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "before restore\n").unwrap();
+        let backup = storage::create_backup(data.path(), &target)
+            .unwrap()
+            .unwrap();
+        let mut state = PersistedState::default();
+        state.backups.push(backup.clone());
+        storage::save_state(data.path(), &state).unwrap();
+        fs::write(target.join("SKILL.md"), "intermediate\n").unwrap();
+        restore_backup_inner(&backup.id, data.path()).unwrap();
+        let state = storage::load_state(data.path()).unwrap();
+        let journal = state.operation_journals.last().unwrap().clone();
+        let backup_hashes = state
+            .backups
+            .iter()
+            .map(|item| {
+                (
+                    item.id.clone(),
+                    storage::inspect_tree(Path::new(&item.backup_path))
+                        .unwrap()
+                        .0,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        fs::write(target.join("SKILL.md"), "manual restore edit\n").unwrap();
+        let before_state = fs::read(data.path().join("state.json")).unwrap();
+
+        let result = rollback_operation_inner(&journal.id, data.path()).unwrap();
+
+        assert!(result.iter().all(|item| item.status == "stale"));
+        assert_eq!(
+            fs::read(data.path().join("state.json")).unwrap(),
+            before_state
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "manual restore edit\n"
+        );
+        for item in storage::load_state(data.path()).unwrap().backups {
+            assert_eq!(
+                storage::inspect_tree(Path::new(&item.backup_path))
+                    .unwrap()
+                    .0,
+                backup_hashes[&item.id]
+            );
+        }
+    }
+
+    #[test]
     fn update_plan_rejects_target_changes_without_creating_a_journal() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -3864,14 +4115,14 @@ mod tests {
             cancel_requested: AtomicBool::new(false),
         };
 
-        begin_progress(&state, "check-updates", "检查来源更新", 3, true);
+        let owner = begin_progress(&state, "check-updates", "检查来源更新", 3, true).unwrap();
         let snapshot = state.operation_progress.lock().unwrap().clone().unwrap();
-        assert_eq!(snapshot.operation_id, "check-updates");
+        assert_eq!(snapshot.operation_id, owner);
         assert_eq!(snapshot.total, 3);
         assert!(snapshot.cancellable);
         state.cancel_requested.store(true, Ordering::Release);
         assert!(state.cancel_requested.load(Ordering::Acquire));
-        update_progress(&state, 4);
+        update_progress(&state, &owner, 4);
         assert_eq!(
             state
                 .operation_progress
@@ -3884,7 +4135,7 @@ mod tests {
         );
         assert!(cancel_operation_inner(&state).unwrap());
         assert!(state.cancel_requested.load(Ordering::Acquire));
-        finish_progress(&state);
+        finish_progress(&state, &owner);
         assert!(state.operation_progress.lock().unwrap().is_none());
         assert!(!state.cancel_requested.load(Ordering::Acquire));
     }
@@ -3902,14 +4153,66 @@ mod tests {
             cancel_requested: AtomicBool::new(false),
         };
 
-        begin_progress(&state, "apply", "写入安装目标", 1, false);
+        let owner = begin_progress(&state, "apply", "写入安装目标", 1, false).unwrap();
         assert!(!cancel_operation_inner(&state).unwrap());
         assert!(!state.cancel_requested.load(Ordering::Acquire));
-        finish_progress(&state);
+        finish_progress(&state, &owner);
     }
 
     #[test]
-    fn apply_install_reports_progress_for_each_entry() {
+    fn background_scan_blocks_update_and_apply_while_preserving_cancellation() {
+        let data = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(AppState {
+            data_dir: data.path().to_path_buf(),
+            inspections: Mutex::new(HashMap::new()),
+            plans: Mutex::new(HashMap::new()),
+            update_plans: Mutex::new(HashMap::new()),
+            mutation_lock: Mutex::new(()),
+            operation_progress: Mutex::new(None),
+            cancel_requested: AtomicBool::new(false),
+        });
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let scan_state = std::sync::Arc::clone(&state);
+        let scan_thread = std::thread::spawn(move || {
+            let owner = begin_progress(&scan_state, "scan", "扫描", 2, true).unwrap();
+            entered_tx.send(owner.clone()).unwrap();
+            release_rx.recv().unwrap();
+            finish_progress(&scan_state, &owner);
+        });
+        let scan_owner = entered_rx.recv().unwrap();
+        assert!(begin_progress(&state, "update", "更新", 1, true).is_none());
+        assert!(begin_progress(&state, "apply", "安装", 1, true).is_none());
+        update_progress(&state, "not-the-owner", 2);
+        assert_eq!(
+            state
+                .operation_progress
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .completed,
+            0
+        );
+        assert!(!cancel_operation_for_owner_inner(&state, "not-the-owner").unwrap());
+        assert!(!state.cancel_requested.load(Ordering::Acquire));
+        assert!(cancel_operation_for_owner_inner(&state, &scan_owner).unwrap());
+        assert!(state.cancel_requested.load(Ordering::Acquire));
+
+        // A stale owner cannot finish or clear the active operation.  This is
+        // the same guard used when a background scan races a user-triggered
+        // update/apply request.
+        finish_progress(&state, "not-the-owner");
+        assert!(state.operation_progress.lock().unwrap().is_some());
+        release_tx.send(()).unwrap();
+        scan_thread.join().unwrap();
+        assert!(state.operation_progress.lock().unwrap().is_none());
+        assert!(!state.cancel_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn apply_install_reports_progress_and_honors_mid_operation_cancellation() {
         let data = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let source_root = home.path().join("source");
@@ -3991,19 +4294,27 @@ mod tests {
             public: plan,
         };
         let progress = std::cell::RefCell::new(Vec::new());
-        let on_progress = |completed: usize| progress.borrow_mut().push(completed);
+        let cancelled = AtomicBool::new(false);
+        let on_progress = |completed: usize| {
+            progress.borrow_mut().push(completed);
+            if completed == 1 {
+                cancelled.store(true, Ordering::Release);
+            }
+        };
 
         let results = apply_install_plan_inner_controlled(
             pending,
             &[],
             data.path(),
-            None,
+            Some(&cancelled),
             Some(&on_progress),
         )
         .unwrap();
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|result| result.success));
-        assert_eq!(progress.into_inner(), vec![1, 2]);
+        assert!(results[0].success);
+        assert_eq!(results[1].status, "cancelled");
+        assert!(!Path::new(&results[1].path).exists());
+        assert_eq!(progress.into_inner(), vec![1, 1]);
     }
 }

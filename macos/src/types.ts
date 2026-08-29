@@ -135,6 +135,7 @@ export interface OperationProgress {
   completed: number;
   total: number;
   cancellable: boolean;
+  indeterminate?: boolean;
 }
 
 export interface PhysicalInstallation {
