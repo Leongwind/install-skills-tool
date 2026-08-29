@@ -208,6 +208,19 @@ pub struct OperationResult {
     pub message: String,
 }
 
+/// A lightweight snapshot for long-running source/update checks.  The UI can
+/// poll this value and request cancellation without coupling itself to the
+/// implementation of a particular adapter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationProgress {
+    pub operation_id: String,
+    pub phase: String,
+    pub completed: usize,
+    pub total: usize,
+    pub cancellable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PhysicalInstallation {

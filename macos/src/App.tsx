@@ -20,6 +20,7 @@ import {
   WarningCircle,
 } from "@phosphor-icons/react";
 import {
+  AlertDialog,
   Badge,
   Button,
   Callout,
@@ -32,8 +33,16 @@ import {
   Theme,
 } from "@radix-ui/themes";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
+import {
+  DiagnosticsPage,
+  InstallFlow,
+  InventoryPage,
+  OperationsPage,
+} from "./components/PageSections";
+import { useAppSnapshot } from "./hooks/useAppSnapshot";
+import { useInventoryEvents } from "./hooks/useInventoryEvents";
 import type {
   BackupRecord,
   AppOverview,
@@ -44,6 +53,7 @@ import type {
   InventorySkill,
   LockfileImportPlan,
   OperationResult,
+  OperationProgress,
   PhysicalInstallation,
   SkillManagementStatus,
   SkillSource,
@@ -56,6 +66,12 @@ import { conflictLabel, detectionLabel, formatBytes, shortPath } from "./ui";
 type Page = "dashboard" | "install" | "manage" | "operations" | "diagnostics";
 type SourceMode = "localDirectory" | "localArchive" | "github";
 type InventoryFilter = "all" | "managed" | "external" | "issues";
+type ConfirmationRequest = {
+  title: string;
+  description: string;
+  confirmLabel?: string;
+  destructive?: boolean;
+};
 
 const inventoryStatus: Record<
   SkillManagementStatus,
@@ -132,6 +148,44 @@ function LoadingRows() {
   );
 }
 
+function ConfirmDialog({
+  request,
+  onResolve,
+}: {
+  request?: ConfirmationRequest;
+  onResolve: (confirmed: boolean) => void;
+}) {
+  return (
+    <AlertDialog.Root
+      open={Boolean(request)}
+      onOpenChange={(open) => {
+        if (!open) onResolve(false);
+      }}
+    >
+      <AlertDialog.Content maxWidth="440px">
+        <AlertDialog.Title>{request?.title ?? "请确认操作"}</AlertDialog.Title>
+        <AlertDialog.Description>
+          {request?.description ?? ""}
+        </AlertDialog.Description>
+        <Flex gap="3" justify="end" mt="4">
+          <AlertDialog.Cancel>
+            <Button variant="soft">取消</Button>
+          </AlertDialog.Cancel>
+          <AlertDialog.Action>
+            <Button
+              aria-label={`确认${request?.confirmLabel ?? "确认"}`}
+              color={request?.destructive ? "red" : undefined}
+              onClick={() => onResolve(true)}
+            >
+              {request?.confirmLabel ?? "确认"}
+            </Button>
+          </AlertDialog.Action>
+        </Flex>
+      </AlertDialog.Content>
+    </AlertDialog.Root>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [environment, setEnvironment] = useState<EnvironmentScan>({
@@ -159,6 +213,10 @@ export default function App() {
   const [plan, setPlan] = useState<InstallPlan>();
   const [overwrites, setOverwrites] = useState<string[]>([]);
   const [results, setResults] = useState<OperationResult[]>([]);
+  const [staleAction, setStaleAction] = useState<"install" | "update">();
+  const [retryAction, setRetryAction] = useState<"install" | "update">();
+  const [operationProgress, setOperationProgress] =
+    useState<OperationProgress>();
   const [updates, setUpdates] = useState<UpdateStatus[]>([]);
   const [updatePlan, setUpdatePlan] = useState<UpdatePlan>();
   const [approvedUpdateIds, setApprovedUpdateIds] = useState<string[]>([]);
@@ -170,17 +228,21 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState("");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [policyDraft, setPolicyDraft] = useState({
     maxBackupsPerSkill: 5,
     maxTotalMb: 1024,
     retentionDays: 90,
   });
+  const [confirmation, setConfirmation] = useState<ConfirmationRequest>();
+  const confirmationResolver = useRef<((confirmed: boolean) => void) | null>(null);
 
   const clients = environment.clients;
 
-  const refresh = useCallback(async () => {
+  const loadSnapshot = useCallback(async () => {
     setBusy("scan");
     setError("");
+    setNotice("");
     try {
       const [nextEnvironment, nextInstallations, nextBackups, nextOverview] =
         await Promise.all([
@@ -200,32 +262,50 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
+  const { refresh, lastSnapshotAt } = useAppSnapshot(loadSnapshot);
+  const applyEnvironment = useCallback(
+    (nextEnvironment: EnvironmentScan) => setEnvironment(nextEnvironment),
+    [],
+  );
+  const { lastInventoryScanAt } = useInventoryEvents(
+    page === "manage",
+    applyEnvironment,
+  );
 
-  // Keep the inventory view useful while an IDE or another manager changes a
-  // known global directory. This is deliberately local-only; network update
-  // checks remain explicit user actions.
   useEffect(() => {
-    if (page !== "manage") return;
-    let active = true;
-    const timer = window.setInterval(() => {
-      void api
-        .scanEnvironment()
-        .then((nextEnvironment) => {
-          if (active) setEnvironment(nextEnvironment);
-        })
-        .catch(() => {
-          // Keep the last good inventory visible; the next manual refresh will
-          // surface a detailed error if the issue persists.
-        });
-    }, 5000);
+    if (!busy || typeof api.getOperationProgress !== "function") {
+      setOperationProgress(undefined);
+      return;
+    }
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const progress = await api.getOperationProgress();
+        if (!disposed) setOperationProgress(progress ?? undefined);
+      } catch {
+        // Progress is advisory; a failed poll must not interrupt the operation.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 350);
     return () => {
-      active = false;
+      disposed = true;
       window.clearInterval(timer);
     };
-  }, [page]);
+  }, [busy]);
+  const requestConfirmation = useCallback((request: ConfirmationRequest) => {
+    return new Promise<boolean>((resolve) => {
+      confirmationResolver.current?.(false);
+      confirmationResolver.current = resolve;
+      setConfirmation(request);
+    });
+  }, []);
+  const resolveConfirmation = useCallback((confirmed: boolean) => {
+    const resolver = confirmationResolver.current;
+    confirmationResolver.current = null;
+    setConfirmation(undefined);
+    resolver?.(confirmed);
+  }, []);
 
   useEffect(() => {
     setPolicyDraft({
@@ -284,6 +364,7 @@ export default function App() {
     setAssignments({});
     setPlan(undefined);
     setResults([]);
+    setRetryAction(undefined);
   }
 
   async function chooseSource() {
@@ -316,6 +397,20 @@ export default function App() {
       setError(friendlyError(reason));
     } finally {
       setBusy("");
+    }
+  }
+
+  async function cancelCurrentOperation() {
+    if (typeof api.cancelOperation !== "function") return;
+    try {
+      const accepted = await api.cancelOperation();
+      setNotice(
+        accepted
+          ? "已请求取消，当前步骤会在安全边界结束。"
+          : "当前操作正在写入，无法安全取消。",
+      );
+    } catch (reason) {
+      setError(friendlyError(reason));
     }
   }
 
@@ -392,7 +487,10 @@ export default function App() {
     setBusy("apply");
     setError("");
     try {
-      setResults(await api.applyInstallPlan(plan.planId, overwrites));
+      const nextResults = await api.applyInstallPlan(plan.planId, overwrites);
+      setResults(nextResults);
+      setStaleAction(nextResults.some((result) => result.status === "stale") ? "install" : undefined);
+      setRetryAction(nextResults.some((result) => !result.success && result.status !== "stale") ? "install" : undefined);
       setPlan(undefined);
       await refresh();
     } catch (reason) {
@@ -403,7 +501,11 @@ export default function App() {
   }
 
   async function adopt(clientId: string, skill: InventorySkill) {
-    if (!window.confirm(`将 ${skill.name} 纳入管理？\n\n${shortPath(skill.resolvedPath)}`)) {
+    if (!(await requestConfirmation({
+      title: `纳入管理：${skill.name}`,
+      description: shortPath(skill.resolvedPath),
+      confirmLabel: "纳入管理",
+    }))) {
       return;
     }
     setBusy(skill.inventoryId);
@@ -428,7 +530,12 @@ export default function App() {
     try {
       const result = await api.uninstall(installationId, force);
       if (!result.success && result.status === "confirmationRequired") {
-        if (window.confirm(`${result.message}\n\n${shortPath(displayPath)}`)) {
+        if (await requestConfirmation({
+          title: "确认卸载",
+          description: `${result.message}\n\n${shortPath(displayPath)}`,
+          confirmLabel: "备份并卸载",
+          destructive: true,
+        })) {
           await uninstallById(installationId, displayPath, true);
         }
         return;
@@ -442,7 +549,11 @@ export default function App() {
   }
 
   async function restore(backup: BackupRecord) {
-    if (!window.confirm(`恢复到 ${shortPath(backup.originalPath)}？当前内容会先备份。`)) {
+    if (!(await requestConfirmation({
+      title: "恢复备份",
+      description: `恢复到 ${shortPath(backup.originalPath)}？当前内容会先备份。`,
+      confirmLabel: "恢复并备份",
+    }))) {
       return;
     }
     setBusy(backup.id);
@@ -494,9 +605,10 @@ export default function App() {
     setBusy("update-apply");
     setError("");
     try {
-      setResults(
-        await api.applyUpdatePlan(updatePlan.planId, approvedUpdateIds),
-      );
+      const nextResults = await api.applyUpdatePlan(updatePlan.planId, approvedUpdateIds);
+      setResults(nextResults);
+      setStaleAction(nextResults.some((result) => result.status === "stale") ? "update" : undefined);
+      setRetryAction(nextResults.some((result) => !result.success && result.status !== "stale") ? "update" : undefined);
       setUpdatePlan(undefined);
       setApprovedUpdateIds([]);
       setUpdates([]);
@@ -505,6 +617,31 @@ export default function App() {
       setError(friendlyError(reason));
     } finally {
       setBusy("");
+    }
+  }
+
+  async function regenerateStalePlan() {
+    setResults([]);
+    if (staleAction === "install") {
+      setPage("install");
+      await createPlan();
+    } else if (staleAction === "update") {
+      setPage("manage");
+      await checkUpdates();
+    }
+    setStaleAction(undefined);
+  }
+
+  async function retryFailedResults() {
+    const action = retryAction;
+    setRetryAction(undefined);
+    setResults([]);
+    if (action === "install") {
+      setPage("install");
+      await createPlan();
+    } else if (action === "update") {
+      setPage("manage");
+      await checkUpdates();
     }
   }
 
@@ -540,7 +677,12 @@ export default function App() {
   }
 
   async function recoverOperation(journalId: string) {
-    if (!window.confirm("恢复会将已写入目标回滚到本次操作前的状态，是否继续？")) return;
+    if (!(await requestConfirmation({
+      title: "恢复未完成操作",
+      description: "已写入的目标会回滚到本次操作前的状态。",
+      confirmLabel: "开始恢复",
+      destructive: true,
+    }))) return;
     setBusy(`recover:${journalId}`);
     setError("");
     try {
@@ -554,7 +696,12 @@ export default function App() {
   }
 
   async function rollbackOperation(journalId: string) {
-    if (!window.confirm("回滚会恢复该操作涉及的文件与管理记录，是否继续？")) return;
+    if (!(await requestConfirmation({
+      title: "回滚操作",
+      description: "将恢复该操作涉及的文件与管理记录。",
+      confirmLabel: "开始回滚",
+      destructive: true,
+    }))) return;
     setBusy(`rollback:${journalId}`);
     setError("");
     try {
@@ -585,7 +732,12 @@ export default function App() {
   }
 
   async function deleteBackup(backup: BackupRecord) {
-    if (!window.confirm(`永久删除此备份？\n\n${shortPath(backup.originalPath)}`)) return;
+    if (!(await requestConfirmation({
+      title: "删除备份",
+      description: `备份将被永久删除：${shortPath(backup.originalPath)}`,
+      confirmLabel: "永久删除",
+      destructive: true,
+    }))) return;
     setBusy(`delete-backup:${backup.id}`);
     setError("");
     try {
@@ -612,7 +764,7 @@ export default function App() {
     setError("");
     try {
       const manifest = await api.exportSkillBundle(ids, destination);
-      window.alert(`已导出 ${manifest.skills.length} 个 Skill。此 ZIP 可在另一台机器直接导入。`);
+      setNotice(`已导出 ${manifest.skills.length} 个 Skill。此 ZIP 可在另一台机器直接导入。`);
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -634,7 +786,7 @@ export default function App() {
     setError("");
     try {
       const lockfile = await api.exportLockfile(ids, destination);
-      window.alert(`已导出 ${lockfile.skills.length} 个可复现 Skill 配置。`);
+      setNotice(`已导出 ${lockfile.skills.length} 个可复现 Skill 配置。`);
     } catch (reason) {
       setError(friendlyError(reason));
     } finally {
@@ -751,6 +903,7 @@ export default function App() {
 
   return (
     <Theme accentColor="blue" grayColor="slate" radius="medium" scaling="95%">
+      <ConfirmDialog request={confirmation} onResolve={resolveConfirmation} />
       <div className="app-shell">
         <header className="titlebar" data-tauri-drag-region>
           <div className="traffic-space" />
@@ -822,13 +975,62 @@ export default function App() {
                 <Callout.Text>{error}</Callout.Text>
               </Callout.Root>
             )}
+            {notice && !error && (
+              <Callout.Root color="green" size="1" className="global-notice">
+                <Callout.Icon>
+                  <Check />
+                </Callout.Icon>
+                <Callout.Text>{notice}</Callout.Text>
+              </Callout.Root>
+            )}
+            {busy && busy !== "scan" && (
+              <Callout.Root color="blue" size="1" className="operation-progress">
+                <Callout.Icon>
+                  <Spinner size="1" />
+                </Callout.Icon>
+                <Callout.Text>
+                  {operationProgress?.phase ??
+                    ({
+                      inspect: "检查来源",
+                      plan: "生成安装预览",
+                      apply: "写入安装目标",
+                      updates: "检查来源更新",
+                      "update-plan": "生成更新计划",
+                      "update-apply": "写入更新目标",
+                      export: "导出便携包",
+                      "lock-export": "导出锁文件",
+                      "lock-import": "读取锁文件",
+                    } as Record<string, string>)[busy] ?? "正在处理"}
+                  {operationProgress && operationProgress.total > 0
+                    ? ` · ${operationProgress.completed}/${operationProgress.total}`
+                    : ""}
+                </Callout.Text>
+                {operationProgress?.cancellable && (
+                  <Button size="1" variant="soft" onClick={() => void cancelCurrentOperation()}>
+                    取消
+                  </Button>
+                )}
+              </Callout.Root>
+            )}
             {page !== "install" && results.length > 0 && (
               <section className="panel global-results" aria-label="最近操作结果">
                 <div className="section-caption">
                   <strong>最近操作结果</strong>
-                  <Button size="1" variant="ghost" onClick={() => setResults([])}>
-                    关闭
-                  </Button>
+                  <Flex gap="2">
+                    {results.some((result) => result.status === "stale") && (
+                      <Button size="1" variant="soft" onClick={() => void regenerateStalePlan()}>
+                        {staleAction === "update" ? "重新检查更新计划" : "重新生成安装计划"}
+                      </Button>
+                    )}
+                    {retryAction && !results.some((result) => result.status === "stale") && (
+                      <Button size="1" variant="soft" onClick={() => void retryFailedResults()}>
+                        重试失败项
+                      </Button>
+                    )}
+                    <Button size="1" variant="ghost" onClick={() => { setResults([]); setStaleAction(undefined); }}>
+                      关闭
+                    </Button>
+                  </Flex>
                 </div>
                 {results.map((result, index) => (
                   <div className="result-row" key={result.entryId ?? `${result.path}-${index}`}>
@@ -940,7 +1142,7 @@ export default function App() {
             )}
 
             {page === "install" && (
-              <div className="page install-page">
+              <InstallFlow>
                 <div className="page-heading">
                   <div>
                     <Text as="div" size="5" weight="bold">
@@ -1360,11 +1562,11 @@ export default function App() {
                     ))}
                   </section>
                 )}
-              </div>
+              </InstallFlow>
             )}
 
             {page === "manage" && (
-              <div className="page manage-page">
+              <InventoryPage>
                 <div className="page-heading">
                   <div>
                     <Text as="div" size="5" weight="bold">
@@ -1372,6 +1574,13 @@ export default function App() {
                     </Text>
                     <Text as="div" size="2" color="gray">
                       查看每个 IDE 的直接安装、外部内容和被动发现项。
+                    </Text>
+                    <Text as="div" size="1" color="gray">
+                      {lastInventoryScanAt
+                        ? `最近扫描 ${lastInventoryScanAt.toLocaleTimeString()}`
+                        : lastSnapshotAt
+                          ? `最近扫描 ${lastSnapshotAt.toLocaleTimeString()}`
+                          : "正在准备首次扫描"}
                     </Text>
                   </div>
                   <Flex gap="2" wrap="wrap" justify="end">
@@ -1666,11 +1875,11 @@ export default function App() {
                   </section>
                 )}
 
-              </div>
+              </InventoryPage>
             )}
 
             {page === "operations" && (
-              <div className="page operations-page">
+              <OperationsPage>
                 <div className="page-heading">
                   <div>
                     <Text as="div" size="5" weight="bold">
@@ -1880,11 +2089,11 @@ export default function App() {
                       ))
                   )}
                 </section>
-              </div>
+              </OperationsPage>
             )}
 
             {page === "diagnostics" && (
-              <div className="page">
+              <DiagnosticsPage>
                 <div className="page-heading">
                   <div>
                     <Text as="div" size="5" weight="bold">
@@ -1923,7 +2132,7 @@ export default function App() {
                     {diagnostics || "诊断尚未生成。点击“生成预览”后可检查并复制。"}
                   </pre>
                 </section>
-              </div>
+              </DiagnosticsPage>
             )}
           </main>
         </div>
@@ -1967,6 +2176,9 @@ function InventoryGroup({
 }) {
   if (!client) return null;
   const allSkills = [...inventory.directSkills, ...inventory.passiveSkills];
+  const roots = client.inventorySkillsPaths?.length
+    ? client.inventorySkillsPaths
+    : [client.globalSkillsPath];
   const query = search.trim().toLowerCase();
   const visible = allSkills.filter((skill) => {
     const matchesSearch =
@@ -1998,6 +2210,18 @@ function InventoryGroup({
           <Text as="div" size="1" className="mono truncate" color="gray">
             {shortPath(inventory.rootPath)}
           </Text>
+          {roots.length > 1 && (
+            <div className="inventory-root-list" aria-label={`${client.name} 兼容库存目录`}>
+              {roots.map((root) => (
+                <Text as="div" size="1" color="gray" key={root}>
+                  <Badge color={root === client.globalSkillsPath ? "blue" : "gray"} variant="soft">
+                    {root === client.globalSkillsPath ? "原生" : "兼容"}
+                  </Badge>{" "}
+                  <span className="mono">{shortPath(root)}</span>
+                </Text>
+              ))}
+            </div>
+          )}
         </div>
         <div className="inventory-counts">
           <Badge color="green" variant="soft">
@@ -2051,6 +2275,14 @@ function InventoryGroup({
         <div className="inventory-list">
           {visible.map((skill) => {
             const status = inventoryStatus[skill.managementStatus];
+            const skillRoot = roots.find(
+              (root) => skill.resolvedPath === root || skill.resolvedPath.startsWith(`${root}/`),
+            );
+            const rootLabel = skillRoot
+              ? skillRoot === client.globalSkillsPath
+                ? "原生目录"
+                : "兼容目录"
+              : undefined;
             const update = updates.find(
               (item) => item.installationId === skill.installationId,
             );
@@ -2077,6 +2309,11 @@ function InventoryGroup({
                         非规范
                       </Badge>
                     )}
+                    {rootLabel && skill.managementStatus !== "passive" && (
+                      <Badge color={rootLabel === "原生目录" ? "blue" : "gray"} variant="soft">
+                        {rootLabel}
+                      </Badge>
+                    )}
                   </Flex>
                   <Text as="div" size="1" className="mono truncate" color="gray">
                     {shortPath(skill.resolvedPath)}
@@ -2084,6 +2321,14 @@ function InventoryGroup({
                   {passiveClient && (
                     <Text as="div" size="1" color="blue">
                       来自 {passiveClient.name} 共享目录，仅供查看
+                    </Text>
+                  )}
+                  {skill.consumers.length > 1 && (
+                    <Text as="div" size="1" color="blue">
+                      共享物理目录，可能影响：{" "}
+                      {skill.consumers
+                        .map((id) => clients.find((item) => item.id === id)?.name ?? id)
+                        .join("、")}
                     </Text>
                   )}
                   {skill.issues.map((issue) => (
@@ -2171,24 +2416,12 @@ function InventoryGroup({
                           variant="ghost"
                           color="red"
                           disabled={busy === skill.installationId}
-                          onClick={() => {
-                          const consumers = skill.consumers
-                            .map(
-                              (id) =>
-                                clients.find((item) => item.id === id)?.name ?? id,
-                            )
-                            .join("、");
-                          if (
-                            window.confirm(
-                              `卸载 ${skill.name}？\n\n将影响：${consumers}\n卸载前会自动备份。`,
-                            )
-                          ) {
+                          onClick={() =>
                             void onUninstall(
                               skill.installationId!,
                               skill.resolvedPath,
-                            );
+                            )
                           }
-                          }}
                         >
                           <Trash />
                           卸载

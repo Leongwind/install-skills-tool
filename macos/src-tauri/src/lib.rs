@@ -30,6 +30,8 @@ pub fn run() {
                 plans: Mutex::new(HashMap::new()),
                 update_plans: Mutex::new(HashMap::new()),
                 mutation_lock: Mutex::new(()),
+                operation_progress: Mutex::new(None),
+                cancel_requested: std::sync::atomic::AtomicBool::new(false),
             });
             Ok(())
         })
@@ -51,6 +53,8 @@ pub fn run() {
             commands::check_updates,
             commands::plan_updates,
             commands::apply_update_plan,
+            commands::get_operation_progress,
+            commands::cancel_operation,
             commands::set_installation_pinned,
             commands::uninstall_installation,
             commands::restore_backup,

@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use tauri::State;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -198,6 +201,42 @@ pub struct AppState {
     pub plans: Mutex<HashMap<String, PendingPlan>>,
     pub update_plans: Mutex<HashMap<String, PendingUpdatePlan>>,
     pub mutation_lock: Mutex<()>,
+    pub operation_progress: Mutex<Option<OperationProgress>>,
+    pub cancel_requested: AtomicBool,
+}
+
+fn begin_progress(
+    state: &AppState,
+    operation_id: &str,
+    phase: &str,
+    total: usize,
+    cancellable: bool,
+) {
+    state.cancel_requested.store(false, Ordering::Release);
+    if let Ok(mut progress) = state.operation_progress.lock() {
+        *progress = Some(OperationProgress {
+            operation_id: operation_id.to_string(),
+            phase: phase.to_string(),
+            completed: 0,
+            total,
+            cancellable,
+        });
+    }
+}
+
+fn update_progress(state: &AppState, completed: usize) {
+    if let Ok(mut progress) = state.operation_progress.lock() {
+        if let Some(value) = progress.as_mut() {
+            value.completed = completed.min(value.total);
+        }
+    }
+}
+
+fn finish_progress(state: &AppState) {
+    state.cancel_requested.store(false, Ordering::Release);
+    if let Ok(mut progress) = state.operation_progress.lock() {
+        *progress = None;
+    }
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -370,12 +409,25 @@ pub async fn inspect_source(
     source: SkillSource,
     state: State<'_, AppState>,
 ) -> Result<SourceInspection, String> {
-    let inspection = skill::inspect_source(source, &state.data_dir).await?;
+    begin_progress(&state, "inspect-source", "检查来源", 1, true);
+    let inspection = match skill::inspect_source(source, &state.data_dir).await {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            finish_progress(&state);
+            return Err(error);
+        }
+    };
+    if state.cancel_requested.load(Ordering::Acquire) {
+        finish_progress(&state);
+        return Err("来源检查已取消".to_string());
+    }
+    update_progress(&state, 1);
     state
         .inspections
         .lock()
         .map_err(|_| "来源检查锁已损坏".to_string())?
         .insert(inspection.inspection_id.clone(), inspection.clone());
+    finish_progress(&state);
     Ok(inspection)
 }
 
@@ -774,7 +826,11 @@ pub fn apply_install_plan(
         .map_err(|_| "安装计划锁已损坏".to_string())?
         .remove(&plan_id)
         .ok_or_else(|| "安装计划不存在或已执行".to_string())?;
-    apply_install_plan_inner(pending, &overwrite_entry_ids, &state.data_dir)
+    let total = pending.public.entries.len();
+    begin_progress(&state, &plan_id, "写入安装目标", total, false);
+    let result = apply_install_plan_inner(pending, &overwrite_entry_ids, &state.data_dir);
+    finish_progress(&state);
+    result
 }
 
 #[tauri::command]
@@ -1860,14 +1916,24 @@ pub fn apply_update_plan(
         // A stale plan must not create a journal, backup, or state mutation.
         return Ok(stale_update_results(&pending.public, &message));
     }
-    apply_update_plan_inner(pending, &approved_entry_ids, &state.data_dir)
+    let total = pending.public.entries.len();
+    begin_progress(&state, &plan_id, "写入更新目标", total, false);
+    let result = apply_update_plan_inner(pending, &approved_entry_ids, &state.data_dir);
+    finish_progress(&state);
+    result
 }
 
 #[tauri::command]
 pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatus>, String> {
     let persisted = storage::load_state(&state.data_dir)?;
+    let total = persisted.installations.len();
+    begin_progress(&state, "check-updates", "检查来源更新", total, true);
     let mut statuses = Vec::new();
-    for installation in persisted.installations {
+    for (index, installation) in persisted.installations.into_iter().enumerate() {
+        if state.cancel_requested.load(Ordering::Acquire) {
+            finish_progress(&state);
+            return Err("更新检查已取消".to_string());
+        }
         if persisted.pinned_installation_ids.contains(&installation.id) {
             statuses.push(UpdateStatus {
                 installation_id: installation.id,
@@ -1878,6 +1944,7 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             });
+            update_progress(&state, index + 1);
             continue;
         }
         let target_hash = storage::inspect_tree(Path::new(&installation.resolved_path))
@@ -1893,6 +1960,7 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             });
+            update_progress(&state, index + 1);
             continue;
         }
         let Some(source) = installation.source.clone() else {
@@ -1905,6 +1973,7 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             });
+            update_progress(&state, index + 1);
             continue;
         };
         match skill::inspect_source(source, &state.data_dir)
@@ -1945,8 +2014,35 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 changes: None,
             }),
         }
+        update_progress(&state, index + 1);
     }
+    finish_progress(&state);
     Ok(statuses)
+}
+
+#[tauri::command]
+pub fn get_operation_progress(
+    state: State<'_, AppState>,
+) -> Result<Option<OperationProgress>, String> {
+    state
+        .operation_progress
+        .lock()
+        .map(|progress| progress.clone())
+        .map_err(|_| "操作进度锁已损坏".to_string())
+}
+
+#[tauri::command]
+pub fn cancel_operation(state: State<'_, AppState>) -> Result<bool, String> {
+    let cancellable = state
+        .operation_progress
+        .lock()
+        .map_err(|_| "操作进度锁已损坏".to_string())?
+        .as_ref()
+        .is_some_and(|progress| progress.cancellable);
+    if cancellable {
+        state.cancel_requested.store(true, Ordering::Release);
+    }
+    Ok(cancellable)
 }
 
 pub fn uninstall_installation_inner(
@@ -3259,5 +3355,66 @@ mod tests {
             ..policy
         };
         assert!(set_backup_policy_inner(invalid, data.path()).is_err());
+    }
+
+    #[test]
+    fn cancellable_progress_is_visible_and_finishes_without_leaking_state() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState {
+            data_dir: data.path().to_path_buf(),
+            inspections: Mutex::new(HashMap::new()),
+            plans: Mutex::new(HashMap::new()),
+            update_plans: Mutex::new(HashMap::new()),
+            mutation_lock: Mutex::new(()),
+            operation_progress: Mutex::new(None),
+            cancel_requested: AtomicBool::new(false),
+        };
+
+        begin_progress(&state, "check-updates", "检查来源更新", 3, true);
+        let snapshot = state.operation_progress.lock().unwrap().clone().unwrap();
+        assert_eq!(snapshot.operation_id, "check-updates");
+        assert_eq!(snapshot.total, 3);
+        assert!(snapshot.cancellable);
+        state.cancel_requested.store(true, Ordering::Release);
+        assert!(state.cancel_requested.load(Ordering::Acquire));
+        update_progress(&state, 4);
+        assert_eq!(
+            state
+                .operation_progress
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .completed,
+            3
+        );
+        finish_progress(&state);
+        assert!(state.operation_progress.lock().unwrap().is_none());
+        assert!(!state.cancel_requested.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn non_cancellable_progress_does_not_accept_cancel_requests() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState {
+            data_dir: data.path().to_path_buf(),
+            inspections: Mutex::new(HashMap::new()),
+            plans: Mutex::new(HashMap::new()),
+            update_plans: Mutex::new(HashMap::new()),
+            mutation_lock: Mutex::new(()),
+            operation_progress: Mutex::new(None),
+            cancel_requested: AtomicBool::new(false),
+        };
+
+        begin_progress(&state, "apply", "写入安装目标", 1, false);
+        let cancellable = state
+            .operation_progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|progress| progress.cancellable);
+        assert!(!cancellable);
+        assert!(!state.cancel_requested.load(Ordering::Acquire));
+        finish_progress(&state);
     }
 }

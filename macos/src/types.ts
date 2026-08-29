@@ -129,6 +129,14 @@ export interface OperationResult {
   message: string;
 }
 
+export interface OperationProgress {
+  operationId: string;
+  phase: string;
+  completed: number;
+  total: number;
+  cancellable: boolean;
+}
+
 export interface PhysicalInstallation {
   id: string;
   skillName: string;

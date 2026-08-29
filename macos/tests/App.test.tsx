@@ -254,6 +254,7 @@ describe("Skill Installer desktop UI", () => {
     expect(screen.getByText("版本过低")).toBeInTheDocument();
     expect(screen.getByText("外部安装")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "纳入管理" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认纳入管理" }));
 
     await waitFor(() =>
       expect(mocks.adoptExternalSkill).toHaveBeenCalledWith(
@@ -302,6 +303,7 @@ describe("Skill Installer desktop UI", () => {
 
     const button = await screen.findByRole("button", { name: "恢复到操作前" });
     fireEvent.click(button);
+    fireEvent.click(await screen.findByRole("button", { name: "确认开始恢复" }));
 
     await waitFor(() =>
       expect(mocks.recoverOperation).toHaveBeenCalledWith("journal-id"),
@@ -483,6 +485,7 @@ describe("Skill Installer desktop UI", () => {
     expect(screen.getByText("更新")).toBeInTheDocument();
     expect(screen.getByText("自动备份")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "回滚此操作" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认开始回滚" }));
 
     await waitFor(() =>
       expect(mocks.rollbackOperation).toHaveBeenCalledWith("completed-update"),
