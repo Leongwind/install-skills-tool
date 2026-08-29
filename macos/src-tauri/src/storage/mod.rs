@@ -4,17 +4,64 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 pub const MAX_FILES: usize = 5_000;
 pub const MAX_BYTES: u64 = 200 * 1024 * 1024;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+
+static STATE_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Durable access to the JSON state file.  Commands still use the existing
+/// helper functions for compatibility, while new code can use this wrapper to
+/// make a read/modify/write operation explicit and serialized.
+#[derive(Debug, Clone)]
+pub struct StateRepository {
+    data_dir: PathBuf,
+}
+
+impl StateRepository {
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+        }
+    }
+
+    pub fn load(&self) -> Result<PersistedState, String> {
+        load_state(&self.data_dir)
+    }
+
+    pub fn save(&self, state: &PersistedState) -> Result<(), String> {
+        save_state(&self.data_dir, state)
+    }
+
+    pub fn mutate<T, F>(&self, mutate: F) -> Result<T, String>
+    where
+        F: FnOnce(&mut PersistedState) -> Result<T, String>,
+    {
+        let _guard = STATE_IO_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| "状态文件锁已损坏".to_string())?;
+        let mut state = load_state_unlocked(&self.data_dir)?;
+        let result = mutate(&mut state)?;
+        save_state_unlocked(&self.data_dir, &state)?;
+        Ok(result)
+    }
+}
 
 pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
+    load_state_unlocked(data_dir)
+}
+
+fn load_state_unlocked(data_dir: &Path) -> Result<PersistedState, String> {
     let path = data_dir.join("state.json");
     if !path.exists() {
         return Ok(PersistedState::default());
@@ -23,6 +70,11 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
     let mut state: PersistedState =
         serde_json::from_slice(&bytes).map_err(|error| format!("状态文件无效: {error}"))?;
     let original_schema = state.schema_version;
+    if original_schema > CURRENT_SCHEMA_VERSION {
+        return Err(format!(
+            "状态文件版本 {original_schema} 高于当前支持版本 {CURRENT_SCHEMA_VERSION}，为避免覆盖未知数据已拒绝读取"
+        ));
+    }
     if state.schema_version == 1 {
         for installation in &mut state.installations {
             installation.legacy_project =
@@ -37,6 +89,12 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
     if state.schema_version == 3 {
         state.schema_version = 4;
     }
+    if state.schema_version == 4 {
+        state.schema_version = CURRENT_SCHEMA_VERSION;
+        if state.revision == 0 {
+            state.revision = 1;
+        }
+    }
     let mut changed = original_schema != state.schema_version;
     for journal in &mut state.operation_journals {
         if matches!(
@@ -50,18 +108,61 @@ pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
         }
     }
     if changed {
+        backup_migrating_state(data_dir, original_schema, &bytes)?;
         save_state(data_dir, &state)?;
+        if let Ok(saved) = fs::read(data_dir.join("state.json")) {
+            if let Ok(saved_state) = serde_json::from_slice::<PersistedState>(&saved) {
+                state.revision = saved_state.revision;
+            }
+        }
     }
     Ok(state)
 }
 
 pub fn save_state(data_dir: &Path, state: &PersistedState) -> Result<(), String> {
+    let _guard = STATE_IO_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "状态文件锁已损坏".to_string())?;
+    save_state_unlocked(data_dir, state)
+}
+
+fn save_state_unlocked(data_dir: &Path, state: &PersistedState) -> Result<(), String> {
     fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
     let target = data_dir.join("state.json");
     let temporary = data_dir.join(format!(".state-{}.tmp", Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, &target).map_err(|error| error.to_string())
+    let mut next = state.clone();
+    let current_revision = fs::read(&target)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|value| value.get("revision").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    next.schema_version = CURRENT_SCHEMA_VERSION;
+    next.revision = current_revision
+        .max(next.revision)
+        .saturating_add(1)
+        .max(1);
+    let bytes = serde_json::to_vec_pretty(&next).map_err(|error| error.to_string())?;
+    let mut file = fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    file.write_all(&bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
+    if let Ok(directory) = fs::File::open(data_dir) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn backup_migrating_state(data_dir: &Path, from_schema: u32, bytes: &[u8]) -> Result<(), String> {
+    let migration_dir = data_dir.join("backups").join("state-migrations");
+    fs::create_dir_all(&migration_dir).map_err(|error| error.to_string())?;
+    let destination = migration_dir.join(format!(
+        "state-v{from_schema}-to-v{CURRENT_SCHEMA_VERSION}-{}.json",
+        Uuid::new_v4()
+    ));
+    let mut file = fs::File::create(destination).map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
 }
 
 pub fn inspect_tree(root: &Path) -> Result<(String, usize, u64, bool), String> {
@@ -487,7 +588,7 @@ mod tests {
 
         let state = load_state(data.path()).unwrap();
 
-        assert_eq!(state.schema_version, 4);
+        assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(!state.installations[0].legacy_project);
         assert!(state.installations[1].legacy_project);
         assert_eq!(
@@ -511,7 +612,7 @@ mod tests {
 
         let state = load_state(data.path()).unwrap();
 
-        assert_eq!(state.schema_version, 4);
+        assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(state.operation_journals.is_empty());
         assert_eq!(state.backup_policy.max_backups_per_skill, 5);
         assert!(state.pinned_installation_ids.is_empty());
@@ -541,12 +642,74 @@ mod tests {
 
         let state = load_state(data.path()).unwrap();
 
-        assert_eq!(state.schema_version, 4);
+        assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(state.pinned_installation_ids.is_empty());
         assert_eq!(
             state.operation_journals[0].status,
             crate::domain::OperationJournalStatus::RecoveryRequired
         );
+    }
+
+    #[test]
+    fn migration_to_v5_keeps_a_readable_backup_and_advances_revision() {
+        let data = tempfile::tempdir().unwrap();
+        let original = br#"{
+          "schemaVersion": 4,
+          "revision": 7,
+          "installations": [],
+          "backups": []
+        }"#;
+        fs::write(data.path().join("state.json"), original).unwrap();
+
+        let state = load_state(data.path()).unwrap();
+
+        assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(state.revision >= 8);
+        let migration_dir = data.path().join("backups/state-migrations");
+        let entries = fs::read_dir(migration_dir).unwrap().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(fs::read(entries[0].as_ref().unwrap().path()).unwrap(), original);
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_rewriting_state() {
+        let data = tempfile::tempdir().unwrap();
+        let original = br#"{
+          "schemaVersion": 99,
+          "revision": 3,
+          "installations": [],
+          "backups": []
+        }"#;
+        let path = data.path().join("state.json");
+        fs::write(&path, original).unwrap();
+
+        let error = load_state(data.path()).unwrap_err();
+
+        assert!(error.contains("高于当前支持版本"));
+        assert_eq!(fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn repository_mutations_are_durable_and_serialized() {
+        let data = tempfile::tempdir().unwrap();
+        let repository = StateRepository::new(data.path());
+        repository
+            .mutate(|state| {
+                state.pinned_installation_ids.push("one".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let first = repository.load().unwrap();
+        repository
+            .mutate(|state| {
+                state.pinned_installation_ids.push("two".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let second = repository.load().unwrap();
+
+        assert_eq!(second.pinned_installation_ids, ["one", "two"]);
+        assert!(second.revision > first.revision);
     }
 
     #[test]

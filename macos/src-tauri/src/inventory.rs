@@ -282,6 +282,7 @@ mod tests {
         let managed_hash = crate::storage::inspect_tree(&managed_path).unwrap().0;
         let state = PersistedState {
             schema_version: 3,
+            revision: 0,
             installations: vec![PhysicalInstallation {
                 id: "managed-id".to_string(),
                 skill_name: "managed".to_string(),

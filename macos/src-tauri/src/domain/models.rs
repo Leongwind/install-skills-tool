@@ -161,6 +161,18 @@ pub struct PendingPlan {
     pub public: InstallPlan,
     pub source_paths: std::collections::HashMap<String, PathBuf>,
     pub pinned_skill_ids: std::collections::HashSet<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub source_guards: std::collections::HashMap<String, String>,
+    pub target_guards: std::collections::HashMap<String, PlanTargetGuard>,
+}
+
+/// The immutable filesystem state captured while an operation plan is shown.
+/// Applying a plan is only safe when both existence and content still match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanTargetGuard {
+    pub existed: bool,
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +252,8 @@ pub struct OperationJournalTarget {
     pub backup_id: Option<String>,
     pub completed: bool,
     #[serde(default)]
+    pub resulting_hash: Option<String>,
+    #[serde(default)]
     pub previous_installation: Option<PhysicalInstallation>,
 }
 
@@ -277,6 +291,8 @@ impl Default for BackupPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct PersistedState {
     pub schema_version: u32,
+    #[serde(default)]
+    pub revision: u64,
     pub installations: Vec<PhysicalInstallation>,
     pub backups: Vec<BackupRecord>,
     #[serde(default)]
@@ -290,7 +306,8 @@ pub struct PersistedState {
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            schema_version: 4,
+            schema_version: 5,
+            revision: 0,
             installations: Vec::new(),
             backups: Vec::new(),
             operation_journals: Vec::new(),
@@ -353,6 +370,10 @@ pub struct UpdatePlan {
 pub struct PendingUpdatePlan {
     pub public: UpdatePlan,
     pub metadata_by_entry: std::collections::HashMap<String, SkillMetadata>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub source_guards: std::collections::HashMap<String, String>,
+    pub target_guards: std::collections::HashMap<String, PlanTargetGuard>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
