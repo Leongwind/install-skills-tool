@@ -155,6 +155,60 @@ fn joined_subpath(base: Option<&str>, relative: &str) -> String {
         .join("/")
 }
 
+/// Copy a local source into the inspection cache.  A plan must read the
+/// immutable preview snapshot rather than a mutable user directory at apply
+/// time.  The source path is retained in metadata for diagnostics only.
+fn snapshot_local_source(root: &Path, data_dir: &Path) -> Result<PathBuf, String> {
+    // Validate the complete source before copying so limits and symlink policy
+    // apply equally to a single Skill and a multi-Skill parent directory.
+    inspect_tree(root)?;
+    let snapshot_parent = cache_dir(data_dir).join(format!("local-{}", Uuid::new_v4()));
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("source");
+    let destination = snapshot_parent.join(root_name);
+    fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+    let cache_root = cache_dir(data_dir).canonicalize().ok();
+    let mut walker = WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(item) = walker.next() {
+        let item = item.map_err(|error| error.to_string())?;
+        if item.path() == snapshot_parent
+            || item.path().starts_with(&snapshot_parent)
+            || cache_root
+                .as_ref()
+                .is_some_and(|cache| item.path() == cache || item.path().starts_with(cache))
+        {
+            if item.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        let metadata = fs::symlink_metadata(item.path()).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("第一阶段不接受软链接: {}", item.path().display()));
+        }
+        let relative = item
+            .path()
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = destination.join(relative);
+        if metadata.is_dir() {
+            fs::create_dir_all(&target).map_err(|error| error.to_string())?;
+        } else if metadata.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            fs::copy(item.path(), &target).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(destination)
+}
+
 fn discover_skills(
     root: &Path,
     source: SkillSource,
@@ -475,8 +529,9 @@ pub async fn inspect_source(
             let canonical = PathBuf::from(path)
                 .canonicalize()
                 .map_err(|error| format!("本地路径无效: {error}"))?;
+            let snapshot = snapshot_local_source(&canonical, data_dir)?;
             (
-                canonical.clone(),
+                snapshot,
                 SkillSourceDetails {
                     local_path: Some(canonical.display().to_string()),
                     ..SkillSourceDetails::default()
@@ -595,6 +650,40 @@ mod tests {
         assert_eq!(inspection.skills[0].name, "valid-skill");
         assert_eq!(inspection.rejected.len(), 1);
         assert_eq!(inspection.rejected[0].relative_path, "skills/invalid-skill");
+    }
+
+    #[test]
+    fn local_directory_uses_an_immutable_preview_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("demo");
+        let data = tempfile::tempdir().unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Original\n---\noriginal",
+        )
+        .unwrap();
+
+        let inspection = tauri::async_runtime::block_on(inspect_source(
+            SkillSource::LocalDirectory {
+                path: source.display().to_string(),
+            },
+            data.path(),
+        ))
+        .unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Mutated\n---\nmutated",
+        )
+        .unwrap();
+
+        let metadata = &inspection.skills[0];
+        assert_ne!(PathBuf::from(&metadata.prepared_path), source);
+        assert!(
+            fs::read_to_string(Path::new(&metadata.prepared_path).join("SKILL.md"))
+                .unwrap()
+                .contains("Original")
+        );
     }
 
     #[test]

@@ -8,8 +8,8 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -95,7 +95,8 @@ fn load_state_unlocked(data_dir: &Path) -> Result<PersistedState, String> {
             state.revision = 1;
         }
     }
-    let mut changed = original_schema != state.schema_version;
+    let migrated = original_schema != state.schema_version;
+    let mut changed = migrated;
     for journal in &mut state.operation_journals {
         if matches!(
             journal.status,
@@ -108,8 +109,11 @@ fn load_state_unlocked(data_dir: &Path) -> Result<PersistedState, String> {
         }
     }
     if changed {
-        backup_migrating_state(data_dir, original_schema, &bytes)?;
-        save_state(data_dir, &state)?;
+        if migrated {
+            backup_migrating_state(data_dir, original_schema, &bytes)?;
+        }
+        // The caller may already hold STATE_IO_LOCK through StateRepository::mutate.
+        save_state_unlocked(data_dir, &state)?;
         if let Ok(saved) = fs::read(data_dir.join("state.json")) {
             if let Ok(saved_state) = serde_json::from_slice::<PersistedState>(&saved) {
                 state.revision = saved_state.revision;
@@ -138,10 +142,7 @@ fn save_state_unlocked(data_dir: &Path, state: &PersistedState) -> Result<(), St
         .and_then(|value| value.get("revision").and_then(serde_json::Value::as_u64))
         .unwrap_or(0);
     next.schema_version = CURRENT_SCHEMA_VERSION;
-    next.revision = current_revision
-        .max(next.revision)
-        .saturating_add(1)
-        .max(1);
+    next.revision = current_revision.max(next.revision).saturating_add(1).max(1);
     let bytes = serde_json::to_vec_pretty(&next).map_err(|error| error.to_string())?;
     let mut file = fs::File::create(&temporary).map_err(|error| error.to_string())?;
     file.write_all(&bytes).map_err(|error| error.to_string())?;
@@ -241,6 +242,23 @@ pub fn inspect_tree(root: &Path) -> Result<(String, usize, u64, bool), String> {
         }
     }
     Ok((hex::encode(digest.finalize()), count, bytes, has_scripts))
+}
+
+/// Hash a single target file for operation-plan preconditions.  Skill roots
+/// are normally directories, but a file at that path is a valid conflict and
+/// must still be guarded against replacement between preview and apply.
+pub fn hash_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn tree_file_hashes(root: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -668,7 +686,10 @@ mod tests {
         let migration_dir = data.path().join("backups/state-migrations");
         let entries = fs::read_dir(migration_dir).unwrap().collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
-        assert_eq!(fs::read(entries[0].as_ref().unwrap().path()).unwrap(), original);
+        assert_eq!(
+            fs::read(entries[0].as_ref().unwrap().path()).unwrap(),
+            original
+        );
     }
 
     #[test]

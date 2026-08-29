@@ -152,6 +152,8 @@ pub struct InstallPlanEntry {
 #[serde(rename_all = "camelCase")]
 pub struct InstallPlan {
     pub plan_id: String,
+    pub created_at: String,
+    pub expires_at: String,
     pub skills: Vec<SkillMetadata>,
     pub entries: Vec<InstallPlanEntry>,
 }
@@ -363,6 +365,8 @@ pub struct UpdatePlanEntry {
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePlan {
     pub plan_id: String,
+    pub created_at: String,
+    pub expires_at: String,
     pub entries: Vec<UpdatePlanEntry>,
 }
 

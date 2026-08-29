@@ -1,7 +1,7 @@
 use crate::adapters::{adapters, passive_consumers_for, resolve_global_target};
 use crate::domain::*;
 use crate::{macos, skill, storage};
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -14,11 +14,146 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
+const PLAN_TTL: ChronoDuration = ChronoDuration::minutes(15);
+
+fn plan_window() -> (String, String) {
+    let created = Utc::now();
+    (created.to_rfc3339(), (created + PLAN_TTL).to_rfc3339())
+}
+
+fn plan_expired(created_at: &str, expires_at: &str) -> bool {
+    let now = Utc::now();
+    let Ok(created) = DateTime::parse_from_rfc3339(created_at) else {
+        return true;
+    };
+    let Ok(expires) = DateTime::parse_from_rfc3339(expires_at) else {
+        return true;
+    };
+    created.with_timezone(&Utc) > now || expires.with_timezone(&Utc) <= now
+}
+
+fn target_guard(path: &Path) -> PlanTargetGuard {
+    PlanTargetGuard {
+        existed: path.exists(),
+        content_hash: if path.is_dir() {
+            storage::inspect_tree(path).ok().map(|value| value.0)
+        } else if path.is_file() {
+            storage::hash_file(path).ok()
+        } else {
+            None
+        },
+    }
+}
+
+fn target_guard_matches(path: &Path, expected: &PlanTargetGuard) -> bool {
+    if path.exists() != expected.existed {
+        return false;
+    }
+    if !expected.existed {
+        return true;
+    }
+    match expected.content_hash.as_deref() {
+        Some(expected_hash) if path.is_dir() => storage::inspect_tree(path)
+            .ok()
+            .is_some_and(|value| value.0 == expected_hash),
+        Some(expected_hash) if path.is_file() => storage::hash_file(path)
+            .ok()
+            .is_some_and(|value| value == expected_hash),
+        Some(_) => false,
+        None => false,
+    }
+}
+
+fn stale_install_results(plan: &InstallPlan, message: &str) -> Vec<OperationResult> {
+    plan.entries
+        .iter()
+        .map(|entry| OperationResult {
+            entry_id: Some(entry.entry_id.clone()),
+            skill_name: Some(entry.skill_name.clone()),
+            path: entry.resolved_path.clone(),
+            success: false,
+            status: "stale".to_string(),
+            message: message.to_string(),
+        })
+        .collect()
+}
+
+fn stale_update_results(plan: &UpdatePlan, message: &str) -> Vec<OperationResult> {
+    plan.entries
+        .iter()
+        .map(|entry| OperationResult {
+            entry_id: Some(entry.entry_id.clone()),
+            skill_name: Some(entry.skill_name.clone()),
+            path: entry.resolved_path.clone(),
+            success: false,
+            status: "stale".to_string(),
+            message: message.to_string(),
+        })
+        .collect()
+}
+
+fn validate_install_plan_guards(pending: &PendingPlan) -> Option<String> {
+    if plan_expired(&pending.created_at, &pending.expires_at) {
+        return Some("安装计划已过期，请重新生成预览".to_string());
+    }
+    for skill in &pending.public.skills {
+        let Some(expected_hash) = pending.source_guards.get(&skill.skill_id) else {
+            return Some(format!("{} 缺少来源校验，请重新生成预览", skill.name));
+        };
+        let source = pending.source_paths.get(&skill.skill_id);
+        let actual_hash = source
+            .and_then(|path| storage::inspect_tree(path).ok())
+            .map(|value| value.0);
+        if actual_hash.as_deref() != Some(expected_hash.as_str()) {
+            return Some(format!("{} 的来源快照已变化，请重新生成预览", skill.name));
+        }
+    }
+    for entry in &pending.public.entries {
+        let Some(expected) = pending.target_guards.get(&entry.entry_id) else {
+            return Some(format!("{} 缺少目标校验，请重新生成预览", entry.skill_name));
+        };
+        if !target_guard_matches(Path::new(&entry.resolved_path), expected) {
+            return Some(format!("{} 的目标已变化，请重新生成预览", entry.skill_name));
+        }
+    }
+    None
+}
+
+fn validate_update_plan_guards(pending: &PendingUpdatePlan) -> Option<String> {
+    if plan_expired(&pending.created_at, &pending.expires_at) {
+        return Some("更新计划已过期，请重新生成预览".to_string());
+    }
+    for entry in &pending.public.entries {
+        let Some(expected) = pending.target_guards.get(&entry.entry_id) else {
+            return Some(format!("{} 缺少目标校验，请重新生成预览", entry.skill_name));
+        };
+        if !target_guard_matches(Path::new(&entry.resolved_path), expected) {
+            return Some(format!("{} 的目标已变化，请重新生成预览", entry.skill_name));
+        }
+        if let Some(metadata) = pending.metadata_by_entry.get(&entry.entry_id) {
+            let actual_hash = storage::inspect_tree(Path::new(&metadata.prepared_path))
+                .ok()
+                .map(|value| value.0);
+            let expected_hash = pending.source_guards.get(&entry.entry_id);
+            if expected_hash.and_then(|hash| actual_hash.as_deref().map(|actual| actual == hash))
+                != Some(true)
+            {
+                return Some(format!(
+                    "{} 的来源快照已变化，请重新生成预览",
+                    entry.skill_name
+                ));
+            }
+        }
+    }
+    None
+}
+
 pub struct AppState {
     pub data_dir: PathBuf,
     pub inspections: Mutex<HashMap<String, SourceInspection>>,
     pub plans: Mutex<HashMap<String, PendingPlan>>,
     pub update_plans: Mutex<HashMap<String, PendingUpdatePlan>>,
+    pub mutation_lock: Mutex<()>,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -75,6 +210,27 @@ fn update_journal_target(
     {
         target.backup_id = backup_id;
         target.completed = completed;
+    }
+}
+
+fn set_journal_resulting_hash(
+    persisted: &mut PersistedState,
+    journal_id: &str,
+    path: &str,
+    resulting_hash: Option<String>,
+) {
+    if let Some(target) = persisted
+        .operation_journals
+        .iter_mut()
+        .find(|journal| journal.id == journal_id)
+        .and_then(|journal| {
+            journal
+                .targets
+                .iter_mut()
+                .find(|target| target.path == path)
+        })
+    {
+        target.resulting_hash = resulting_hash;
     }
 }
 
@@ -291,8 +447,11 @@ pub fn build_install_plan(
             warnings,
         });
     }
+    let (created_at, expires_at) = plan_window();
     Ok(InstallPlan {
         plan_id: Uuid::new_v4().to_string(),
+        created_at,
+        expires_at,
         skills: selected,
         entries,
     })
@@ -331,6 +490,23 @@ pub async fn plan_install(
         .filter(|skill| selected_ids.contains(skill.skill_id.as_str()))
         .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
         .collect();
+    let created_at = plan.created_at.clone();
+    let expires_at = plan.expires_at.clone();
+    let source_guards = plan
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
+        .collect();
+    let target_guards = plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                target_guard(Path::new(&entry.resolved_path)),
+            )
+        })
+        .collect();
     state
         .plans
         .lock()
@@ -341,24 +517,25 @@ pub async fn plan_install(
                 public: plan.clone(),
                 source_paths,
                 pinned_skill_ids: HashSet::new(),
+                created_at,
+                expires_at,
+                source_guards,
+                target_guards,
             },
         );
     Ok(plan)
 }
 
-#[tauri::command]
-pub fn apply_install_plan(
-    plan_id: String,
-    overwrite_entry_ids: Vec<String>,
-    state: State<'_, AppState>,
+pub fn apply_install_plan_inner(
+    pending: PendingPlan,
+    overwrite_entry_ids: &[String],
+    data_dir: &Path,
 ) -> Result<Vec<OperationResult>, String> {
-    let pending = state
-        .plans
-        .lock()
-        .map_err(|_| "安装计划锁已损坏".to_string())?
-        .remove(&plan_id)
-        .ok_or_else(|| "安装计划不存在或已执行".to_string())?;
-    let mut persisted = storage::load_state(&state.data_dir)?;
+    if let Some(message) = validate_install_plan_guards(&pending) {
+        // A stale plan must not create a journal, backup, or state mutation.
+        return Ok(stale_install_results(&pending.public, &message));
+    }
+    let mut persisted = storage::load_state(data_dir)?;
     let mut results = Vec::new();
     let journal_id = Uuid::new_v4().to_string();
     let journal_targets = pending
@@ -378,6 +555,7 @@ pub fn apply_install_plan(
             existed_before: Path::new(&entry.resolved_path).exists(),
             backup_id: None,
             completed: false,
+            resulting_hash: None,
             previous_installation: persisted
                 .installations
                 .iter()
@@ -396,7 +574,7 @@ pub fn apply_install_plan(
             targets: journal_targets,
             message: None,
         });
-        storage::save_state(&state.data_dir, &persisted)?;
+        storage::save_state(data_dir, &persisted)?;
     }
     for entry in &pending.public.entries {
         let metadata = pending
@@ -443,7 +621,7 @@ pub fn apply_install_plan(
                 metadata,
                 pending.pinned_skill_ids.contains(&entry.skill_id),
             );
-            storage::save_state(&state.data_dir, &persisted)?;
+            storage::save_state(data_dir, &persisted)?;
             results.push(OperationResult {
                 entry_id: Some(entry.entry_id.clone()),
                 skill_name: Some(entry.skill_name.clone()),
@@ -455,7 +633,7 @@ pub fn apply_install_plan(
             continue;
         }
         let operation = (|| -> Result<(), String> {
-            let backup_id = record_backup(&state.data_dir, &mut persisted, &destination)?;
+            let backup_id = record_backup(data_dir, &mut persisted, &destination)?;
             update_journal_target(
                 &mut persisted,
                 &journal_id,
@@ -463,15 +641,24 @@ pub fn apply_install_plan(
                 backup_id,
                 true,
             );
-            storage::save_state(&state.data_dir, &persisted)?;
+            storage::save_state(data_dir, &persisted)?;
             storage::atomic_replace(source_path, &destination)?;
+            let resulting_hash = storage::inspect_tree(&destination)
+                .ok()
+                .map(|value| value.0);
+            set_journal_resulting_hash(
+                &mut persisted,
+                &journal_id,
+                &entry.resolved_path,
+                resulting_hash,
+            );
             replace_installation_record(
                 &mut persisted,
                 entry,
                 metadata,
                 pending.pinned_skill_ids.contains(&entry.skill_id),
             );
-            storage::save_state(&state.data_dir, &persisted)
+            storage::save_state(data_dir, &persisted)
         })();
         results.push(match operation {
             Ok(()) => OperationResult {
@@ -507,14 +694,35 @@ pub fn apply_install_plan(
             },
             (failures > 0).then(|| format!("{failures} 个目标失败，可执行恢复")),
         );
-        storage::save_state(&state.data_dir, &persisted)?;
+        storage::save_state(data_dir, &persisted)?;
     }
     Ok(results)
 }
 
 #[tauri::command]
+pub fn apply_install_plan(
+    plan_id: String,
+    overwrite_entry_ids: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<OperationResult>, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
+    let pending = state
+        .plans
+        .lock()
+        .map_err(|_| "安装计划锁已损坏".to_string())?
+        .remove(&plan_id)
+        .ok_or_else(|| "安装计划不存在或已执行".to_string())?;
+    apply_install_plan_inner(pending, &overwrite_entry_ids, &state.data_dir)
+}
+
+#[tauri::command]
 pub fn list_installations(state: State<'_, AppState>) -> Result<Vec<PhysicalInstallation>, String> {
-    Ok(storage::load_state(&state.data_dir)?.installations)
+    Ok(storage::StateRepository::new(&state.data_dir)
+        .load()?
+        .installations)
 }
 
 #[tauri::command]
@@ -658,6 +866,10 @@ pub fn recover_operation(
     journal_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<OperationResult>, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     recover_operation_inner(&journal_id, &state.data_dir)
 }
 
@@ -666,6 +878,10 @@ pub fn rollback_operation(
     journal_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<OperationResult>, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     rollback_operation_inner(&journal_id, &state.data_dir)
 }
 
@@ -1006,8 +1222,11 @@ pub async fn prepare_lockfile_import_inner(
     missing_client_ids.sort();
     missing_client_ids.dedup();
     let install_plan = if resolved_skills.is_empty() {
+        let (created_at, expires_at) = plan_window();
         InstallPlan {
             plan_id: Uuid::new_v4().to_string(),
+            created_at,
+            expires_at,
             skills: Vec::new(),
             entries: Vec::new(),
         }
@@ -1042,6 +1261,22 @@ pub async fn prepare_lockfile_import_inner(
         .iter()
         .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
         .collect();
+    let (created_at, expires_at) = plan_window();
+    let source_guards = install_plan
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
+        .collect();
+    let target_guards = install_plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                target_guard(Path::new(&entry.resolved_path)),
+            )
+        })
+        .collect();
     Ok(PendingLockfilePlan {
         public: LockfileImportPlan {
             install_plan: install_plan.clone(),
@@ -1053,6 +1288,10 @@ pub async fn prepare_lockfile_import_inner(
             public: install_plan,
             source_paths,
             pinned_skill_ids,
+            created_at,
+            expires_at,
+            source_guards,
+            target_guards,
         },
     })
 }
@@ -1151,6 +1390,7 @@ pub fn adopt_external_skill_inner(
             existed_before: true,
             backup_id: None,
             completed: true,
+            resulting_hash: None,
             previous_installation: None,
         }],
         message: Some("已纳入管理；回滚只移除管理记录，不删除 Skill".to_string()),
@@ -1165,6 +1405,10 @@ pub fn adopt_external_skill(
     resolved_path: String,
     state: State<'_, AppState>,
 ) -> Result<PhysicalInstallation, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     adopt_external_skill_inner(
         &client_id,
         &resolved_path,
@@ -1194,7 +1438,7 @@ pub fn set_installation_pinned_inner(
             .pinned_installation_ids
             .push(installation_id.to_string());
     }
-    storage::save_state(data_dir, &persisted)
+    storage::StateRepository::new(data_dir).save(&persisted)
 }
 
 #[tauri::command]
@@ -1203,6 +1447,10 @@ pub fn set_installation_pinned(
     pinned: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     set_installation_pinned_inner(&installation_id, pinned, &state.data_dir)
 }
 
@@ -1323,12 +1571,32 @@ pub async fn prepare_update_plan_inner(
             }),
         }
     }
+    let (created_at, expires_at) = plan_window();
+    let source_guards = metadata_by_entry
+        .iter()
+        .map(|(entry_id, metadata)| (entry_id.clone(), metadata.content_hash.clone()))
+        .collect();
+    let target_guards = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                target_guard(Path::new(&entry.resolved_path)),
+            )
+        })
+        .collect();
     Ok(PendingUpdatePlan {
         public: UpdatePlan {
             plan_id: Uuid::new_v4().to_string(),
+            created_at: created_at.clone(),
+            expires_at: expires_at.clone(),
             entries,
         },
         metadata_by_entry,
+        created_at,
+        expires_at,
+        source_guards,
+        target_guards,
     })
 }
 
@@ -1352,6 +1620,9 @@ pub fn apply_update_plan_inner(
     approved_entry_ids: &[String],
     data_dir: &Path,
 ) -> Result<Vec<OperationResult>, String> {
+    if let Some(message) = validate_update_plan_guards(&pending) {
+        return Ok(stale_update_results(&pending.public, &message));
+    }
     let mut persisted = storage::load_state(data_dir)?;
     let approved = approved_entry_ids.iter().collect::<HashSet<_>>();
     let journal_id = Uuid::new_v4().to_string();
@@ -1369,6 +1640,7 @@ pub fn apply_update_plan_inner(
             existed_before: Path::new(&entry.resolved_path).exists(),
             backup_id: None,
             completed: false,
+            resulting_hash: None,
             previous_installation: persisted
                 .installations
                 .iter()
@@ -1427,6 +1699,15 @@ pub fn apply_update_plan_inner(
             );
             storage::save_state(data_dir, &persisted)?;
             storage::atomic_replace(Path::new(&metadata.prepared_path), &destination)?;
+            let resulting_hash = storage::inspect_tree(&destination)
+                .ok()
+                .map(|value| value.0);
+            set_journal_resulting_hash(
+                &mut persisted,
+                &journal_id,
+                &entry.resolved_path,
+                resulting_hash,
+            );
             let installation = persisted
                 .installations
                 .iter_mut()
@@ -1486,12 +1767,20 @@ pub fn apply_update_plan(
     approved_entry_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<OperationResult>, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     let pending = state
         .update_plans
         .lock()
         .map_err(|_| "更新计划锁已损坏".to_string())?
         .remove(&plan_id)
         .ok_or_else(|| "更新计划不存在或已执行".to_string())?;
+    if let Some(message) = validate_update_plan_guards(&pending) {
+        // A stale plan must not create a journal, backup, or state mutation.
+        return Ok(stale_update_results(&pending.public, &message));
+    }
     apply_update_plan_inner(pending, &approved_entry_ids, &state.data_dir)
 }
 
@@ -1619,6 +1908,7 @@ pub fn uninstall_installation_inner(
                 existed_before: true,
                 backup_id: None,
                 completed: false,
+                resulting_hash: None,
                 previous_installation: Some(installation.clone()),
             }],
             message: None,
@@ -1676,6 +1966,10 @@ pub fn uninstall_installation(
     force: bool,
     state: State<'_, AppState>,
 ) -> Result<OperationResult, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     uninstall_installation_inner(&installation_id, force, &state.data_dir)
 }
 
@@ -1701,6 +1995,7 @@ pub fn restore_backup_inner(backup_id: &str, data_dir: &Path) -> Result<Operatio
             existed_before,
             backup_id: None,
             completed: false,
+            resulting_hash: None,
             previous_installation: existed_before
                 .then(|| {
                     persisted
@@ -1729,6 +2024,15 @@ pub fn restore_backup_inner(backup_id: &str, data_dir: &Path) -> Result<Operatio
         );
         storage::save_state(data_dir, &persisted)?;
         storage::atomic_replace(Path::new(&backup.backup_path), &destination)?;
+        let resulting_hash = storage::inspect_tree(&destination)
+            .ok()
+            .map(|value| value.0);
+        set_journal_resulting_hash(
+            &mut persisted,
+            &journal_id,
+            &backup.original_path,
+            resulting_hash,
+        );
         if let Ok((hash, _, _, _)) = storage::inspect_tree(&destination) {
             if let Some(installation) = persisted
                 .installations
@@ -1775,6 +2079,10 @@ pub fn restore_backup(
     backup_id: String,
     state: State<'_, AppState>,
 ) -> Result<OperationResult, String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     restore_backup_inner(&backup_id, &state.data_dir)
 }
 
@@ -1788,14 +2096,18 @@ pub fn set_backup_policy_inner(policy: BackupPolicy, data_dir: &Path) -> Result<
     if !(1..=3650).contains(&policy.retention_days) {
         return Err("保留天数必须在 1 到 3650 之间".to_string());
     }
-    let mut persisted = storage::load_state(data_dir)?;
-    persisted.backup_policy = policy;
-    storage::enforce_backup_policy(&mut persisted)?;
-    storage::save_state(data_dir, &persisted)
+    storage::StateRepository::new(data_dir).mutate(|persisted| {
+        persisted.backup_policy = policy;
+        storage::enforce_backup_policy(persisted)
+    })
 }
 
 #[tauri::command]
 pub fn set_backup_policy(policy: BackupPolicy, state: State<'_, AppState>) -> Result<(), String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     set_backup_policy_inner(policy, &state.data_dir)
 }
 
@@ -1845,6 +2157,10 @@ pub fn delete_backup_inner(backup_id: &str, data_dir: &Path) -> Result<(), Strin
 
 #[tauri::command]
 pub fn delete_backup(backup_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _mutation = state
+        .mutation_lock
+        .lock()
+        .map_err(|_| "状态修改锁已损坏".to_string())?;
     delete_backup_inner(&backup_id, &state.data_dir)
 }
 
@@ -2188,6 +2504,7 @@ mod tests {
                 existed_before: false,
                 backup_id: None,
                 completed: true,
+                resulting_hash: None,
                 previous_installation: None,
             }],
             message: None,
@@ -2280,6 +2597,10 @@ mod tests {
         let journal = updated_state.operation_journals.last().unwrap();
         assert_eq!(journal.operation_type, "update");
         assert_eq!(journal.status, OperationJournalStatus::Completed);
+        assert_eq!(
+            journal.targets[0].resulting_hash.as_deref(),
+            Some(updated_state.installations[0].content_hash.as_str())
+        );
         assert_eq!(updated_state.backups.len(), 1);
         assert_ne!(
             updated_state.installations[0].content_hash,
@@ -2301,6 +2622,215 @@ mod tests {
             rolled_back.operation_journals[0].status,
             OperationJournalStatus::RolledBack
         );
+    }
+
+    #[test]
+    fn update_plan_rejects_target_changes_without_creating_a_journal() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let previous = tracked_local_installation(data.path(), &source, &target);
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            std::slice::from_ref(&previous.id),
+            data.path(),
+        ))
+        .unwrap();
+        let entry_id = pending.public.entries[0].entry_id.clone();
+        fs::write(target.join("SKILL.md"), "manual edit\n").unwrap();
+
+        let results = apply_update_plan_inner(pending, &[entry_id], data.path()).unwrap();
+
+        assert_eq!(results[0].status, "stale");
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "manual edit\n"
+        );
+        let state = storage::load_state(data.path()).unwrap();
+        assert_eq!(state.operation_journals.len(), 0);
+    }
+
+    #[test]
+    fn install_plan_rejects_source_changes_without_writing() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\noriginal\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: home.path().join(".kiro/skills").display().to_string(),
+            inventory_skills_paths: Vec::new(),
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let inspection = tauri::async_runtime::block_on(skill::inspect_source(
+            SkillSource::LocalDirectory {
+                path: source.display().to_string(),
+            },
+            data.path(),
+        ))
+        .unwrap();
+        let plan = build_install_plan(
+            &inspection,
+            &[SkillAssignment {
+                skill_id: inspection.skills[0].skill_id.clone(),
+                client_ids: vec![client.id.clone()],
+            }],
+            std::slice::from_ref(&client),
+            home.path(),
+            &PersistedState::default(),
+        )
+        .unwrap();
+        let pending = PendingPlan {
+            source_paths: inspection
+                .skills
+                .iter()
+                .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
+                .collect(),
+            source_guards: inspection
+                .skills
+                .iter()
+                .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
+                .collect(),
+            target_guards: plan
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.entry_id.clone(),
+                        target_guard(Path::new(&entry.resolved_path)),
+                    )
+                })
+                .collect(),
+            pinned_skill_ids: HashSet::new(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + PLAN_TTL).to_rfc3339(),
+            public: plan,
+        };
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\nchanged\n",
+        )
+        .unwrap();
+
+        let results = apply_install_plan_inner(pending, &[], data.path()).unwrap();
+
+        assert_eq!(results[0].status, "installed");
+        // The source was snapshotted during inspection, so changing the user
+        // directory does not invalidate the plan or alter the copied content.
+        assert!(results[0].success);
+        let installed = home.path().join(".kiro/skills/demo/SKILL.md");
+        assert!(installed.is_file());
+        assert!(fs::read_to_string(installed).unwrap().contains("original"));
+    }
+
+    #[test]
+    fn install_plan_rejects_tampered_preview_snapshot_without_writing() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("source/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\noriginal\n",
+        )
+        .unwrap();
+        let inspection = tauri::async_runtime::block_on(skill::inspect_source(
+            SkillSource::LocalDirectory {
+                path: source.display().to_string(),
+            },
+            data.path(),
+        ))
+        .unwrap();
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: home.path().join(".kiro/skills").display().to_string(),
+            inventory_skills_paths: Vec::new(),
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let plan = build_install_plan(
+            &inspection,
+            &[SkillAssignment {
+                skill_id: inspection.skills[0].skill_id.clone(),
+                client_ids: vec![client.id.clone()],
+            }],
+            std::slice::from_ref(&client),
+            home.path(),
+            &PersistedState::default(),
+        )
+        .unwrap();
+        let snapshot = PathBuf::from(&inspection.skills[0].prepared_path);
+        let pending = PendingPlan {
+            source_paths: inspection
+                .skills
+                .iter()
+                .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
+                .collect(),
+            source_guards: inspection
+                .skills
+                .iter()
+                .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
+                .collect(),
+            target_guards: plan
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.entry_id.clone(),
+                        target_guard(Path::new(&entry.resolved_path)),
+                    )
+                })
+                .collect(),
+            pinned_skill_ids: HashSet::new(),
+            created_at: Utc::now().to_rfc3339(),
+            expires_at: (Utc::now() + PLAN_TTL).to_rfc3339(),
+            public: plan,
+        };
+        fs::write(
+            snapshot.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\ntampered\n",
+        )
+        .unwrap();
+
+        let results = apply_install_plan_inner(pending, &[], data.path()).unwrap();
+
+        assert_eq!(results[0].status, "stale");
+        assert!(!home.path().join(".kiro/skills/demo").exists());
+        let state = storage::load_state(data.path()).unwrap();
+        assert!(state.installations.is_empty());
+        assert!(state.operation_journals.is_empty());
     }
 
     #[test]
@@ -2554,6 +3084,7 @@ mod tests {
                 existed_before: true,
                 backup_id: Some(backup.id.clone()),
                 completed: true,
+                resulting_hash: None,
                 previous_installation: None,
             }],
             message: None,

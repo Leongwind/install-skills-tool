@@ -1,10 +1,23 @@
 # Skill Installer for macOS
 
-Skill Installer 0.4.0 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
+Skill Installer 0.4.1 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
 Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 应用数据只保存在本机，不采集遥测，不上传 Skill 内容。
 
-## 0.4.0 功能
+## 0.4.1 功能
+
+- 安装与更新计划包含创建时间、过期时间、来源快照哈希和目标前置条件。执行前会
+  重新校验；计划过期或来源/目标发生变化时返回 `stale` 结果，不创建备份、操作
+  日志或写入目标。
+- 本地目录来源在检查时复制到缓存快照，后续安装不会读取用户正在修改的原始目录。
+- 状态文件升级到 schema v5，增加单调递增 `revision`。v1-v4 迁移前会在
+  `backups/state-migrations/` 保存原始文件；遇到更高版本会拒绝读取，避免未知字段
+  被覆盖。状态写入使用临时文件、`fsync` 和原子替换。
+- 所有会修改状态、Skill 或备份的桌面操作使用统一修改锁。操作日志目标记录最终
+  `resultingHash`，操作中心只在所需备份仍存在时显示回滚按钮。
+
+Apple Developer ID 签名、公证、Stapling、Homebrew 和自动更新不在本版本范围内；
+当前 CI 与本地构建仍使用 ad-hoc 签名包，仅用于 macOS 内测。
 
 - 更新不再停留在“发现变化”：可生成只读更新计划，查看新增、修改和删除摘要，
   逐项确认后批量更新。手工修改的目标会明确警告，写入前始终备份。
@@ -19,7 +32,7 @@ Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
   锁文件体积小、可审阅，适合从可访问来源重建相同配置。
 - 操作中心可修改每个 Skill 的备份数量、总空间和保留天数，也可手工恢复或删除
   备份。仍被未完成操作引用的故障恢复备份禁止删除。
-- 状态升级到 schema v4，原有安装、备份和 v3 操作日志原子迁移，不删除内容。
+- 状态升级到 schema v5，原有安装、备份和 v3/v4 操作日志安全迁移，不删除内容。
 
 ## 0.3.0 功能
 
@@ -118,7 +131,9 @@ TRAE 国际版通过 `com.trae.app`、应用内 `product.json` 和 `.trae` 数�
 └── logs/
 ```
 
-`state.json` 当前为 schema v4。v1/v2/v3 会原子迁移，不会删除 Skill 或备份。诊断
+`state.json` 当前为 schema v5。v1/v2/v3/v4 会原子迁移，不会删除 Skill 或备份。迁移
+前的原始 `state.json` 会保存在 `backups/state-migrations/`，未知的更高版本会拒绝
+读取。诊断
 预览会将用户目录替换为 `~`，包含库存数量、检测依据、操作日志、备份策略、
 规范和管理状态，但不包含 Skill 文件内容。
 
@@ -146,8 +161,8 @@ macos/src-tauri/target/release/bundle/dmg/
 CI 产物分别为 `skill-installer-macos-arm64-dmg` 与
 `skill-installer-macos-x64-dmg`，每个产物同时包含 `SHA256SUMS.txt`。Ad-hoc 签名
 不代表开发者身份或 Apple 公证；首次打开时仍可能需要在 Finder 中右键应用并
-选择“打开”。0.4.0 不包含
-Developer ID 签名、公证、自动更新、私有 GitHub、OAuth 或 Skill 市场。
+选择“打开”。0.4.1 不包含 Developer ID 签名、公证、Stapling、Homebrew、自动更新、
+私有 GitHub、OAuth 或 Skill 市场。
 
 ## Windows 边界
 

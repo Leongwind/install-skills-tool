@@ -7,14 +7,14 @@ Skill Installer 是一个本地优先的 Agent Skill 批量安装和 IDE Skill �
 
 | 平台 | 目录 | 状态 | 安装包 |
 |---|---|---|---|
-| macOS | [`macos/`](macos/) | 0.4.0 | `.dmg`（Apple Silicon / Intel） |
+| macOS | [`macos/`](macos/) | 0.4.1 | `.dmg`（Apple Silicon / Intel） |
 | Windows | [`windows/`](windows/) | 0.1.0 | `.exe` |
 
 macOS 版支持 Codex、Claude Code、Kiro、Cursor、Windsurf、TRAE 国际版和
 TRAE 国内版。它可从目录、ZIP 或公开 GitHub 仓库批量发现 Skills，通过
 Skill-IDE 矩阵分配全局目标，并按 IDE 展示受管理、外部、异常和被动发现库存。
 写入前会校验和预览，冲突覆盖与卸载前自动备份，且不会执行 Skill 脚本。
-0.4.0 增加可确认/可回滚的批量更新、版本固定、可复现 JSON 锁文件，以及统一的
+0.4.1 增加可确认/可回滚的批量更新、版本固定、可复现 JSON 锁文件，以及统一的
 操作与备份中心。跨机器迁移可按场景选择携带实际内容的 ZIP，或可审阅且会校验
 来源哈希的锁文件。
 

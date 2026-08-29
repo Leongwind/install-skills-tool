@@ -110,6 +110,8 @@ export interface InstallPlanEntry {
 
 export interface InstallPlan {
   planId: string;
+  createdAt: string;
+  expiresAt: string;
   skills: SkillMetadata[];
   entries: InstallPlanEntry[];
 }
@@ -198,6 +200,8 @@ export interface UpdatePlanEntry extends UpdateStatus {
 
 export interface UpdatePlan {
   planId: string;
+  createdAt: string;
+  expiresAt: string;
   entries: UpdatePlanEntry[];
 }
 
@@ -220,6 +224,7 @@ export interface OperationJournalTarget {
   existedBefore: boolean;
   backupId?: string;
   completed: boolean;
+  resultingHash?: string;
 }
 
 export interface OperationJournal {

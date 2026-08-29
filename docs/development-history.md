@@ -61,6 +61,16 @@ signed app bundles, and exposed the expected `0.4.0` bundle metadata:
 | `skill-installer-macos-arm64-dmg` | arm64 | `8f41a1311c2e7bb219f8c4a25a5dce6f24c20e1314b369962a08296c27146c2d` |
 | `skill-installer-macos-x64-dmg` | x86_64 | `036a0adff32bfcc1e1e9138e029578d8deb069ce045d748c47ee257225f9bc1d` |
 
+## macOS 0.4.1 hardening, 2026-08-29
+
+| Commit | Change |
+|---|---|
+| `5a91737` | Added schema v5 state revision, migration backups and durable state repository. |
+| _pending_ | Added stale install/update plan guards, local preview snapshots, truthful rollback availability and regression coverage. |
+
+macOS 0.4.1 keeps ad-hoc DMG packaging for local testing. Apple Developer ID signing,
+notarization, Stapling, Homebrew and automatic updates are outside this milestone.
+
 ## Windows 0.1.0, started 2026-08-02
 
 | Commit | Change |

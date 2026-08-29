@@ -34,6 +34,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: pnpm install --frozen-lockfile
+      - name: Verify macOS version metadata
+        run: |
+          test "$(node -p "require('./package.json').version")" = "0.4.1"
+          test "$(node -p "require('./src-tauri/tauri.conf.json').version")" = "0.4.1"
+          grep -q '^version = "0.4.1"' src-tauri/Cargo.toml
       - run: pnpm run build
       - run: pnpm test
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
@@ -47,9 +52,11 @@ jobs:
         include:
           - runner: macos-15
             target: aarch64-apple-darwin
+            expected_arch: arm64
             artifact: skill-installer-macos-arm64-dmg
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            expected_arch: x86_64
             artifact: skill-installer-macos-x64-dmg
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -74,6 +81,29 @@ jobs:
           DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       - name: Generate SHA-256 checksum
         run: shasum -a 256 src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg > src-tauri/target/${{ matrix.target }}/release/bundle/dmg/SHA256SUMS.txt
+      - name: Verify DMG, bundle metadata, architecture and ad-hoc signature
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        run: |
+          set -euo pipefail
+          dmg=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          hdiutil verify "$dmg"
+          mount_output=$(hdiutil attach "$dmg" -nobrowse -readonly)
+          mount_point=$(printf '%s\n' "$mount_output" | awk '/\/Volumes\// {print substr($0, index($0, "/Volumes/")); exit}')
+          test -n "$mount_point"
+          cleanup() { hdiutil detach "$mount_point" >/dev/null || true; }
+          trap cleanup EXIT
+          app="$mount_point/Skill Installer.app"
+          test -d "$app"
+          bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+          bundle_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+          test "$bundle_id" = "com.leongwind.skillinstaller"
+          test "$bundle_version" = "0.4.1"
+          executable=$(find "$app/Contents/MacOS" -type f -perm -111 -maxdepth 1 -print -quit)
+          test -n "$executable"
+          test "$(lipo -archs "$executable")" = "$EXPECTED_ARCH"
+          codesign --verify --deep --strict "$app"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

@@ -733,7 +733,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS 0.4.0</Badge>
+          <Badge variant="outline">macOS 0.4.1</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
@@ -1212,6 +1212,9 @@ export default function App() {
                         <Text as="div" size="1" color="gray">
                           {plan.skills.length} 个 Skill，{plan.entries.length} 个目标路径
                         </Text>
+                        <Text as="div" size="1" color="gray">
+                          预览有效至 {new Date(plan.expiresAt).toLocaleTimeString()}
+                        </Text>
                       </div>
                     </div>
                     <div className="plan-list">
@@ -1470,6 +1473,9 @@ export default function App() {
                         <Text as="div" size="1" color="gray">
                           仅更新已勾选项；每个目标会先备份，完成后可回滚。
                         </Text>
+                        <Text as="div" size="1" color="gray">
+                          预览有效至 {new Date(updatePlan.expiresAt).toLocaleTimeString()}
+                        </Text>
                       </div>
                       <Badge variant="soft">{updatePlan.entries.length}</Badge>
                     </div>
@@ -1718,7 +1724,14 @@ export default function App() {
                       .reverse()
                       .map((journal) => {
                         const recoverable = ["partial", "recoveryRequired"].includes(journal.status);
-                        const rollbackable = journal.status === "completed";
+                        const retainedBackupIds = new Set(backups.map((backup) => backup.id));
+                        const rollbackable =
+                          journal.status === "completed" &&
+                          journal.targets.every(
+                            (target) =>
+                              !target.existedBefore ||
+                              (target.backupId !== undefined && retainedBackupIds.has(target.backupId)),
+                          );
                         return (
                           <div className="operation-row" key={journal.id}>
                             <ClockCounterClockwise />

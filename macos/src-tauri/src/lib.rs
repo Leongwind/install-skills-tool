@@ -29,6 +29,7 @@ pub fn run() {
                 inspections: Mutex::new(HashMap::new()),
                 plans: Mutex::new(HashMap::new()),
                 update_plans: Mutex::new(HashMap::new()),
+                mutation_lock: Mutex::new(()),
             });
             Ok(())
         })
