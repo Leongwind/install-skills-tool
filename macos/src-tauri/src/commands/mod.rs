@@ -92,7 +92,7 @@ fn stale_update_results(plan: &UpdatePlan, message: &str) -> Vec<OperationResult
         .collect()
 }
 
-fn validate_install_plan_guards(pending: &PendingPlan) -> Option<String> {
+fn validate_install_plan_guards(pending: &PendingPlan, data_dir: &Path) -> Option<String> {
     if plan_expired(&pending.created_at, &pending.expires_at) {
         return Some("安装计划已过期，请重新生成预览".to_string());
     }
@@ -116,10 +116,33 @@ fn validate_install_plan_guards(pending: &PendingPlan) -> Option<String> {
             return Some(format!("{} 的目标已变化，请重新生成预览", entry.skill_name));
         }
     }
+    let persisted = match storage::load_state(data_dir) {
+        Ok(state) => state,
+        Err(error) => return Some(format!("无法读取安装状态，计划已失效: {error}")),
+    };
+    for entry in &pending.public.entries {
+        let Some(expected) = pending.installation_guards.get(&entry.entry_id) else {
+            return Some(format!(
+                "{} 缺少安装记录校验，请重新生成预览",
+                entry.skill_name
+            ));
+        };
+        let actual = persisted
+            .installations
+            .iter()
+            .find(|installation| installation.resolved_path == entry.resolved_path)
+            .map(|installation| installation.id.clone());
+        if &actual != expected {
+            return Some(format!(
+                "{} 的安装记录已变化，请重新生成预览",
+                entry.skill_name
+            ));
+        }
+    }
     None
 }
 
-fn validate_update_plan_guards(pending: &PendingUpdatePlan) -> Option<String> {
+fn validate_update_plan_guards(pending: &PendingUpdatePlan, data_dir: &Path) -> Option<String> {
     if plan_expired(&pending.created_at, &pending.expires_at) {
         return Some("更新计划已过期，请重新生成预览".to_string());
     }
@@ -143,6 +166,27 @@ fn validate_update_plan_guards(pending: &PendingUpdatePlan) -> Option<String> {
                     entry.skill_name
                 ));
             }
+        }
+    }
+    let persisted = match storage::load_state(data_dir) {
+        Ok(state) => state,
+        Err(error) => return Some(format!("无法读取安装状态，计划已失效: {error}")),
+    };
+    for entry in &pending.public.entries {
+        let Some(expected_id) = pending.installation_guards.get(&entry.entry_id) else {
+            return Some(format!(
+                "{} 缺少安装记录校验，请重新生成预览",
+                entry.skill_name
+            ));
+        };
+        let unchanged = persisted.installations.iter().any(|installation| {
+            installation.id == *expected_id && installation.resolved_path == entry.resolved_path
+        });
+        if !unchanged {
+            return Some(format!(
+                "{} 的安装记录已变化，请重新生成预览",
+                entry.skill_name
+            ));
         }
     }
     None
@@ -507,6 +551,20 @@ pub async fn plan_install(
             )
         })
         .collect();
+    let installation_guards = plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                persisted
+                    .installations
+                    .iter()
+                    .find(|installation| installation.resolved_path == entry.resolved_path)
+                    .map(|installation| installation.id.clone()),
+            )
+        })
+        .collect();
     state
         .plans
         .lock()
@@ -521,6 +579,7 @@ pub async fn plan_install(
                 expires_at,
                 source_guards,
                 target_guards,
+                installation_guards,
             },
         );
     Ok(plan)
@@ -531,7 +590,7 @@ pub fn apply_install_plan_inner(
     overwrite_entry_ids: &[String],
     data_dir: &Path,
 ) -> Result<Vec<OperationResult>, String> {
-    if let Some(message) = validate_install_plan_guards(&pending) {
+    if let Some(message) = validate_install_plan_guards(&pending, data_dir) {
         // A stale plan must not create a journal, backup, or state mutation.
         return Ok(stale_install_results(&pending.public, &message));
     }
@@ -1277,6 +1336,20 @@ pub async fn prepare_lockfile_import_inner(
             )
         })
         .collect();
+    let installation_guards = install_plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                persisted
+                    .installations
+                    .iter()
+                    .find(|installation| installation.resolved_path == entry.resolved_path)
+                    .map(|installation| installation.id.clone()),
+            )
+        })
+        .collect();
     Ok(PendingLockfilePlan {
         public: LockfileImportPlan {
             install_plan: install_plan.clone(),
@@ -1292,6 +1365,7 @@ pub async fn prepare_lockfile_import_inner(
             expires_at,
             source_guards,
             target_guards,
+            installation_guards,
         },
     })
 }
@@ -1585,6 +1659,10 @@ pub async fn prepare_update_plan_inner(
             )
         })
         .collect();
+    let installation_guards = entries
+        .iter()
+        .map(|entry| (entry.entry_id.clone(), entry.installation_id.clone()))
+        .collect();
     Ok(PendingUpdatePlan {
         public: UpdatePlan {
             plan_id: Uuid::new_v4().to_string(),
@@ -1597,6 +1675,7 @@ pub async fn prepare_update_plan_inner(
         expires_at,
         source_guards,
         target_guards,
+        installation_guards,
     })
 }
 
@@ -1620,7 +1699,7 @@ pub fn apply_update_plan_inner(
     approved_entry_ids: &[String],
     data_dir: &Path,
 ) -> Result<Vec<OperationResult>, String> {
-    if let Some(message) = validate_update_plan_guards(&pending) {
+    if let Some(message) = validate_update_plan_guards(&pending, data_dir) {
         return Ok(stale_update_results(&pending.public, &message));
     }
     let mut persisted = storage::load_state(data_dir)?;
@@ -1777,7 +1856,7 @@ pub fn apply_update_plan(
         .map_err(|_| "更新计划锁已损坏".to_string())?
         .remove(&plan_id)
         .ok_or_else(|| "更新计划不存在或已执行".to_string())?;
-    if let Some(message) = validate_update_plan_guards(&pending) {
+    if let Some(message) = validate_update_plan_guards(&pending, &state.data_dir) {
         // A stale plan must not create a journal, backup, or state mutation.
         return Ok(stale_update_results(&pending.public, &message));
     }
@@ -2671,6 +2750,48 @@ mod tests {
     }
 
     #[test]
+    fn update_plan_rejects_installation_record_changes_without_writing() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let previous = tracked_local_installation(data.path(), &source, &target);
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            std::slice::from_ref(&previous.id),
+            data.path(),
+        ))
+        .unwrap();
+        let entry_id = pending.public.entries[0].entry_id.clone();
+
+        let mut changed_state = storage::load_state(data.path()).unwrap();
+        changed_state.installations.clear();
+        storage::save_state(data.path(), &changed_state).unwrap();
+
+        let results = apply_update_plan_inner(pending, &[entry_id], data.path()).unwrap();
+
+        assert_eq!(results[0].status, "stale");
+        assert!(fs::read_to_string(target.join("SKILL.md"))
+            .unwrap()
+            .contains("Old"));
+        let state = storage::load_state(data.path()).unwrap();
+        assert!(state.installations.is_empty());
+        assert!(state.operation_journals.is_empty());
+        assert!(state.backups.is_empty());
+    }
+
+    #[test]
     fn install_plan_rejects_source_changes_without_writing() {
         let data = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -2733,6 +2854,11 @@ mod tests {
                         target_guard(Path::new(&entry.resolved_path)),
                     )
                 })
+                .collect(),
+            installation_guards: plan
+                .entries
+                .iter()
+                .map(|entry| (entry.entry_id.clone(), None))
                 .collect(),
             pinned_skill_ids: HashSet::new(),
             created_at: Utc::now().to_rfc3339(),
@@ -2820,6 +2946,11 @@ mod tests {
                         target_guard(Path::new(&entry.resolved_path)),
                     )
                 })
+                .collect(),
+            installation_guards: plan
+                .entries
+                .iter()
+                .map(|entry| (entry.entry_id.clone(), None))
                 .collect(),
             pinned_skill_ids: HashSet::new(),
             created_at: Utc::now().to_rfc3339(),

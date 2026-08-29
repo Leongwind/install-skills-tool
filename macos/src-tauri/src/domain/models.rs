@@ -175,6 +175,9 @@ pub struct PendingPlan {
     pub expires_at: String,
     pub source_guards: std::collections::HashMap<String, String>,
     pub target_guards: std::collections::HashMap<String, PlanTargetGuard>,
+    /// The installation record observed while the plan was generated.  The
+    /// value is `None` when the target was not tracked at that time.
+    pub installation_guards: std::collections::HashMap<String, Option<String>>,
 }
 
 /// The immutable filesystem state captured while an operation plan is shown.
@@ -386,6 +389,7 @@ pub struct PendingUpdatePlan {
     pub expires_at: String,
     pub source_guards: std::collections::HashMap<String, String>,
     pub target_guards: std::collections::HashMap<String, PlanTargetGuard>,
+    pub installation_guards: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

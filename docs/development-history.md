@@ -71,11 +71,14 @@ signed app bundles, and exposed the expected `0.4.0` bundle metadata:
 macOS 0.4.1 keeps ad-hoc DMG packaging for local testing. Apple Developer ID signing,
 notarization, Stapling, Homebrew and automatic updates are outside this milestone.
 
+The plan guards also capture the installation-record identity. If another operation changes
+that record after preview, apply returns `stale` before creating backups or journals.
+
 ## macOS 0.5.0 adapter and inventory refresh, 2026-08-29
 
 | Commit | Change |
 |---|---|
-| _pending_ | Added Adapter V2 metadata, recursive inventory scanning, Agent Skills optional frontmatter fields, passive shared-directory handling and local inventory refresh. |
+| `cb4b0d1` | Added Adapter V2 metadata, recursive inventory scanning, Agent Skills optional frontmatter fields, passive shared-directory handling and local inventory refresh. |
 
 The 0.5.0 package remains an ad-hoc macOS DMG for local testing. No Apple Developer ID,
 notarization, Stapling, Homebrew or automatic-update distribution was added.
