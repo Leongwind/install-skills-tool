@@ -1,4 +1,6 @@
-use crate::adapters::{adapters, passive_consumers_for, resolve_global_target};
+use crate::adapters::{
+    adapters, passive_consumers_for, resolve_global_target, CURRENT_ADAPTER_VERSION,
+};
 use crate::domain::*;
 use crate::{macos, skill, storage};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -334,6 +336,86 @@ fn finish_journal(
     }
 }
 
+fn content_hash_for_path(path: &Path) -> Option<String> {
+    if path.is_dir() {
+        storage::inspect_tree(path).ok().map(|value| value.0)
+    } else if path.is_file() {
+        storage::hash_file(path).ok()
+    } else {
+        None
+    }
+}
+
+fn journal_is_superseded(
+    journal_index: usize,
+    journal: &OperationJournal,
+    all: &[OperationJournal],
+) -> bool {
+    all.iter().skip(journal_index + 1).any(|later| {
+        later.id != journal.id
+            && later.targets.iter().any(|target| {
+                journal
+                    .targets
+                    .iter()
+                    .any(|current| current.path == target.path)
+            })
+    })
+}
+
+fn rollback_availability(
+    journal_index: usize,
+    journal: &OperationJournal,
+    persisted: &PersistedState,
+) -> String {
+    let recoverable = matches!(
+        journal.status,
+        OperationJournalStatus::RecoveryRequired | OperationJournalStatus::Partial
+    ) || journal.status == OperationJournalStatus::Completed;
+    if !recoverable {
+        return "unavailable".to_string();
+    }
+    if journal_is_superseded(journal_index, journal, &persisted.operation_journals) {
+        return "superseded".to_string();
+    }
+    for target in journal.targets.iter().filter(|target| target.completed) {
+        if let Some(expected_hash) = target.resulting_hash.as_deref() {
+            if content_hash_for_path(Path::new(&target.path)).as_deref() != Some(expected_hash) {
+                return "stale".to_string();
+            }
+        } else if !(journal.operation_type == "uninstall" && !Path::new(&target.path).exists()) {
+            // A missing resulting hash is only a valid post-operation state for
+            // uninstall, where the target is expected to be absent.  All other
+            // operations need an explicit hash before they can be rolled back.
+            return "stale".to_string();
+        }
+        if target.existed_before && journal.operation_type != "adopt" {
+            let Some(backup_id) = target.backup_id.as_deref() else {
+                return "missingBackup".to_string();
+            };
+            if !persisted
+                .backups
+                .iter()
+                .any(|backup| backup.id == backup_id && Path::new(&backup.backup_path).exists())
+            {
+                return "missingBackup".to_string();
+            }
+        }
+    }
+    "available".to_string()
+}
+
+fn operation_journal_views(persisted: &PersistedState) -> Vec<OperationJournalView> {
+    persisted
+        .operation_journals
+        .iter()
+        .enumerate()
+        .map(|(index, journal)| OperationJournalView {
+            journal: journal.clone(),
+            rollback_availability: rollback_availability(index, journal, persisted),
+        })
+        .collect()
+}
+
 fn inspected_update<'a>(
     inspection: &'a SourceInspection,
     installation: &PhysicalInstallation,
@@ -385,7 +467,7 @@ fn replace_installation_record(
         scope: InstallScope::Global,
         consumers: entry.consumers.clone(),
         passive_consumers: entry.passive_consumers.clone(),
-        adapter_version: 1,
+        adapter_version: CURRENT_ADAPTER_VERSION,
         installed_at: Utc::now().to_rfc3339(),
         provenance: InstallationProvenance::Tool,
         legacy_project: false,
@@ -399,9 +481,27 @@ fn replace_installation_record(
 pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, String> {
     let clients = macos::scan_clients();
     let persisted = storage::load_state(&state.data_dir)?;
-    Ok(crate::inventory::build_environment_scan(
-        clients, &persisted,
-    ))
+    begin_progress(
+        &state,
+        "scan-environment",
+        "扫描 IDE Skill 库存",
+        clients.len(),
+        true,
+    );
+    let progress_state = &state;
+    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let scan = crate::inventory::build_environment_scan_with_control(
+        clients,
+        &persisted,
+        Some(&state.cancel_requested),
+        Some(&on_progress),
+    );
+    let cancelled = state.cancel_requested.load(Ordering::Acquire);
+    finish_progress(&state);
+    if cancelled {
+        return Err("库存扫描已取消".to_string());
+    }
+    Ok(scan)
 }
 
 #[tauri::command]
@@ -410,7 +510,16 @@ pub async fn inspect_source(
     state: State<'_, AppState>,
 ) -> Result<SourceInspection, String> {
     begin_progress(&state, "inspect-source", "检查来源", 1, true);
-    let inspection = match skill::inspect_source(source, &state.data_dir).await {
+    let progress_state = &state;
+    let on_progress = |bytes: usize| update_progress(progress_state, bytes);
+    let inspection = match skill::inspect_source_with_control(
+        source,
+        &state.data_dir,
+        Some(&state.cancel_requested),
+        Some(&on_progress),
+    )
+    .await
+    {
         Ok(inspection) => inspection,
         Err(error) => {
             finish_progress(&state);
@@ -642,9 +751,34 @@ pub fn apply_install_plan_inner(
     overwrite_entry_ids: &[String],
     data_dir: &Path,
 ) -> Result<Vec<OperationResult>, String> {
+    apply_install_plan_inner_controlled(pending, overwrite_entry_ids, data_dir, None, None)
+}
+
+fn apply_install_plan_inner_controlled(
+    pending: PendingPlan,
+    overwrite_entry_ids: &[String],
+    data_dir: &Path,
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&dyn Fn(usize)>,
+) -> Result<Vec<OperationResult>, String> {
     if let Some(message) = validate_install_plan_guards(&pending, data_dir) {
         // A stale plan must not create a journal, backup, or state mutation.
         return Ok(stale_install_results(&pending.public, &message));
+    }
+    if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Ok(pending
+            .public
+            .entries
+            .iter()
+            .map(|entry| OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "cancelled".to_string(),
+                message: "操作已取消，未写入任何目标".to_string(),
+            })
+            .collect());
     }
     let mut persisted = storage::load_state(data_dir)?;
     let mut results = Vec::new();
@@ -687,7 +821,21 @@ pub fn apply_install_plan_inner(
         });
         storage::save_state(data_dir, &persisted)?;
     }
-    for entry in &pending.public.entries {
+    for (entry_index, entry) in pending.public.entries.iter().enumerate() {
+        if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "cancelled".to_string(),
+                message: "操作已取消，尚未处理此目标".to_string(),
+            });
+            if let Some(callback) = on_progress {
+                callback(entry_index);
+            }
+            break;
+        }
         let metadata = pending
             .public
             .skills
@@ -712,6 +860,9 @@ pub fn apply_install_plan_inner(
                 status: "notWritable".to_string(),
                 message: "目标位置不可写入".to_string(),
             });
+            if let Some(callback) = on_progress {
+                callback(entry_index + 1);
+            }
             continue;
         }
         if requires_confirmation && !overwrite_entry_ids.contains(&entry.entry_id) {
@@ -723,6 +874,9 @@ pub fn apply_install_plan_inner(
                 status: "confirmationRequired".to_string(),
                 message: "需要确认覆盖".to_string(),
             });
+            if let Some(callback) = on_progress {
+                callback(entry_index + 1);
+            }
             continue;
         }
         if entry.conflict == ConflictState::Identical {
@@ -741,6 +895,9 @@ pub fn apply_install_plan_inner(
                 status: "tracked".to_string(),
                 message: "内容已相同，已纳入管理".to_string(),
             });
+            if let Some(callback) = on_progress {
+                callback(entry_index + 1);
+            }
             continue;
         }
         let operation = (|| -> Result<(), String> {
@@ -789,11 +946,16 @@ pub fn apply_install_plan_inner(
                 message,
             },
         });
+        if let Some(callback) = on_progress {
+            callback(entry_index + 1);
+        }
     }
     if has_journal_targets {
         let failures = results
             .iter()
-            .filter(|result| !result.success && result.status == "failed")
+            .filter(|result| {
+                !result.success && ["failed", "cancelled"].contains(&result.status.as_str())
+            })
             .count();
         finish_journal(
             &mut persisted,
@@ -827,8 +989,16 @@ pub fn apply_install_plan(
         .remove(&plan_id)
         .ok_or_else(|| "安装计划不存在或已执行".to_string())?;
     let total = pending.public.entries.len();
-    begin_progress(&state, &plan_id, "写入安装目标", total, false);
-    let result = apply_install_plan_inner(pending, &overwrite_entry_ids, &state.data_dir);
+    begin_progress(&state, &plan_id, "写入安装目标", total, true);
+    let progress_state = &state;
+    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let result = apply_install_plan_inner_controlled(
+        pending,
+        &overwrite_entry_ids,
+        &state.data_dir,
+        Some(&state.cancel_requested),
+        Some(&on_progress),
+    );
     finish_progress(&state);
     result
 }
@@ -848,9 +1018,10 @@ pub fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupRecord>, Str
 #[tauri::command]
 pub fn get_app_overview(state: State<'_, AppState>) -> Result<AppOverview, String> {
     let persisted = storage::load_state(&state.data_dir)?;
+    let operation_journals = operation_journal_views(&persisted);
     Ok(AppOverview {
         backup_policy: persisted.backup_policy,
-        operation_journals: persisted.operation_journals,
+        operation_journals,
         pinned_installation_ids: persisted.pinned_installation_ids,
     })
 }
@@ -865,7 +1036,27 @@ pub fn scan_client_inventory(
         .find(|client| client.id == client_id)
         .ok_or_else(|| format!("未知 Agent: {client_id}"))?;
     let persisted = storage::load_state(&state.data_dir)?;
-    Ok(crate::inventory::scan_client_inventory(&client, &persisted))
+    begin_progress(
+        &state,
+        &format!("scan-client-{client_id}"),
+        "扫描 IDE Skill 库存",
+        0,
+        true,
+    );
+    let progress_state = &state;
+    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let inventory = crate::inventory::scan_client_inventory_with_control(
+        &client,
+        &persisted,
+        Some(&state.cancel_requested),
+        Some(&on_progress),
+    );
+    let cancelled = state.cancel_requested.load(Ordering::Acquire);
+    finish_progress(&state);
+    if cancelled {
+        return Err("库存扫描已取消".to_string());
+    }
+    Ok(inventory)
 }
 
 fn rollback_journal(
@@ -874,12 +1065,12 @@ fn rollback_journal(
     allow_completed: bool,
 ) -> Result<Vec<OperationResult>, String> {
     let mut persisted = storage::load_state(data_dir)?;
-    let journal = persisted
+    let journal_index = persisted
         .operation_journals
         .iter()
-        .find(|journal| journal.id == journal_id)
-        .cloned()
+        .position(|journal| journal.id == journal_id)
         .ok_or_else(|| "恢复记录不存在".to_string())?;
+    let journal = persisted.operation_journals[journal_index].clone();
     let recoverable = matches!(
         journal.status,
         OperationJournalStatus::RecoveryRequired | OperationJournalStatus::Partial
@@ -890,6 +1081,63 @@ fn rollback_journal(
         } else {
             "该操作当前不需要恢复".to_string()
         });
+    }
+    // Rollback is destructive.  Perform every guard before touching a target,
+    // creating a backup or changing the journal so stale requests are truly
+    // zero-write.  A later operation on the same physical path supersedes the
+    // old journal and must be handled through the newer journal instead.
+    let stale_message =
+        if journal_is_superseded(journal_index, &journal, &persisted.operation_journals) {
+            Some("该操作已被后续相关操作覆盖，请从最新操作回滚".to_string())
+        } else {
+            journal
+                .targets
+                .iter()
+                .filter(|target| target.completed)
+                .find_map(|target| {
+                    if let Some(expected) = target.resulting_hash.as_deref() {
+                        let actual = content_hash_for_path(Path::new(&target.path));
+                        if actual.as_deref() != Some(expected) {
+                            return Some(format!("目标已被修改，无法安全回滚：{}", target.path));
+                        }
+                    } else if !(journal.operation_type == "uninstall"
+                        && !Path::new(&target.path).exists())
+                    {
+                        return Some(format!(
+                            "操作结果缺少完整校验，无法安全回滚：{}",
+                            target.path
+                        ));
+                    }
+                    if target.existed_before && journal.operation_type != "adopt" {
+                        let Some(backup_id) = target.backup_id.as_deref() else {
+                            return Some(format!("恢复所需备份缺失：{}", target.path));
+                        };
+                        let present = persisted.backups.iter().any(|backup| {
+                            backup.id == backup_id && Path::new(&backup.backup_path).exists()
+                        });
+                        if !present {
+                            return Some(format!("恢复所需备份不存在：{backup_id}"));
+                        }
+                    }
+                    None
+                })
+        };
+    if let Some(message) = stale_message {
+        return Ok(journal
+            .targets
+            .iter()
+            .map(|target| OperationResult {
+                entry_id: None,
+                skill_name: target
+                    .previous_installation
+                    .as_ref()
+                    .map(|installation| installation.skill_name.clone()),
+                path: target.path.clone(),
+                success: false,
+                status: "stale".to_string(),
+                message: message.clone(),
+            })
+            .collect());
     }
     let mut results = Vec::new();
     for target in journal
@@ -1503,7 +1751,7 @@ pub fn adopt_external_skill_inner(
         scope: InstallScope::Global,
         consumers: vec![client.id.clone()],
         passive_consumers: passive_consumers_for(&path, std::slice::from_ref(&client.id), clients),
-        adapter_version: 1,
+        adapter_version: CURRENT_ADAPTER_VERSION,
         installed_at: Utc::now().to_rfc3339(),
         provenance: InstallationProvenance::Adopted,
         legacy_project: false,
@@ -1520,7 +1768,7 @@ pub fn adopt_external_skill_inner(
             existed_before: true,
             backup_id: None,
             completed: true,
-            resulting_hash: None,
+            resulting_hash: Some(installation.content_hash.clone()),
             previous_installation: None,
         }],
         message: Some("已纳入管理；回滚只移除管理记录，不删除 Skill".to_string()),
@@ -1755,8 +2003,33 @@ pub fn apply_update_plan_inner(
     approved_entry_ids: &[String],
     data_dir: &Path,
 ) -> Result<Vec<OperationResult>, String> {
+    apply_update_plan_inner_controlled(pending, approved_entry_ids, data_dir, None, None)
+}
+
+fn apply_update_plan_inner_controlled(
+    pending: PendingUpdatePlan,
+    approved_entry_ids: &[String],
+    data_dir: &Path,
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&dyn Fn(usize)>,
+) -> Result<Vec<OperationResult>, String> {
     if let Some(message) = validate_update_plan_guards(&pending, data_dir) {
         return Ok(stale_update_results(&pending.public, &message));
+    }
+    if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Ok(pending
+            .public
+            .entries
+            .iter()
+            .map(|entry| OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "cancelled".to_string(),
+                message: "操作已取消，未写入任何目标".to_string(),
+            })
+            .collect());
     }
     let mut persisted = storage::load_state(data_dir)?;
     let approved = approved_entry_ids.iter().collect::<HashSet<_>>();
@@ -1796,8 +2069,25 @@ pub fn apply_update_plan_inner(
         storage::save_state(data_dir, &persisted)?;
     }
     let mut results = Vec::new();
-    for entry in &pending.public.entries {
+    for (entry_index, entry) in pending.public.entries.iter().enumerate() {
+        if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            results.push(OperationResult {
+                entry_id: Some(entry.entry_id.clone()),
+                skill_name: Some(entry.skill_name.clone()),
+                path: entry.resolved_path.clone(),
+                success: false,
+                status: "cancelled".to_string(),
+                message: "操作已取消，尚未处理此目标".to_string(),
+            });
+            if let Some(callback) = on_progress {
+                callback(entry_index);
+            }
+            break;
+        }
         if !entry.requires_confirmation {
+            if let Some(callback) = on_progress {
+                callback(entry_index + 1);
+            }
             continue;
         }
         if !approved.contains(&entry.entry_id) {
@@ -1809,6 +2099,9 @@ pub fn apply_update_plan_inner(
                 status: "confirmationRequired".to_string(),
                 message: "需要确认后才能更新".to_string(),
             });
+            if let Some(callback) = on_progress {
+                callback(entry_index + 1);
+            }
             continue;
         }
         let Some(metadata) = pending.metadata_by_entry.get(&entry.entry_id) else {
@@ -1820,6 +2113,9 @@ pub fn apply_update_plan_inner(
                 status: "failed".to_string(),
                 message: "更新来源已失效，请重新生成计划".to_string(),
             });
+            if let Some(callback) = on_progress {
+                callback(entry_index + 1);
+            }
             continue;
         };
         let operation = (|| -> Result<(), String> {
@@ -1851,6 +2147,7 @@ pub fn apply_update_plan_inner(
             installation.source = Some(metadata.source.clone());
             installation.source_details = metadata.source_details.clone();
             installation.content_hash = metadata.content_hash.clone();
+            installation.adapter_version = CURRENT_ADAPTER_VERSION;
             storage::save_state(data_dir, &persisted)
         })();
         results.push(match operation {
@@ -1871,6 +2168,9 @@ pub fn apply_update_plan_inner(
                 message,
             },
         });
+        if let Some(callback) = on_progress {
+            callback(entry_index + 1);
+        }
     }
     if persisted
         .operation_journals
@@ -1879,7 +2179,9 @@ pub fn apply_update_plan_inner(
     {
         let failures = results
             .iter()
-            .filter(|result| !result.success && result.status == "failed")
+            .filter(|result| {
+                !result.success && ["failed", "cancelled"].contains(&result.status.as_str())
+            })
             .count();
         finish_journal(
             &mut persisted,
@@ -1917,8 +2219,16 @@ pub fn apply_update_plan(
         return Ok(stale_update_results(&pending.public, &message));
     }
     let total = pending.public.entries.len();
-    begin_progress(&state, &plan_id, "写入更新目标", total, false);
-    let result = apply_update_plan_inner(pending, &approved_entry_ids, &state.data_dir);
+    begin_progress(&state, &plan_id, "写入更新目标", total, true);
+    let progress_state = &state;
+    let on_progress = |completed: usize| update_progress(progress_state, completed);
+    let result = apply_update_plan_inner_controlled(
+        pending,
+        &approved_entry_ids,
+        &state.data_dir,
+        Some(&state.cancel_requested),
+        Some(&on_progress),
+    );
     finish_progress(&state);
     result
 }
@@ -1976,9 +2286,14 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
             update_progress(&state, index + 1);
             continue;
         };
-        match skill::inspect_source(source, &state.data_dir)
-            .await
-            .and_then(|inspection| inspected_update(&inspection, &installation).cloned())
+        match skill::inspect_source_with_control(
+            source,
+            &state.data_dir,
+            Some(&state.cancel_requested),
+            None,
+        )
+        .await
+        .and_then(|inspection| inspected_update(&inspection, &installation).cloned())
         {
             Ok(metadata) if metadata.content_hash != installation.content_hash => {
                 statuses.push(UpdateStatus {
@@ -2013,6 +2328,10 @@ pub async fn check_updates(state: State<'_, AppState>) -> Result<Vec<UpdateStatu
                 source_revision: None,
                 changes: None,
             }),
+        }
+        if state.cancel_requested.load(Ordering::Acquire) {
+            finish_progress(&state);
+            return Err("更新检查已取消".to_string());
         }
         update_progress(&state, index + 1);
     }
@@ -2106,8 +2425,24 @@ pub fn uninstall_installation_inner(
                 backup_id,
                 true,
             );
+            set_journal_resulting_hash(
+                &mut persisted,
+                &journal_id,
+                &installation.resolved_path,
+                current_hash.clone(),
+            );
             storage::save_state(data_dir, &persisted)?;
-            fs::remove_dir_all(&path).map_err(|error| error.to_string())
+            fs::remove_dir_all(&path).map_err(|error| error.to_string())?;
+            // Uninstall's resulting state is an absent target.  Persist this
+            // only after the remove succeeds so rollback can guard against a
+            // target that was recreated or modified after the operation.
+            set_journal_resulting_hash(
+                &mut persisted,
+                &journal_id,
+                &installation.resolved_path,
+                None,
+            );
+            storage::save_state(data_dir, &persisted)
         })();
         if let Err(message) = operation {
             finish_journal(
@@ -2223,6 +2558,7 @@ pub fn restore_backup_inner(backup_id: &str, data_dir: &Path) -> Result<Operatio
                 .find(|installation| installation.resolved_path == backup.original_path)
             {
                 installation.content_hash = hash;
+                installation.adapter_version = CURRENT_ADAPTER_VERSION;
             }
         }
         storage::enforce_backup_policy(&mut persisted)?;
@@ -2683,6 +3019,7 @@ mod tests {
         let target = data.path().join("target/demo");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("SKILL.md"), "new").unwrap();
+        let resulting_hash = storage::inspect_tree(&target).unwrap().0;
         let mut persisted = PersistedState::default();
         persisted.operation_journals.push(OperationJournal {
             id: "journal".to_string(),
@@ -2695,7 +3032,7 @@ mod tests {
                 existed_before: false,
                 backup_id: None,
                 completed: true,
-                resulting_hash: None,
+                resulting_hash: Some(resulting_hash),
                 previous_installation: None,
             }],
             message: None,
@@ -2797,6 +3134,10 @@ mod tests {
             updated_state.installations[0].content_hash,
             previous.content_hash
         );
+        assert_eq!(
+            updated_state.installations[0].adapter_version,
+            CURRENT_ADAPTER_VERSION
+        );
 
         let rollback = rollback_operation_inner(&journal.id, data.path()).unwrap();
 
@@ -2813,6 +3154,151 @@ mod tests {
             rolled_back.operation_journals[0].status,
             OperationJournalStatus::RolledBack
         );
+    }
+
+    #[test]
+    fn rollback_rejects_manual_target_edits_without_writing_state_or_backup() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let previous = tracked_local_installation(data.path(), &source, &target);
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            std::slice::from_ref(&previous.id),
+            data.path(),
+        ))
+        .unwrap();
+        let entry_id = pending.public.entries[0].entry_id.clone();
+        apply_update_plan_inner(pending, std::slice::from_ref(&entry_id), data.path()).unwrap();
+        fs::write(target.join("SKILL.md"), "manual edit").unwrap();
+        let before = fs::read(data.path().join("state.json")).unwrap();
+        let result = rollback_operation_inner(
+            &storage::load_state(data.path())
+                .unwrap()
+                .operation_journals
+                .last()
+                .unwrap()
+                .id,
+            data.path(),
+        )
+        .unwrap();
+        assert!(result.iter().all(|item| item.status == "stale"));
+        assert_eq!(fs::read(data.path().join("state.json")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "manual edit"
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_rebuilt_target_with_different_hash_without_writes() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let previous = tracked_local_installation(data.path(), &source, &target);
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            std::slice::from_ref(&previous.id),
+            data.path(),
+        ))
+        .unwrap();
+        let entry_id = pending.public.entries[0].entry_id.clone();
+        apply_update_plan_inner(pending, std::slice::from_ref(&entry_id), data.path()).unwrap();
+        let journal_id = storage::load_state(data.path())
+            .unwrap()
+            .operation_journals
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        fs::remove_dir_all(&target).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "rebuilt by user").unwrap();
+        let before = fs::read(data.path().join("state.json")).unwrap();
+        let result = rollback_operation_inner(&journal_id, data.path()).unwrap();
+        assert!(result.iter().all(|item| item.status == "stale"));
+        assert_eq!(fs::read(data.path().join("state.json")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "rebuilt by user"
+        );
+    }
+
+    #[test]
+    fn rollback_rejects_journal_superseded_by_a_later_operation_without_writes() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source/demo");
+        let target = workspace.path().join("installed/demo");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: demo\ndescription: New\n---\nnew\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: demo\ndescription: Old\n---\nold\n",
+        )
+        .unwrap();
+        let previous = tracked_local_installation(data.path(), &source, &target);
+        let pending = tauri::async_runtime::block_on(prepare_update_plan_inner(
+            std::slice::from_ref(&previous.id),
+            data.path(),
+        ))
+        .unwrap();
+        let entry_id = pending.public.entries[0].entry_id.clone();
+        apply_update_plan_inner(pending, std::slice::from_ref(&entry_id), data.path()).unwrap();
+        let mut state = storage::load_state(data.path()).unwrap();
+        let old_id = state.operation_journals.last().unwrap().id.clone();
+        let current_hash = storage::inspect_tree(&target).unwrap().0;
+        state.operation_journals.push(OperationJournal {
+            id: "newer-operation".to_string(),
+            operation_type: "restore".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            finished_at: Some(Utc::now().to_rfc3339()),
+            status: OperationJournalStatus::Completed,
+            targets: vec![OperationJournalTarget {
+                path: target.display().to_string(),
+                existed_before: true,
+                backup_id: state.backups.first().map(|backup| backup.id.clone()),
+                completed: true,
+                resulting_hash: Some(current_hash),
+                previous_installation: None,
+            }],
+            message: None,
+        });
+        storage::save_state(data.path(), &state).unwrap();
+        let before = fs::read(data.path().join("state.json")).unwrap();
+        let result = rollback_operation_inner(&old_id, data.path()).unwrap();
+        assert!(result.iter().all(|item| item.status == "stale"));
+        assert_eq!(fs::read(data.path().join("state.json")).unwrap(), before);
+        assert!(target.join("SKILL.md").is_file());
     }
 
     #[test]
@@ -3420,5 +3906,104 @@ mod tests {
         assert!(!cancel_operation_inner(&state).unwrap());
         assert!(!state.cancel_requested.load(Ordering::Acquire));
         finish_progress(&state);
+    }
+
+    #[test]
+    fn apply_install_reports_progress_for_each_entry() {
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let source_root = home.path().join("source");
+        for name in ["first", "second"] {
+            let skill = source_root.join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\n"),
+            )
+            .unwrap();
+        }
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: home.path().join(".kiro/skills").display().to_string(),
+            inventory_skills_paths: Vec::new(),
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let inspection = tauri::async_runtime::block_on(skill::inspect_source(
+            SkillSource::LocalDirectory {
+                path: source_root.display().to_string(),
+            },
+            data.path(),
+        ))
+        .unwrap();
+        let assignments = inspection
+            .skills
+            .iter()
+            .map(|skill| SkillAssignment {
+                skill_id: skill.skill_id.clone(),
+                client_ids: vec![client.id.clone()],
+            })
+            .collect::<Vec<_>>();
+        let plan = build_install_plan(
+            &inspection,
+            &assignments,
+            std::slice::from_ref(&client),
+            home.path(),
+            &PersistedState::default(),
+        )
+        .unwrap();
+        let pending = PendingPlan {
+            source_paths: inspection
+                .skills
+                .iter()
+                .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
+                .collect(),
+            source_guards: inspection
+                .skills
+                .iter()
+                .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
+                .collect(),
+            target_guards: plan
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.entry_id.clone(),
+                        target_guard(Path::new(&entry.resolved_path)),
+                    )
+                })
+                .collect(),
+            installation_guards: plan
+                .entries
+                .iter()
+                .map(|entry| (entry.entry_id.clone(), None))
+                .collect(),
+            pinned_skill_ids: HashSet::new(),
+            created_at: plan.created_at.clone(),
+            expires_at: plan.expires_at.clone(),
+            public: plan,
+        };
+        let progress = std::cell::RefCell::new(Vec::new());
+        let on_progress = |completed: usize| progress.borrow_mut().push(completed);
+
+        let results = apply_install_plan_inner_controlled(
+            pending,
+            &[],
+            data.path(),
+            None,
+            Some(&on_progress),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.success));
+        assert_eq!(progress.into_inner(), vec![1, 2]);
     }
 }

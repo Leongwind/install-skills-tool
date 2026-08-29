@@ -464,6 +464,7 @@ describe("Skill Installer desktop UI", () => {
           createdAt: "2026-08-27T00:00:00Z",
           finishedAt: "2026-08-27T00:01:00Z",
           status: "completed",
+          rollbackAvailability: "available",
           targets: [
             {
               path: "/Users/test/.agents/skills/demo",

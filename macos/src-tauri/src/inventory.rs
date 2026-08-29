@@ -4,8 +4,12 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+const MAX_INVENTORY_DEPTH: usize = 16;
+const MAX_INVENTORY_ENTRIES: usize = 10_000;
 
 #[derive(Deserialize)]
 struct InventoryFrontmatter {
@@ -155,11 +159,28 @@ pub fn scan_client_inventory(
     client: &DetectedClient,
     state: &PersistedState,
 ) -> ClientSkillInventory {
+    scan_client_inventory_with_control(client, state, None, None)
+}
+
+pub fn scan_client_inventory_with_control(
+    client: &DetectedClient,
+    state: &PersistedState,
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&dyn Fn(usize)>,
+) -> ClientSkillInventory {
     let mut direct_skills = Vec::new();
     let mut scan_errors = Vec::new();
-    let mut read_succeeded = false;
     let mut seen_paths = HashSet::new();
+    let mut scanned_entries = 0usize;
+    let mut capped = false;
     for root in inventory_roots(client) {
+        if capped {
+            break;
+        }
+        if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            scan_errors.push("扫描已取消".to_string());
+            break;
+        }
         if !root.exists() {
             continue;
         }
@@ -174,7 +195,6 @@ pub fn scan_client_inventory(
             scan_errors.push(format!("{}: 根目录是软链接", root.display()));
             continue;
         }
-        read_succeeded = true;
         let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
         while let Some(item) = walker.next() {
             let item = match item {
@@ -184,8 +204,38 @@ pub fn scan_client_inventory(
                     continue;
                 }
             };
+            if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                scan_errors.push("扫描已取消".to_string());
+                break;
+            }
+            scanned_entries = scanned_entries.saturating_add(1);
+            if let Some(callback) = on_progress {
+                callback(scanned_entries);
+            }
+            if scanned_entries > MAX_INVENTORY_ENTRIES {
+                scan_errors.push(format!(
+                    "{}: 库存条目超过限制 {}，其余内容未扫描",
+                    root.display(),
+                    MAX_INVENTORY_ENTRIES
+                ));
+                capped = true;
+                break;
+            }
             let path = item.path();
             if path == root {
+                continue;
+            }
+            if item.depth() > MAX_INVENTORY_DEPTH {
+                if item.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                if item.depth() == MAX_INVENTORY_DEPTH + 1 {
+                    scan_errors.push(format!(
+                        "{}: 库存嵌套深度超过限制 {}，其余内容未扫描",
+                        root.display(),
+                        MAX_INVENTORY_DEPTH
+                    ));
+                }
                 continue;
             }
             if item.file_type().is_dir() && ignored_inventory_directory(path) {
@@ -232,7 +282,7 @@ pub fn scan_client_inventory(
         root_path: client.global_skills_path.clone(),
         direct_skills,
         passive_skills: Vec::new(),
-        scan_error: (!read_succeeded && !scan_errors.is_empty()).then(|| scan_errors.join("\n")),
+        scan_error: (!scan_errors.is_empty()).then(|| scan_errors.join("\n")),
     }
 }
 
@@ -261,9 +311,26 @@ pub fn build_environment_scan(
     clients: Vec<DetectedClient>,
     state: &PersistedState,
 ) -> EnvironmentScan {
+    build_environment_scan_with_control(clients, state, None, None)
+}
+
+pub fn build_environment_scan_with_control(
+    clients: Vec<DetectedClient>,
+    state: &PersistedState,
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&dyn Fn(usize)>,
+) -> EnvironmentScan {
     let mut inventories = clients
         .iter()
-        .map(|client| scan_client_inventory(client, state))
+        .enumerate()
+        .map(|(index, client)| {
+            let inventory =
+                scan_client_inventory_with_control(client, state, cancel_requested, None);
+            if let Some(callback) = on_progress {
+                callback(index + 1);
+            }
+            inventory
+        })
         .collect::<Vec<_>>();
     let codex_skills = inventories
         .iter()
@@ -425,6 +492,91 @@ mod tests {
 
         assert_eq!(inventory.direct_skills.len(), 1);
         assert_eq!(inventory.direct_skills[0].name, "demo");
+    }
+
+    #[test]
+    fn client_inventory_reports_depth_limit_instead_of_walking_unbounded_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let mut deep = root.path().to_path_buf();
+        for index in 0..(MAX_INVENTORY_DEPTH + 3) {
+            deep = deep.join(format!("level-{index}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            deep.join("SKILL.md"),
+            "---\nname: deep\ndescription: Deep\n---\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let inventory = scan_client_inventory(&client, &PersistedState::default());
+
+        assert!(inventory.direct_skills.is_empty());
+        assert!(inventory
+            .scan_error
+            .as_deref()
+            .is_some_and(|error| error.contains("嵌套深度超过限制")));
+    }
+
+    #[test]
+    fn client_inventory_honors_cancellation_between_entries() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["first", "second"] {
+            let skill = root.path().join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\n"),
+            )
+            .unwrap();
+        }
+        let client = DetectedClient {
+            id: "kiro".to_string(),
+            name: "Kiro".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![root.path().display().to_string()],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let cancelled = AtomicBool::new(false);
+        let on_progress = |completed: usize| {
+            if completed >= 2 {
+                cancelled.store(true, Ordering::Release);
+            }
+        };
+
+        let inventory = scan_client_inventory_with_control(
+            &client,
+            &PersistedState::default(),
+            Some(&cancelled),
+            Some(&on_progress),
+        );
+
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(inventory
+            .scan_error
+            .as_deref()
+            .is_some_and(|error| error.contains("扫描已取消")));
+        assert!(inventory.direct_skills.len() < 2);
     }
 
     #[cfg(unix)]

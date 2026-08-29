@@ -15,17 +15,25 @@ export function useInventoryEvents(
   useEffect(() => {
     if (!enabled) return;
     let active = true;
+    let inFlight = false;
+    let generation = 0;
     const scan = () => {
+      if (inFlight) return;
+      inFlight = true;
+      const requestGeneration = ++generation;
       void api
         .scanEnvironment()
         .then((nextEnvironment) => {
-          if (!active) return;
+          if (!active || requestGeneration !== generation) return;
           onEnvironment(nextEnvironment);
           setLastInventoryScanAt(new Date());
         })
         .catch(() => {
           // Keep the last good inventory visible. Manual refresh surfaces a
           // detailed error when the issue persists.
+        })
+        .finally(() => {
+          inFlight = false;
         });
     };
     const timer = window.setInterval(scan, 5000);

@@ -1,10 +1,10 @@
 mod adapters;
-mod commands;
-mod domain;
+pub mod commands;
+pub mod domain;
 mod inventory;
 mod macos;
 mod skill;
-mod storage;
+pub mod storage;
 
 use commands::AppState;
 use std::collections::HashMap;

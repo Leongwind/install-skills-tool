@@ -58,6 +58,10 @@ impl StateRepository {
 }
 
 pub fn load_state(data_dir: &Path) -> Result<PersistedState, String> {
+    let _guard = STATE_IO_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "状态文件锁已损坏".to_string())?;
     load_state_unlocked(data_dir)
 }
 
@@ -731,6 +735,56 @@ mod tests {
 
         assert_eq!(second.pinned_installation_ids, ["one", "two"]);
         assert!(second.revision > first.revision);
+    }
+
+    #[test]
+    fn concurrent_reads_serialize_schema_migration_without_duplicate_writes() {
+        let data = tempfile::tempdir().unwrap();
+        let original = br#"{
+          "schemaVersion": 4,
+          "revision": 0,
+          "installations": [],
+          "backups": [],
+          "operationJournals": [],
+          "pinnedInstallationIds": []
+        }"#;
+        fs::write(data.path().join("state.json"), original).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let path = data.path().to_path_buf();
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                load_state(&path).unwrap()
+            }));
+        }
+        let states = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(states
+            .iter()
+            .all(|state| state.schema_version == CURRENT_SCHEMA_VERSION));
+        assert_eq!(
+            fs::read_dir(data.path().join("backups/state-migrations"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let repository = StateRepository::new(data.path());
+        repository
+            .mutate(|state| {
+                state
+                    .pinned_installation_ids
+                    .push("after-migration".to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            repository.load().unwrap().pinned_installation_ids,
+            ["after-migration"]
+        );
     }
 
     #[test]

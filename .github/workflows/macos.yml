@@ -80,15 +80,20 @@ jobs:
         env:
           DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
       - name: Generate SHA-256 checksum
-        run: shasum -a 256 src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg > src-tauri/target/${{ matrix.target }}/release/bundle/dmg/SHA256SUMS.txt
+        run: |
+          dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          dmg=$(find "$dmg_dir" -type f -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          (cd "$dmg_dir" && shasum -a 256 "$(basename "$dmg")" > SHA256SUMS.txt)
       - name: Verify DMG, bundle metadata, architecture and ad-hoc signature
         env:
           EXPECTED_ARCH: ${{ matrix.expected_arch }}
         run: |
           set -euo pipefail
-          dmg=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
+          dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          dmg=$(find "$dmg_dir" -type f -name '*.dmg' -print -quit)
           test -n "$dmg"
-          expected_sha=$(awk -v file="$(basename "$dmg")" '$2 == file {print $1}' "$(dirname "$dmg")/SHA256SUMS.txt")
+          expected_sha=$(awk -v file="$(basename "$dmg")" '$2 == file {print $1}' "$dmg_dir/SHA256SUMS.txt")
           actual_sha=$(shasum -a 256 "$dmg" | awk '{print $1}')
           test -n "$expected_sha"
           test "$expected_sha" = "$actual_sha"
@@ -107,7 +112,8 @@ jobs:
           executable=$(find "$app/Contents/MacOS" -type f -perm -111 -maxdepth 1 -print -quit)
           test -n "$executable"
           test "$(lipo -archs "$executable")" = "$EXPECTED_ARCH"
-          codesign --verify --deep --strict "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dvv "$app" 2>&1 | grep -q 'Signature=adhoc'
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

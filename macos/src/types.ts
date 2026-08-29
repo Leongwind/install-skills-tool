@@ -237,6 +237,7 @@ export interface OperationJournalTarget {
   backupId?: string;
   completed: boolean;
   resultingHash?: string;
+  previousInstallation?: PhysicalInstallation;
 }
 
 export interface OperationJournal {
@@ -257,8 +258,19 @@ export interface BackupPolicy {
 
 export interface AppOverview {
   backupPolicy: BackupPolicy;
-  operationJournals: OperationJournal[];
+  operationJournals: OperationJournalView[];
   pinnedInstallationIds: string[];
+}
+
+export interface OperationJournalView {
+  id: string;
+  operationType: string;
+  createdAt: string;
+  finishedAt?: string;
+  status: OperationJournalStatus;
+  targets: OperationJournalTarget[];
+  message?: string;
+  rollbackAvailability: "available" | "missingBackup" | "stale" | "superseded" | "unavailable";
 }
 
 export interface PortableBundleManifest {

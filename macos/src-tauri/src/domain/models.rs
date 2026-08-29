@@ -295,6 +295,17 @@ pub struct OperationJournal {
     pub message: Option<String>,
 }
 
+/// View model for the operation centre.  Rollback availability is derived
+/// from the current target, retained backups and later operations; it is not
+/// persisted as user-controlled state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationJournalView {
+    #[serde(flatten)]
+    pub journal: OperationJournal,
+    pub rollback_availability: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupPolicy {
@@ -479,7 +490,7 @@ pub struct PendingLockfilePlan {
 #[serde(rename_all = "camelCase")]
 pub struct AppOverview {
     pub backup_policy: BackupPolicy,
-    pub operation_journals: Vec<OperationJournal>,
+    pub operation_journals: Vec<OperationJournalView>,
     pub pinned_installation_ids: Vec<String>,
 }
 

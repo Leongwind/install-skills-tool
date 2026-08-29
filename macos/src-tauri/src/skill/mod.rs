@@ -2,12 +2,15 @@ use crate::domain::{
     RejectedSkill, SkillMetadata, SkillSource, SkillSourceDetails, SourceInspection,
 };
 use crate::storage::{cache_dir, inspect_tree, MAX_BYTES, MAX_FILES};
+use futures_util::StreamExt;
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io::{Cursor, Read, Seek};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -550,60 +553,48 @@ fn extract_local_archive(
     ))
 }
 
-async fn download_github(
+async fn download_github_with_transport<C, CFut, D, DFut>(
     raw: &str,
     data_dir: &Path,
-) -> Result<(PathBuf, SkillSourceDetails), String> {
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+    resolve_commit: C,
+    download_archive: D,
+) -> Result<(PathBuf, SkillSourceDetails), String>
+where
+    C: Fn(String) -> CFut + Send + Sync,
+    CFut: Future<Output = Result<Option<String>, String>> + Send,
+    D: Fn(String) -> DFut + Send + Sync,
+    DFut: Future<Output = Result<Vec<u8>, String>> + Send,
+{
     let location = parse_github_url(raw)?;
+    let commit_sha = resolve_commit(format!(
+        "https://api.github.com/repos/{}/{}/commits/{}",
+        location.owner, location.repository, location.reference
+    ))
+    .await
+    .unwrap_or(None);
+    // The commit endpoint is authoritative for a moving ref.  Once it gives
+    // us a SHA, the archive request must use that SHA rather than the original
+    // branch name, otherwise a ref update between the two requests is a TOCTOU
+    // window.
+    let archive_reference = commit_sha.as_deref().unwrap_or(location.reference.as_str());
     let download_url = format!(
         "https://codeload.github.com/{}/{}/zip/{}",
-        location.owner, location.repository, location.reference
+        location.owner, location.repository, archive_reference
     );
-    let client = reqwest::Client::builder()
-        .user_agent("Skill-Installer/0.5.1")
-        .build()
-        .map_err(|error| error.to_string())?;
-    let commit_sha = client
-        .get(format!(
-            "https://api.github.com/repos/{}/{}/commits/{}",
-            location.owner, location.repository, location.reference
-        ))
-        .send()
-        .await
-        .ok()
-        .filter(|response| response.status().is_success());
-    let commit_sha = match commit_sha {
-        Some(response) => response
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|json| {
-                json.get("sha")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            }),
-        None => None,
-    };
-    let response = client
-        .get(download_url)
-        .send()
-        .await
-        .map_err(|error| format!("GitHub 下载失败: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!("GitHub 返回 {}", response.status()));
+    if cancel_requested.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err("GitHub 下载已取消".to_string());
     }
-    if response
-        .content_length()
-        .is_some_and(|size| size > MAX_DOWNLOAD)
-    {
-        return Err("下载内容超过 50 MB".to_string());
+    let bytes = download_archive(download_url).await?;
+    if cancel_requested.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err("GitHub 下载已取消".to_string());
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("读取下载内容失败: {error}"))?;
     if bytes.len() as u64 > MAX_DOWNLOAD {
         return Err("下载内容超过 50 MB".to_string());
+    }
+    if let Some(callback) = on_progress {
+        callback(bytes.len());
     }
 
     let destination = cache_dir(data_dir).join(Uuid::new_v4().to_string());
@@ -630,6 +621,85 @@ async fn download_github(
     ))
 }
 
+async fn download_github(
+    raw: &str,
+    data_dir: &Path,
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+) -> Result<(PathBuf, SkillSourceDetails), String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Skill-Installer/0.5.1")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let resolve_commit = {
+        let client = client.clone();
+        move |url: String| {
+            let client = client.clone();
+            async move {
+                let response = client.get(url).send().await.ok();
+                let Some(response) = response.filter(|response| response.status().is_success())
+                else {
+                    return Ok(None);
+                };
+                let json = response.json::<serde_json::Value>().await.ok();
+                Ok(json.and_then(|json| {
+                    json.get("sha")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                }))
+            }
+        }
+    };
+    let download_archive = move |url: String| {
+        let client = client.clone();
+        let cancel_requested = cancel_requested;
+        let on_progress = on_progress;
+        async move {
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|error| format!("GitHub 下载失败: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!("GitHub 返回 {}", response.status()));
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > MAX_DOWNLOAD)
+            {
+                return Err("下载内容超过 50 MB".to_string());
+            }
+            let mut stream = response.bytes_stream();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                if cancel_requested
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    return Err("GitHub 下载已取消".to_string());
+                }
+                let chunk = chunk.map_err(|error| format!("读取下载内容失败: {error}"))?;
+                bytes.extend_from_slice(&chunk);
+                if bytes.len() as u64 > MAX_DOWNLOAD {
+                    return Err("下载内容超过 50 MB".to_string());
+                }
+                if let Some(callback) = on_progress {
+                    callback(bytes.len());
+                }
+            }
+            Ok(bytes)
+        }
+    };
+    download_github_with_transport(
+        raw,
+        data_dir,
+        cancel_requested,
+        on_progress,
+        resolve_commit,
+        download_archive,
+    )
+    .await
+}
+
 #[cfg(test)]
 async fn inspect(source: SkillSource, data_dir: &Path) -> Result<(SkillMetadata, PathBuf), String> {
     let inspection = inspect_source(source, data_dir).await?;
@@ -645,7 +715,19 @@ pub async fn inspect_source(
     source: SkillSource,
     data_dir: &Path,
 ) -> Result<SourceInspection, String> {
+    inspect_source_with_control(source, data_dir, None, None).await
+}
+
+pub async fn inspect_source_with_control(
+    source: SkillSource,
+    data_dir: &Path,
+    cancel_requested: Option<&AtomicBool>,
+    on_progress: Option<&(dyn Fn(usize) + Send + Sync)>,
+) -> Result<SourceInspection, String> {
     crate::storage::cleanup_cache(data_dir, Duration::from_secs(24 * 60 * 60))?;
+    if cancel_requested.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err("来源检查已取消".to_string());
+    }
     let (root, source_details) = match &source {
         SkillSource::LocalDirectory { path } => {
             let canonical = PathBuf::from(path)
@@ -661,8 +743,13 @@ pub async fn inspect_source(
             )
         }
         SkillSource::LocalArchive { path } => extract_local_archive(Path::new(path), data_dir)?,
-        SkillSource::Github { url } => download_github(url, data_dir).await?,
+        SkillSource::Github { url } => {
+            download_github(url, data_dir, cancel_requested, on_progress).await?
+        }
     };
+    if cancel_requested.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+        return Err("来源检查已取消".to_string());
+    }
     let github_sha_unavailable =
         matches!(&source, SkillSource::Github { .. }) && source_details.commit_sha.is_none();
     let (skills, rejected, mut warnings) = discover_skills(&root, source.clone(), source_details)?;
@@ -682,6 +769,8 @@ pub async fn inspect_source(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
 
@@ -1039,6 +1128,89 @@ mod tests {
 
         assert!(extracted.join("SKILL.md").is_file());
         assert!(!extracted.join("linked.md").exists());
+    }
+
+    #[test]
+    fn github_ref_is_pinned_to_resolved_commit_before_archive_download() {
+        let data = tempfile::tempdir().unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut bytes);
+            writer
+                .start_file(
+                    "skills-main/skills/demo/SKILL.md",
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            writer
+                .write_all(b"---\nname: demo\ndescription: Demo\n---\n")
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let archive = bytes.into_inner();
+        let observed_url = Arc::new(Mutex::new(String::new()));
+        let observed_for_download = Arc::clone(&observed_url);
+        let archive_for_download = archive.clone();
+        let (path, details) = tauri::async_runtime::block_on(download_github_with_transport(
+            "acme/skills@main",
+            data.path(),
+            None,
+            None,
+            |_url| async { Ok(Some("deadbeef0123456789".to_string())) },
+            move |url| {
+                let observed_for_download = Arc::clone(&observed_for_download);
+                let archive_for_download = archive_for_download.clone();
+                async move {
+                    *observed_for_download.lock().unwrap() = url;
+                    Ok(archive_for_download)
+                }
+            },
+        ))
+        .unwrap();
+
+        assert_eq!(details.commit_sha.as_deref(), Some("deadbeef0123456789"));
+        assert_eq!(
+            observed_url.lock().unwrap().as_str(),
+            "https://codeload.github.com/acme/skills/zip/deadbeef0123456789"
+        );
+        assert!(path.join("skills/demo/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn github_download_honors_cancellation_after_a_slow_transport() {
+        let data = tempfile::tempdir().unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut writer = ZipWriter::new(&mut bytes);
+            writer
+                .start_file("skills-main/demo/SKILL.md", SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .write_all(b"---\nname: demo\ndescription: Demo\n---\n")
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let archive = bytes.into_inner();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_for_transport = Arc::clone(&cancelled);
+        let result = tauri::async_runtime::block_on(download_github_with_transport(
+            "acme/skills@main",
+            data.path(),
+            Some(cancelled.as_ref()),
+            None,
+            |_url| async { Ok(Some("0123456789abcdef".to_string())) },
+            move |_url| {
+                cancel_for_transport.store(true, Ordering::Release);
+                let archive = archive.clone();
+                async move { Ok(archive) }
+            },
+        ));
+
+        let error = result.expect_err("cancellation should stop before extraction");
+        assert!(error.contains("已取消"));
+        assert!(fs::read_dir(data.path().join("cache"))
+            .map(|entries| entries.count() == 0)
+            .unwrap_or(true));
     }
 
     #[test]

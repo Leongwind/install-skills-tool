@@ -3,6 +3,11 @@ use semver::Version;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Version of the adapter contract persisted with installations.  Increment
+/// this when native/compatible root semantics change; old records remain
+/// readable and are upgraded when an installation is touched.
+pub const CURRENT_ADAPTER_VERSION: u32 = 2;
+
 #[derive(Debug, Clone)]
 pub struct Adapter {
     pub id: &'static str,

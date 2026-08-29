@@ -10,7 +10,8 @@ Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
   也接受 `/tree/<ref>/...`、`/blob/<ref>/.../SKILL.md`、`/commit/<sha>` 以及
   `?ref=...&path=...` 链接。所有 ref 和路径都会经过安全校验，仍只访问公开仓库。
 - 来源检查和更新检查会公开阶段、完成数量和可取消状态；正在写入目标时为保证
-  原子性不会中途停止。失败结果可重新生成对应计划，stale 结果提供重新预览入口。
+  原子性不会打断当前目标，取消请求会在下一目标前生效。失败结果可重新生成对应计划，
+  stale 结果提供重新预览入口。
 - 页面边界抽为独立 flow 组件，确认操作使用应用内对话框；库存显示原生/兼容目录、
   共享物理路径影响和最近扫描时间。
 
@@ -176,13 +177,14 @@ macos/src-tauri/target/release/bundle/dmg/
 CI 产物分别为 `skill-installer-macos-arm64-dmg` 与
 `skill-installer-macos-x64-dmg`，每个产物同时包含 `SHA256SUMS.txt`。Ad-hoc 签名
 不代表开发者身份或 Apple 公证；首次打开时仍可能需要在 Finder 中右键应用并
-选择“打开”。0.4.1 不包含 Developer ID 签名、公证、Stapling、Homebrew、自动更新、
+选择“打开”。0.5.1 不包含 Developer ID 签名、公证、Stapling、Homebrew、自动更新、
 私有 GitHub、OAuth 或 Skill 市场。
 
 ## Windows 边界
 
-未来 Windows 版本创建顶层 `windows/`，拥有独立源码、依赖、测试、CI 和安装包。
-它可以参考 macOS 版本稳定的数据模型与流程，但不会导入或依赖 `macos/` 源码。
+Windows 0.1.0 已位于顶层 `windows/`，拥有独立源码、依赖、测试、CI 和安装包。
+它可以参考 macOS 版本稳定的数据模型与流程，但不会导入或依赖 `macos/` 源码；后续
+Windows 修复和真实 Win11 验收应在 Windows 工作区完成。
 
 ## 社区与验收文档
 

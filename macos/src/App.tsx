@@ -1966,14 +1966,9 @@ export default function App() {
                       .reverse()
                       .map((journal) => {
                         const recoverable = ["partial", "recoveryRequired"].includes(journal.status);
-                        const retainedBackupIds = new Set(backups.map((backup) => backup.id));
                         const rollbackable =
                           journal.status === "completed" &&
-                          journal.targets.every(
-                            (target) =>
-                              !target.existedBefore ||
-                              (target.backupId !== undefined && retainedBackupIds.has(target.backupId)),
-                          );
+                          journal.rollbackAvailability === "available";
                         return (
                           <div className="operation-row" key={journal.id}>
                             <ClockCounterClockwise />
