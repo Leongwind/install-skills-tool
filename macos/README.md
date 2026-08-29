@@ -9,6 +9,10 @@ Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 - GitHub 来源支持 `owner/repository` 简写、`@ref`、`@commit` 和精确目录路径，
   也接受 `/tree/<ref>/...`、`/blob/<ref>/.../SKILL.md`、`/commit/<sha>` 以及
   `?ref=...&path=...` 链接。所有 ref 和路径都会经过安全校验，仍只访问公开仓库。
+- 来源检查和更新检查会公开阶段、完成数量和可取消状态；正在写入目标时为保证
+  原子性不会中途停止。失败结果可重新生成对应计划，stale 结果提供重新预览入口。
+- 页面边界抽为独立 flow 组件，确认操作使用应用内对话框；库存显示原生/兼容目录、
+  共享物理路径影响和最近扫描时间。
 
 ## 0.5.0 功能
 
