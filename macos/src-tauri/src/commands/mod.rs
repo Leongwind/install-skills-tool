@@ -1339,7 +1339,7 @@ pub fn adopt_external_skill_inner(
         .map_err(|error| format!("Skill 路径无效: {error}"))?;
     if !roots
         .iter()
-        .any(|root| path.parent() == Some(root.as_path()))
+        .any(|root| path != *root && path.starts_with(root))
     {
         return Err("只能纳管 Agent 全局目录中的直接子目录".to_string());
     }
@@ -2230,6 +2230,10 @@ mod tests {
             relative_path: name.to_string(),
             name: name.to_string(),
             description: name.to_string(),
+            license: None,
+            compatibility: None,
+            metadata: None,
+            allowed_tools: None,
             source: SkillSource::LocalDirectory {
                 path: "/tmp/source".to_string(),
             },
@@ -2427,6 +2431,10 @@ mod tests {
             relative_path: "one/demo".to_string(),
             name: "demo".to_string(),
             description: "First".to_string(),
+            license: None,
+            compatibility: None,
+            metadata: None,
+            allowed_tools: None,
             source: SkillSource::LocalDirectory {
                 path: "/tmp/source".to_string(),
             },

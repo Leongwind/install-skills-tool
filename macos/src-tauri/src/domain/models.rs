@@ -90,6 +90,14 @@ pub struct SkillMetadata {
     pub relative_path: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub compatibility: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub allowed_tools: Option<String>,
     pub source: SkillSource,
     pub source_details: SkillSourceDetails,
     pub prepared_path: String,

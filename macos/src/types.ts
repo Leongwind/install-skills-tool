@@ -68,6 +68,10 @@ export interface SkillMetadata {
   relativePath: string;
   name: string;
   description: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: unknown;
+  allowedTools?: string;
   source: SkillSource;
   sourceDetails: SkillSourceDetails;
   preparedPath: string;

@@ -204,6 +204,29 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  // Keep the inventory view useful while an IDE or another manager changes a
+  // known global directory. This is deliberately local-only; network update
+  // checks remain explicit user actions.
+  useEffect(() => {
+    if (page !== "manage") return;
+    let active = true;
+    const timer = window.setInterval(() => {
+      void api
+        .scanEnvironment()
+        .then((nextEnvironment) => {
+          if (active) setEnvironment(nextEnvironment);
+        })
+        .catch(() => {
+          // Keep the last good inventory visible; the next manual refresh will
+          // surface a detailed error if the issue persists.
+        });
+    }, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [page]);
+
   useEffect(() => {
     setPolicyDraft({
       maxBackupsPerSkill: overview.backupPolicy.maxBackupsPerSkill,
@@ -733,7 +756,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS 0.4.1</Badge>
+          <Badge variant="outline">macOS 0.5.0</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
@@ -1065,6 +1088,16 @@ export default function App() {
                                   <Badge color="amber" variant="soft">
                                     <ShieldWarning />
                                     含脚本
+                                  </Badge>
+                                )}
+                                {skill.license && (
+                                  <Badge color="gray" variant="soft">
+                                    许可证 {skill.license}
+                                  </Badge>
+                                )}
+                                {skill.compatibility && (
+                                  <Badge color="gray" variant="soft">
+                                    {skill.compatibility}
                                   </Badge>
                                 )}
                               </Flex>

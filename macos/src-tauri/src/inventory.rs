@@ -1,9 +1,11 @@
 use crate::domain::*;
 use regex::Regex;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 #[derive(Deserialize)]
 struct InventoryFrontmatter {
@@ -21,6 +23,12 @@ fn read_frontmatter(path: &Path) -> Result<InventoryFrontmatter, String> {
         .find("\n---")
         .ok_or_else(|| "SKILL.md frontmatter 未结束".to_string())?;
     serde_yaml::from_str(&body[..end]).map_err(|error| format!("YAML 无效: {error}"))
+}
+
+fn ignored_inventory_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "node_modules" | "target" | "__MACOSX"))
 }
 
 fn inventory_entry(
@@ -150,32 +158,69 @@ pub fn scan_client_inventory(
     let mut direct_skills = Vec::new();
     let mut scan_errors = Vec::new();
     let mut read_succeeded = false;
+    let mut seen_paths = HashSet::new();
     for root in inventory_roots(client) {
         if !root.exists() {
             continue;
         }
-        let entries = match fs::read_dir(&root) {
-            Ok(entries) => {
-                read_succeeded = true;
-                entries
-            }
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
             Err(error) => {
                 scan_errors.push(format!("{}: {error}", root.display()));
                 continue;
             }
         };
-        direct_skills.extend(entries.filter_map(Result::ok).filter_map(|entry| {
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).ok()?;
+        if metadata.file_type().is_symlink() {
+            scan_errors.push(format!("{}: 根目录是软链接", root.display()));
+            continue;
+        }
+        read_succeeded = true;
+        let mut walker = WalkDir::new(&root).follow_links(false).into_iter();
+        while let Some(item) = walker.next() {
+            let item = match item {
+                Ok(item) => item,
+                Err(error) => {
+                    scan_errors.push(error.to_string());
+                    continue;
+                }
+            };
+            let path = item.path();
+            if path == root {
+                continue;
+            }
+            if item.file_type().is_dir() && ignored_inventory_directory(path) {
+                walker.skip_current_dir();
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    scan_errors.push(format!("{}: {error}", path.display()));
+                    continue;
+                }
+            };
             if metadata.file_type().is_symlink() {
-                return Some(inventory_entry(client, path, state, true));
+                if seen_paths.insert(path.display().to_string()) {
+                    direct_skills.push(inventory_entry(client, path.to_path_buf(), state, true));
+                }
+                if metadata.is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
             }
             if metadata.is_dir() && path.join("SKILL.md").is_file() {
-                Some(inventory_entry(client, path, state, false))
-            } else {
-                None
+                let identity = path
+                    .canonicalize()
+                    .map(|candidate| candidate.display().to_string())
+                    .unwrap_or_else(|_| path.display().to_string());
+                if seen_paths.insert(identity) {
+                    direct_skills.push(inventory_entry(client, path.to_path_buf(), state, false));
+                }
+                // A discovered Skill is a root; don't mistake examples under
+                // references/ or assets/ for nested Skills.
+                walker.skip_current_dir();
             }
-        }));
+        }
     }
     direct_skills.sort_by(|left, right| {
         left.name
@@ -244,6 +289,13 @@ pub fn build_environment_scan(
                 .iter_mut()
                 .find(|inventory| inventory.client_id == target)
             {
+                if inventory
+                    .direct_skills
+                    .iter()
+                    .any(|item| item.resolved_path == skill.resolved_path)
+                {
+                    continue;
+                }
                 let mut passive = skill.clone();
                 passive.inventory_id = Uuid::new_v4().to_string();
                 passive.management_status = SkillManagementStatus::Passive;
@@ -339,6 +391,40 @@ mod tests {
                 .management_status,
             SkillManagementStatus::Adopted
         );
+    }
+
+    #[test]
+    fn client_inventory_discovers_nested_skills_and_deduplicates_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("catalog/engineering/demo");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo\n---\n",
+        )
+        .unwrap();
+        let client = DetectedClient {
+            id: "cursor".to_string(),
+            name: "Cursor".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: root.path().display().to_string(),
+            inventory_skills_paths: vec![
+                root.path().display().to_string(),
+                root.path().join("catalog").display().to_string(),
+            ],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let inventory = scan_client_inventory(&client, &PersistedState::default());
+
+        assert_eq!(inventory.direct_skills.len(), 1);
+        assert_eq!(inventory.direct_skills[0].name, "demo");
     }
 
     #[cfg(unix)]
@@ -461,5 +547,63 @@ mod tests {
         assert!(inventory.direct_skills.iter().any(|skill| {
             skill.resolved_path == legacy_root.join("legacy").display().to_string()
         }));
+    }
+
+    #[test]
+    fn codex_shared_skills_are_reported_as_passive_for_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let shared_root = home.path().join(".agents/skills");
+        let skill = shared_root.join("shared");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: Shared\n---\n",
+        )
+        .unwrap();
+        let codex = DetectedClient {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: shared_root.display().to_string(),
+            inventory_skills_paths: vec![shared_root.display().to_string()],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let cursor_root = home.path().join(".cursor/skills");
+        fs::create_dir_all(&cursor_root).unwrap();
+        let cursor = DetectedClient {
+            id: "cursor".to_string(),
+            name: "Cursor".to_string(),
+            edition: ClientEdition::Standard,
+            version: None,
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: cursor_root.display().to_string(),
+            inventory_skills_paths: vec![cursor_root.display().to_string()],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+
+        let scan = build_environment_scan(vec![codex, cursor], &PersistedState::default());
+        let cursor_inventory = scan
+            .inventories
+            .iter()
+            .find(|inventory| inventory.client_id == "cursor")
+            .unwrap();
+        assert!(cursor_inventory.direct_skills.is_empty());
+        assert_eq!(cursor_inventory.passive_skills.len(), 1);
+        assert_eq!(
+            cursor_inventory.passive_skills[0]
+                .passive_from_client_id
+                .as_deref(),
+            Some("codex")
+        );
     }
 }

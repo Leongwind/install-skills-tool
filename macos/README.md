@@ -1,10 +1,10 @@
 # Skill Installer for macOS
 
-Skill Installer 0.4.1 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
+Skill Installer 0.5.0 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
 Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 应用数据只保存在本机，不采集遥测，不上传 Skill 内容。
 
-## 0.4.1 功能
+## 0.5.0 功能
 
 - 安装与更新计划包含创建时间、过期时间、来源快照哈希和目标前置条件。执行前会
   重新校验；计划过期或来源/目标发生变化时返回 `stale` 结果，不创建备份、操作
@@ -33,6 +33,11 @@ Apple Developer ID 签名、公证、Stapling、Homebrew 和自动更新不在�
 - 操作中心可修改每个 Skill 的备份数量、总空间和保留天数，也可手工恢复或删除
   备份。仍被未完成操作引用的故障恢复备份禁止删除。
 - 状态升级到 schema v5，原有安装、备份和 v3/v4 操作日志安全迁移，不删除内容。
+- Adapter V2 为每个客户端记录原生 Skills 目录和递归库存能力；库存会扫描已知根目录
+  下的嵌套 Skill、跳过依赖和元数据目录，并对 Codex 共享目录生成被动发现提示。
+- 来源检查保留 Agent Skills 规范中的 `license`、`compatibility`、`metadata` 和
+  `allowed-tools` 字段；库存页每 5 秒进行一次本地刷新，便于在 IDE 外部变更后及时看到
+  新内容。
 
 ## 0.3.0 功能
 
@@ -99,7 +104,7 @@ TRAE 国际版通过 `com.trae.app`、应用内 `product.json` 和 `.trae` 数�
 
 ## 库存与纳管
 
-库存只扫描每个适配器的已知全局目录直接子项，不跟随软链接：
+库存递归扫描每个适配器的已知全局目录，不跟随软链接：
 
 - `SKILL.md` 可读但目录名或 frontmatter 不规范时仍显示警告。
 - 软链接、无法安全哈希或越出已知全局目录的内容仅供查看，不能纳管。

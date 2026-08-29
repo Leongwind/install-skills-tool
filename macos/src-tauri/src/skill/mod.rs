@@ -19,6 +19,14 @@ const MAX_DOWNLOAD: u64 = 50 * 1024 * 1024;
 struct Frontmatter {
     name: String,
     description: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    compatibility: Option<String>,
+    #[serde(default)]
+    metadata: Option<serde_yaml::Value>,
+    #[serde(rename = "allowed-tools", default)]
+    allowed_tools: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -117,6 +125,12 @@ fn validate_skill(
         relative_path,
         name: frontmatter.name,
         description: frontmatter.description,
+        license: frontmatter.license,
+        compatibility: frontmatter.compatibility,
+        metadata: frontmatter
+            .metadata
+            .and_then(|value| serde_json::to_value(value).ok()),
+        allowed_tools: frontmatter.allowed_tools,
         source,
         source_details,
         prepared_path: path.display().to_string(),
@@ -618,6 +632,39 @@ mod tests {
             SkillSourceDetails::default(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn preserves_optional_agent_skills_frontmatter_fields() {
+        let parent = tempfile::tempdir().unwrap();
+        let skill = parent.path().join("metadata-skill");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: metadata-skill\ndescription: Metadata\nlicense: MIT\ncompatibility: Requires git\nmetadata:\n  author: example\nallowed-tools: Bash(git:*)\n---\n",
+        )
+        .unwrap();
+
+        let metadata = validate_skill(
+            &skill,
+            ".".to_string(),
+            SkillSource::LocalDirectory {
+                path: skill.display().to_string(),
+            },
+            SkillSourceDetails::default(),
+        )
+        .unwrap();
+
+        assert_eq!(metadata.license.as_deref(), Some("MIT"));
+        assert_eq!(metadata.compatibility.as_deref(), Some("Requires git"));
+        assert_eq!(metadata.allowed_tools.as_deref(), Some("Bash(git:*)"));
+        assert_eq!(
+            metadata
+                .metadata
+                .as_ref()
+                .and_then(|value| value["author"].as_str()),
+            Some("example")
+        );
     }
 
     #[test]

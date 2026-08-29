@@ -66,10 +66,19 @@ signed app bundles, and exposed the expected `0.4.0` bundle metadata:
 | Commit | Change |
 |---|---|
 | `5a91737` | Added schema v5 state revision, migration backups and durable state repository. |
-| _pending_ | Added stale install/update plan guards, local preview snapshots, truthful rollback availability and regression coverage. |
+| `1f425fe` | Added stale install/update plan guards, local preview snapshots, truthful rollback availability and regression coverage. |
 
 macOS 0.4.1 keeps ad-hoc DMG packaging for local testing. Apple Developer ID signing,
 notarization, Stapling, Homebrew and automatic updates are outside this milestone.
+
+## macOS 0.5.0 adapter and inventory refresh, 2026-08-29
+
+| Commit | Change |
+|---|---|
+| _pending_ | Added Adapter V2 metadata, recursive inventory scanning, Agent Skills optional frontmatter fields, passive shared-directory handling and local inventory refresh. |
+
+The 0.5.0 package remains an ad-hoc macOS DMG for local testing. No Apple Developer ID,
+notarization, Stapling, Homebrew or automatic-update distribution was added.
 
 ## Windows 0.1.0, started 2026-08-02
 

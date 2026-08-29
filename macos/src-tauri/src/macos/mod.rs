@@ -208,6 +208,12 @@ pub fn scan_clients() -> Vec<DetectedClient> {
             if let Some(minimum) = minimum {
                 notes.push(format!("原生 Skills 最低版本 {minimum}"));
             }
+            if adapter.native_install_relative != adapter.install_relative {
+                notes.push(format!(
+                    "原生 Skills 目录 ~/{}, 当前兼容写入目录 ~/{}",
+                    adapter.native_install_relative, adapter.install_relative
+                ));
+            }
             let status = if application.is_some() && !supports_version {
                 DetectionStatus::UnsupportedVersion
             } else if application.is_some() {

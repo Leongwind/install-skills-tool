@@ -8,8 +8,14 @@ pub struct Adapter {
     pub id: &'static str,
     pub name: &'static str,
     pub edition: ClientEdition,
+    /// The adapter's documented native global root.  `install_relative` is
+    /// retained as the current write target for backwards compatibility with
+    /// existing managed installations; migrations can offer this native root
+    /// explicitly without silently moving user files.
+    pub native_install_relative: &'static str,
     pub install_relative: &'static str,
     pub inventory_relatives: &'static [&'static str],
+    pub recursive_inventory: bool,
 }
 
 pub fn adapters() -> Vec<Adapter> {
@@ -18,50 +24,68 @@ pub fn adapters() -> Vec<Adapter> {
             id: "codex",
             name: "Codex",
             edition: ClientEdition::Standard,
+            native_install_relative: ".codex/skills",
             install_relative: ".agents/skills",
             inventory_relatives: &[".agents/skills", ".codex/skills"],
+            recursive_inventory: true,
         },
         Adapter {
             id: "claude-code",
             name: "Claude Code",
             edition: ClientEdition::Standard,
+            native_install_relative: ".claude/skills",
             install_relative: ".claude/skills",
             inventory_relatives: &[".claude/skills"],
+            recursive_inventory: true,
         },
         Adapter {
             id: "kiro",
             name: "Kiro",
             edition: ClientEdition::Standard,
+            native_install_relative: ".kiro/skills",
             install_relative: ".kiro/skills",
             inventory_relatives: &[".kiro/skills"],
+            recursive_inventory: true,
         },
         Adapter {
             id: "cursor",
             name: "Cursor",
             edition: ClientEdition::Standard,
+            native_install_relative: ".cursor/skills",
             install_relative: ".cursor/skills",
+            // Shared discovery from Codex's `.agents/skills` is represented as
+            // a passive inventory item instead of being scanned as Cursor's
+            // direct inventory.  This preserves the owning consumer and
+            // avoids presenting one physical directory as two direct roots.
             inventory_relatives: &[".cursor/skills"],
+            recursive_inventory: true,
         },
         Adapter {
             id: "windsurf",
             name: "Windsurf",
             edition: ClientEdition::Standard,
+            native_install_relative: ".codeium/windsurf/skills",
             install_relative: ".codeium/windsurf/skills",
             inventory_relatives: &[".codeium/windsurf/skills"],
+            recursive_inventory: true,
         },
         Adapter {
             id: "trae-international",
             name: "TRAE International",
             edition: ClientEdition::TraeInternational,
+            native_install_relative: ".trae/skills",
             install_relative: ".trae/skills",
             inventory_relatives: &[".trae/skills"],
+            recursive_inventory: true,
         },
         Adapter {
             id: "trae-china",
             name: "TRAE China",
             edition: ClientEdition::TraeChina,
+            native_install_relative: ".trae-cn/skills",
             install_relative: ".trae-cn/skills",
             inventory_relatives: &[".trae-cn/skills"],
+            recursive_inventory: true,
         },
     ]
 }
@@ -71,8 +95,12 @@ pub fn resolve_global_target(adapter: &Adapter, home: &Path, skill_name: &str) -
 }
 
 pub fn resolve_inventory_roots(adapter: &Adapter, home: &Path) -> Vec<PathBuf> {
-    adapter
-        .inventory_relatives
+    let relatives = if adapter.recursive_inventory {
+        adapter.inventory_relatives
+    } else {
+        &adapter.inventory_relatives[..1]
+    };
+    relatives
         .iter()
         .map(|relative| home.join(relative))
         .collect()
@@ -158,6 +186,10 @@ mod tests {
         assert_eq!(
             resolve_inventory_roots(&codex, home),
             vec![home.join(".agents/skills"), home.join(".codex/skills"),]
+        );
+        assert_eq!(
+            home.join(codex.native_install_relative),
+            home.join(".codex/skills")
         );
     }
 
