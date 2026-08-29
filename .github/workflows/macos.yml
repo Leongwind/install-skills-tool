@@ -88,6 +88,10 @@ jobs:
           set -euo pipefail
           dmg=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)
           test -n "$dmg"
+          expected_sha=$(awk -v file="$(basename "$dmg")" '$2 == file {print $1}' "$(dirname "$dmg")/SHA256SUMS.txt")
+          actual_sha=$(shasum -a 256 "$dmg" | awk '{print $1}')
+          test -n "$expected_sha"
+          test "$expected_sha" = "$actual_sha"
           hdiutil verify "$dmg"
           mount_output=$(hdiutil attach "$dmg" -nobrowse -readonly)
           mount_point=$(printf '%s\n' "$mount_output" | awk '/\/Volumes\// {print substr($0, index($0, "/Volumes/")); exit}')
