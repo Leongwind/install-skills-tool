@@ -98,8 +98,8 @@ repository access or marketplace integration.
 
 | Commit | Change |
 |---|---|
-| pending | Split page boundaries and snapshot/inventory hooks; replaced browser confirmation with Radix dialog, added stale-plan retry affordance, inventory source labels and scan timestamps. |
-| pending | Added contributing, security, changelog, issue templates, smoke-test, release, privacy and dependency-license documentation. |
+| `58f48ca` | Split page boundaries and snapshot/inventory hooks; replaced browser confirmation with Radix dialog, added stale-plan retry affordance, inventory source labels and scan timestamps, plus progress/cancellation IPC. |
+| `2b25476` | Added contributing, security, changelog, issue templates, smoke-test, release, privacy and dependency-license documentation. |
 
 ## Windows 0.1.0, started 2026-08-02
 
