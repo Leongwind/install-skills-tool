@@ -131,6 +131,9 @@ fn validate_github_component(value: &str, label: &str) -> Result<(), String> {
         || value == ".."
         || value.chars().any(char::is_control)
         || value.contains('\\')
+        || value
+            .chars()
+            .any(|character| !character.is_ascii_alphanumeric() && !"._-".contains(character))
     {
         return Err(format!("GitHub {label} 无效"));
     }
@@ -142,6 +145,9 @@ fn validate_github_reference(reference: &str) -> Result<(), String> {
         || reference == "."
         || reference == ".."
         || reference.chars().any(char::is_control)
+        || reference
+            .chars()
+            .any(|character| !character.is_ascii_alphanumeric() && !"._-/".contains(character))
         || reference
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -743,7 +749,9 @@ mod tests {
     #[test]
     fn rejects_unsafe_github_shorthand_components() {
         assert!(parse_github_url("../skills").is_err());
+        assert!(parse_github_url("acme/skills#main").is_err());
         assert!(parse_github_url("acme/skills@../main").is_err());
+        assert!(parse_github_url("acme/skills@release+candidate").is_err());
         assert!(parse_github_url("acme/skills@main:../demo").is_err());
     }
 

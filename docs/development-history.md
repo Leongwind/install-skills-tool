@@ -85,6 +85,7 @@ notarization, Stapling, Homebrew or automatic-update distribution was added.
 | Commit | Change |
 |---|---|
 | `ea3bb28` | Added public GitHub shorthand, explicit ref/commit and exact Skill path parsing with validation and documentation. |
+| _pending_ | Tightened shorthand owner, repository and ref character validation before download. |
 
 The 0.5.1 source resolver remains public-repository only and does not add OAuth, private
 repository access or marketplace integration.
