@@ -3,6 +3,9 @@ import type {
   BackupRecord,
   AppOverview,
   ClientSkillInventory,
+  CatalogEntry,
+  CatalogSource,
+  CatalogSyncResult,
   EnvironmentScan,
   InstallPlan,
   LockfileImportPlan,
@@ -16,6 +19,7 @@ import type {
   SourceInspection,
   UpdateStatus,
   UpdatePlan,
+  SkillCollection,
 } from "./types";
 
 export const api = {
@@ -86,4 +90,32 @@ export const api = {
     invoke<void>("delete_backup", { backupId }),
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
   revealInFinder: (path: string) => invoke<void>("reveal_in_finder", { path }),
+  listCatalogSources: () => invoke<CatalogSource[]>("list_catalog_sources"),
+  saveCatalogSource: (source: CatalogSource) =>
+    invoke<CatalogSource[]>("save_catalog_source", { source }),
+  removeCatalogSource: (sourceId: string) =>
+    invoke<CatalogSource[]>("remove_catalog_source", { sourceId }),
+  syncCatalog: (sourceId: string) =>
+    invoke<CatalogSyncResult>("sync_catalog", { sourceId }),
+  searchCatalog: (request: {
+    query?: string;
+    sourceId?: string;
+    scriptsOnly?: boolean;
+    category?: string;
+    updatedSince?: string;
+  }) => invoke<CatalogEntry[]>("search_catalog", { request }),
+  setCatalogFavorite: (entryId: string, favorite: boolean) =>
+    invoke<string[]>("set_catalog_favorite", { entryId, favorite }),
+  listCollections: () => invoke<SkillCollection[]>("list_collections"),
+  saveCollection: (collection: SkillCollection) =>
+    invoke<SkillCollection[]>("save_collection", { collection }),
+  deleteCollection: (collectionId: string) =>
+    invoke<SkillCollection[]>("delete_collection", { collectionId }),
+  planCollectionInstall: (
+    request: {
+      collectionId: string;
+      inspectionId?: string;
+      assignments?: SkillAssignment[];
+    },
+  ) => invoke<InstallPlan>("plan_collection_install", { request }),
 };

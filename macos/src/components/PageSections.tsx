@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+export { DiscoverPage } from "./DiscoverPage";
+
 /**
  * Stable page seams used by App's shell.  Keeping the page roots as named
  * components lets the shell own navigation while each flow can be extracted

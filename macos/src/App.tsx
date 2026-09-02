@@ -37,6 +37,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "./api";
 import {
   DiagnosticsPage,
+  DiscoverPage,
   InstallFlow,
   InventoryPage,
   OperationsPage,
@@ -45,6 +46,7 @@ import { useAppSnapshot } from "./hooks/useAppSnapshot";
 import { useInventoryEvents } from "./hooks/useInventoryEvents";
 import type {
   BackupRecord,
+  CatalogEntry,
   AppOverview,
   ClientSkillInventory,
   DetectedClient,
@@ -63,7 +65,7 @@ import type {
 } from "./types";
 import { conflictLabel, detectionLabel, formatBytes, shortPath } from "./ui";
 
-type Page = "dashboard" | "install" | "manage" | "operations" | "diagnostics";
+type Page = "dashboard" | "discover" | "install" | "manage" | "operations" | "diagnostics";
 type SourceMode = "localDirectory" | "localArchive" | "github";
 type InventoryFilter = "all" | "managed" | "external" | "issues";
 type ConfirmationRequest = {
@@ -379,6 +381,20 @@ export default function App() {
     if (typeof selectedPath !== "string") return;
     setSourceValue(selectedPath);
     resetInspection();
+  }
+
+  function openCatalogEntry(entry: CatalogEntry) {
+    const url = entry.skillUrl ?? (entry.owner && entry.repository
+      ? `https://github.com/${entry.owner}/${entry.repository}/tree/${entry.commitSha ?? entry.reference ?? "HEAD"}/${entry.path ?? ""}`
+      : "");
+    if (!url) {
+      setError("该目录条目没有可用的公开来源 URL");
+      return;
+    }
+    setSourceMode("github");
+    setSourceValue(url);
+    resetInspection();
+    setPage("install");
   }
 
   async function inspect() {
@@ -909,7 +925,7 @@ export default function App() {
           <div className="traffic-space" />
           <Package size={17} weight="fill" />
           <strong>Skill Installer</strong>
-          <Badge variant="outline">macOS 0.5.1</Badge>
+          <Badge variant="outline">macOS 0.6.0</Badge>
           <span className="titlebar-spacer" />
           <Button size="1" variant="ghost" onClick={() => void refresh()}>
             {busy === "scan" ? <Spinner size="1" /> : <ArrowClockwise />}
@@ -933,6 +949,13 @@ export default function App() {
               >
                 <CloudArrowDown />
                 批量安装
+              </button>
+              <button
+                className={page === "discover" ? "nav-item active" : "nav-item"}
+                onClick={() => setPage("discover")}
+              >
+                <GithubLogo />
+                发现 Skills
               </button>
               <button
                 className={page === "manage" ? "nav-item active" : "nav-item"}
@@ -1568,6 +1591,10 @@ export default function App() {
                   </section>
                 )}
               </InstallFlow>
+            )}
+
+            {page === "discover" && (
+              <DiscoverPage clients={clients} onOpenInstall={openCatalogEntry} />
             )}
 
             {page === "manage" && (

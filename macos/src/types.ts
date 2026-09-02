@@ -182,6 +182,56 @@ export interface EnvironmentScan {
   inventories: ClientSkillInventory[];
 }
 
+export interface CatalogSource {
+  id: string;
+  name: string;
+  url: string;
+  provider: string;
+  enabled: boolean;
+  etag?: string;
+  lastModified?: string;
+  lastSyncedAt?: string;
+}
+
+export type CatalogInstallState = "notInstalled" | "partial" | "installed" | "updateAvailable";
+
+export interface CatalogEntry {
+  id: string;
+  sourceId: string;
+  name: string;
+  description: string;
+  owner?: string;
+  repository?: string;
+  reference?: string;
+  path?: string;
+  commitSha?: string;
+  license?: string;
+  stars?: number;
+  updatedAt?: string;
+  skillUrl?: string;
+  hasScripts: boolean;
+  installedState: CatalogInstallState;
+  warnings: string[];
+}
+
+export interface CatalogSyncResult {
+  sourceId: string;
+  entries: CatalogEntry[];
+  fetchedAt: string;
+  fromCache: boolean;
+  warning?: string;
+}
+
+export interface SkillCollection {
+  id: string;
+  name: string;
+  description?: string;
+  skillRefs: string[];
+  defaultClientIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface BackupRecord {
   id: string;
   originalPath: string;
