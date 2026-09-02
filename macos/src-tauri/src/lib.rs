@@ -51,6 +51,7 @@ pub fn run() {
             commands::sync_catalog,
             commands::search_catalog,
             commands::set_catalog_favorite,
+            commands::list_catalog_favorites,
             commands::list_collections,
             commands::save_collection,
             commands::delete_collection,

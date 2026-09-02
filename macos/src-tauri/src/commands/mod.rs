@@ -573,8 +573,8 @@ pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, S
     Ok(scan)
 }
 
-/// Return configured catalog providers.  The built-in skills.sh provider is
-/// added lazily, so upgrading an existing installation never performs a
+/// Return configured catalog providers.  The built-in public GitHub provider
+/// is added lazily, so upgrading an existing installation never performs a
 /// network request or changes the user's state until this page is opened.
 #[tauri::command]
 pub fn list_catalog_sources(state: State<'_, AppState>) -> Result<Vec<CatalogSource>, String> {
@@ -587,15 +587,39 @@ pub fn list_catalog_sources(state: State<'_, AppState>) -> Result<Vec<CatalogSou
 
 #[tauri::command]
 pub fn save_catalog_source(
-    source: CatalogSource,
+    mut source: CatalogSource,
     state: State<'_, AppState>,
 ) -> Result<Vec<CatalogSource>, String> {
     if source.id.trim().is_empty() || source.name.trim().is_empty() || source.url.trim().is_empty()
     {
         return Err("目录来源需要 id、名称和 URL".to_string());
     }
-    if !source.url.starts_with("https://") {
-        return Err("目录来源必须使用 HTTPS".to_string());
+    let parsed = url::Url::parse(source.url.trim()).map_err(|_| "目录来源 URL 无效".to_string())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("目录来源必须是无凭据、无片段的 HTTPS URL".to_string());
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if !matches!(
+        host,
+        "github.com" | "api.github.com" | "raw.githubusercontent.com"
+    ) {
+        return Err("目录来源目前只支持公开 GitHub HTTPS 地址".to_string());
+    }
+    source.url = parsed.to_string();
+    if source.provider.trim().is_empty() {
+        source.provider = if host == "api.github.com" && parsed.path().contains("/contents") {
+            "github-contents".to_string()
+        } else {
+            "github-json".to_string()
+        };
+    }
+    if !matches!(source.provider.as_str(), "github-json" | "github-contents") {
+        return Err("目录来源 provider 不受支持".to_string());
     }
     let repository = storage::StateRepository::new(&state.data_dir);
     repository.mutate(|persisted| {
@@ -618,8 +642,8 @@ pub fn remove_catalog_source(
     source_id: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<CatalogSource>, String> {
-    if source_id == "skills-sh" {
-        return Err("内置 skills.sh 来源不能删除，可在设置中停用".to_string());
+    if source_id == "anthropics-skills" {
+        return Err("内置 GitHub 来源不能删除，可在设置中停用".to_string());
     }
     let repository = storage::StateRepository::new(&state.data_dir);
     let sources = repository.mutate(|persisted| {
@@ -653,7 +677,9 @@ pub async fn sync_catalog(
     let fallback = catalog::load_snapshot(&state.data_dir, &source.id)
         .ok()
         .flatten();
-    match catalog::sync_source(&state.data_dir, &source).await {
+    match catalog::sync_source_with_control(&state.data_dir, &source, Some(&state.cancel_requested))
+        .await
+    {
         Ok((snapshot, from_cache)) => {
             let mut updated = source.clone();
             updated.etag = snapshot.etag.clone();
@@ -755,6 +781,14 @@ pub fn set_catalog_favorite(
     })
 }
 
+/// Favorites are stored by stable catalog id rather than by the display name.
+/// This read seam keeps the selection available after an application restart.
+#[tauri::command]
+pub fn list_catalog_favorites(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| Ok(persisted.catalog_favorites.clone()))
+}
+
 #[tauri::command]
 pub fn list_collections(state: State<'_, AppState>) -> Result<Vec<SkillCollection>, String> {
     let repository = storage::StateRepository::new(&state.data_dir);
@@ -768,6 +802,9 @@ pub fn save_collection(
 ) -> Result<Vec<SkillCollection>, String> {
     let repository = storage::StateRepository::new(&state.data_dir);
     repository.mutate(|persisted| {
+        for reference in &collection.source_refs {
+            catalog::validate_collection_ref(reference)?;
+        }
         let existing = persisted
             .skill_collections
             .iter()
@@ -780,6 +817,8 @@ pub fn save_collection(
             collection.default_client_ids.clone(),
             existing,
         )?;
+        let mut normalized = normalized;
+        normalized.source_refs = collection.source_refs.clone();
         if let Some(item) = persisted
             .skill_collections
             .iter_mut()
@@ -807,6 +846,75 @@ pub fn delete_collection(
     })
 }
 
+fn compose_collection_inspection(
+    collection: &SkillCollection,
+    inspected_sources: &[SourceInspection],
+) -> Result<SourceInspection, String> {
+    let mut skills = Vec::new();
+    let mut rejected = Vec::new();
+    let mut warnings = Vec::new();
+    let mut source = None;
+    for reference in &collection.source_refs {
+        catalog::validate_collection_ref(reference)?;
+        let inspected = inspected_sources
+            .iter()
+            .find(|inspection| inspection.source == reference.source)
+            .ok_or_else(|| format!("集合成员 {} 来源检查不存在", reference.catalog_entry_id))?;
+        if source.is_none() {
+            source = Some(inspected.source.clone());
+        }
+        rejected.extend(inspected.rejected.clone());
+        warnings.extend(inspected.warnings.clone());
+        let candidate = inspected.skills.iter().find(|skill| {
+            let name_matches = reference
+                .skill_name
+                .as_deref()
+                .is_none_or(|name| name == skill.name);
+            let expected_path = reference
+                .path
+                .as_deref()
+                .or(reference.source_details.subpath.as_deref());
+            let path_matches = expected_path.is_none_or(|path| {
+                skill.relative_path == path
+                    || skill
+                        .source_details
+                        .subpath
+                        .as_deref()
+                        .is_some_and(|actual| actual == path)
+            });
+            name_matches && path_matches
+        });
+        let Some(candidate) = candidate else {
+            return Err(format!(
+                "集合成员 {} 在固定来源中不存在或不唯一",
+                reference.catalog_entry_id
+            ));
+        };
+        if let (Some(expected), Some(actual)) = (
+            reference
+                .commit_sha
+                .as_deref()
+                .or(reference.source_details.commit_sha.as_deref()),
+            candidate.source_details.commit_sha.as_deref(),
+        ) {
+            if expected != actual {
+                return Err(format!(
+                    "集合成员 {} 的 commit SHA 与检查结果不一致",
+                    reference.catalog_entry_id
+                ));
+            }
+        }
+        skills.push(candidate.clone());
+    }
+    Ok(SourceInspection {
+        inspection_id: Uuid::new_v4().to_string(),
+        source: source.ok_or_else(|| "集合没有可安装的 Skill".to_string())?,
+        skills,
+        rejected,
+        warnings,
+    })
+}
+
 #[tauri::command]
 pub async fn plan_collection_install(
     request: CollectionInstallRequest,
@@ -818,21 +926,96 @@ pub async fn plan_collection_install(
         .into_iter()
         .find(|item| item.id == request.collection_id)
         .ok_or_else(|| "Skill 集合不存在".to_string())?;
-    let inspection_id = request
-        .inspection_id
-        .ok_or_else(|| "集合安装需要先检查来源并提供 inspectionId".to_string())?;
-    let assignments = if request.assignments.is_empty() {
-        catalog::collection_assignments(&collection)
+    // A collection stores a stable source descriptor for every catalog member.
+    // Re-inspect every descriptor here and compose one inspection snapshot so
+    // the normal inspect -> plan -> apply pipeline remains the only installer.
+    let (inspection, assignments) = if !collection.source_refs.is_empty() {
+        let mut inspected_sources = Vec::new();
+        for reference in &collection.source_refs {
+            catalog::validate_collection_ref(reference)?;
+            let inspected = skill::inspect_source_with_control(
+                reference.source.clone(),
+                &state.data_dir,
+                Some(&state.cancel_requested),
+                None,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "集合成员 {} 来源检查失败：{error}",
+                    reference.catalog_entry_id
+                )
+            })?;
+            inspected_sources.push(inspected);
+        }
+        let inspection = compose_collection_inspection(&collection, &inspected_sources)?;
+        state
+            .inspections
+            .lock()
+            .map_err(|_| "来源检查锁已损坏".to_string())?
+            .insert(inspection.inspection_id.clone(), inspection.clone());
+        let by_catalog_id: HashMap<_, _> = collection
+            .source_refs
+            .iter()
+            .zip(inspection.skills.iter())
+            .map(|(reference, skill)| (reference.catalog_entry_id.as_str(), skill.skill_id.clone()))
+            .collect();
+        let assignments = if request.assignments.is_empty() {
+            inspection
+                .skills
+                .iter()
+                .map(|skill| SkillAssignment {
+                    skill_id: skill.skill_id.clone(),
+                    client_ids: collection.default_client_ids.clone(),
+                })
+                .collect()
+        } else {
+            let mut assignments: Vec<SkillAssignment> = request
+                .assignments
+                .into_iter()
+                .map(|mut assignment| {
+                    if let Some(skill_id) = by_catalog_id.get(assignment.skill_id.as_str()) {
+                        assignment.skill_id = skill_id.clone();
+                    }
+                    assignment
+                })
+                .collect();
+            // A collection operation may customise the matrix, but it can
+            // never silently drop a member.  Missing rows receive the
+            // collection defaults and therefore remain in the preview.
+            let assigned_ids = assignments
+                .iter()
+                .map(|assignment: &SkillAssignment| assignment.skill_id.clone())
+                .collect::<HashSet<_>>();
+            for skill in &inspection.skills {
+                if !assigned_ids.contains(&skill.skill_id) {
+                    assignments.push(SkillAssignment {
+                        skill_id: skill.skill_id.clone(),
+                        client_ids: collection.default_client_ids.clone(),
+                    });
+                }
+            }
+            assignments
+        };
+        (inspection, assignments)
     } else {
-        request.assignments
+        let inspection_id = request
+            .inspection_id
+            .ok_or_else(|| "集合安装需要先检查来源并提供 inspectionId".to_string())?;
+        let inspection = state
+            .inspections
+            .lock()
+            .map_err(|_| "来源检查锁已损坏".to_string())?
+            .get(&inspection_id)
+            .cloned()
+            .ok_or_else(|| "来源检查不存在或已过期".to_string())?;
+        let assignments = if request.assignments.is_empty() {
+            catalog::collection_assignments(&collection)
+        } else {
+            request.assignments
+        };
+        (inspection, assignments)
     };
-    let inspection = state
-        .inspections
-        .lock()
-        .map_err(|_| "来源检查锁已损坏".to_string())?
-        .get(&inspection_id)
-        .cloned()
-        .ok_or_else(|| "来源检查不存在或已过期".to_string())?;
     let clients = macos::scan_clients();
     let persisted = repository.load()?;
     let plan = build_install_plan(
@@ -842,63 +1025,7 @@ pub async fn plan_collection_install(
         &home_dir()?,
         &persisted,
     )?;
-    let selected_ids: HashSet<_> = plan
-        .skills
-        .iter()
-        .map(|skill| skill.skill_id.as_str())
-        .collect();
-    let source_paths = inspection
-        .skills
-        .iter()
-        .filter(|skill| selected_ids.contains(skill.skill_id.as_str()))
-        .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
-        .collect();
-    let source_guards = plan
-        .skills
-        .iter()
-        .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
-        .collect();
-    let target_guards = plan
-        .entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.entry_id.clone(),
-                target_guard(Path::new(&entry.resolved_path)),
-            )
-        })
-        .collect();
-    let installation_guards = plan
-        .entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.entry_id.clone(),
-                persisted
-                    .installations
-                    .iter()
-                    .find(|item| item.resolved_path == entry.resolved_path)
-                    .map(|item| item.id.clone()),
-            )
-        })
-        .collect();
-    state
-        .plans
-        .lock()
-        .map_err(|_| "安装计划锁已损坏".to_string())?
-        .insert(
-            plan.plan_id.clone(),
-            PendingPlan {
-                created_at: plan.created_at.clone(),
-                expires_at: plan.expires_at.clone(),
-                public: plan.clone(),
-                source_paths,
-                pinned_skill_ids: HashSet::new(),
-                source_guards,
-                target_guards,
-                installation_guards,
-            },
-        );
+    register_pending_install_plan(&state, &plan, &inspection, &persisted)?;
     Ok(plan)
 }
 
@@ -1080,28 +1207,12 @@ pub fn build_install_plan(
     })
 }
 
-#[tauri::command]
-pub async fn plan_install(
-    inspection_id: String,
-    assignments: Vec<SkillAssignment>,
-    state: State<'_, AppState>,
-) -> Result<InstallPlan, String> {
-    let inspection = state
-        .inspections
-        .lock()
-        .map_err(|_| "来源检查锁已损坏".to_string())?
-        .get(&inspection_id)
-        .cloned()
-        .ok_or_else(|| "来源检查不存在或已过期".to_string())?;
-    let clients = macos::scan_clients();
-    let persisted = storage::load_state(&state.data_dir)?;
-    let plan = build_install_plan(
-        &inspection,
-        &assignments,
-        &clients,
-        &home_dir()?,
-        &persisted,
-    )?;
+fn register_pending_install_plan(
+    state: &AppState,
+    plan: &InstallPlan,
+    inspection: &SourceInspection,
+    persisted: &PersistedState,
+) -> Result<(), String> {
     let selected_ids: HashSet<_> = plan
         .skills
         .iter()
@@ -1113,8 +1224,6 @@ pub async fn plan_install(
         .filter(|skill| selected_ids.contains(skill.skill_id.as_str()))
         .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
         .collect();
-    let created_at = plan.created_at.clone();
-    let expires_at = plan.expires_at.clone();
     let source_guards = plan
         .skills
         .iter()
@@ -1154,13 +1263,39 @@ pub async fn plan_install(
                 public: plan.clone(),
                 source_paths,
                 pinned_skill_ids: HashSet::new(),
-                created_at,
-                expires_at,
+                created_at: plan.created_at.clone(),
+                expires_at: plan.expires_at.clone(),
                 source_guards,
                 target_guards,
                 installation_guards,
             },
         );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn plan_install(
+    inspection_id: String,
+    assignments: Vec<SkillAssignment>,
+    state: State<'_, AppState>,
+) -> Result<InstallPlan, String> {
+    let inspection = state
+        .inspections
+        .lock()
+        .map_err(|_| "来源检查锁已损坏".to_string())?
+        .get(&inspection_id)
+        .cloned()
+        .ok_or_else(|| "来源检查不存在或已过期".to_string())?;
+    let clients = macos::scan_clients();
+    let persisted = storage::load_state(&state.data_dir)?;
+    let plan = build_install_plan(
+        &inspection,
+        &assignments,
+        &clients,
+        &home_dir()?,
+        &persisted,
+    )?;
+    register_pending_install_plan(&state, &plan, &inspection, &persisted)?;
     Ok(plan)
 }
 
@@ -3198,6 +3333,102 @@ mod tests {
     #[test]
     fn normalized_paths_remove_parent_segments() {
         assert_eq!(normalized(Path::new("/tmp/project/../demo")), "/tmp/demo");
+    }
+
+    #[test]
+    fn collection_composes_members_from_multiple_github_sources() {
+        let source_a = SkillSource::Github {
+            url: "https://github.com/acme/first/tree/main/alpha".into(),
+        };
+        let source_b = SkillSource::Github {
+            url: "https://github.com/other/second/tree/v2/beta".into(),
+        };
+        let skill = |id: &str, name: &str, source: SkillSource, subpath: &str| SkillMetadata {
+            skill_id: id.into(),
+            relative_path: String::new(),
+            name: name.into(),
+            description: name.into(),
+            license: None,
+            compatibility: None,
+            metadata: None,
+            allowed_tools: None,
+            source,
+            source_details: SkillSourceDetails {
+                owner: Some(if name == "alpha" { "acme" } else { "other" }.into()),
+                repository: Some(if name == "alpha" { "first" } else { "second" }.into()),
+                reference: Some(if name == "alpha" { "main" } else { "v2" }.into()),
+                subpath: Some(subpath.into()),
+                ..Default::default()
+            },
+            prepared_path: format!("/tmp/{name}"),
+            content_hash: format!("{name}-hash"),
+            file_count: 1,
+            total_bytes: 10,
+            has_scripts: false,
+            warnings: Vec::new(),
+        };
+        let collection = SkillCollection {
+            id: "collection".into(),
+            name: "cross-source".into(),
+            description: None,
+            skill_refs: vec!["catalog-a".into(), "catalog-b".into()],
+            default_client_ids: vec!["codex".into()],
+            source_refs: vec![
+                CollectionSkillRef {
+                    catalog_entry_id: "catalog-a".into(),
+                    source: source_a.clone(),
+                    source_details: SkillSourceDetails {
+                        owner: Some("acme".into()),
+                        repository: Some("first".into()),
+                        reference: Some("main".into()),
+                        subpath: Some("alpha".into()),
+                        ..Default::default()
+                    },
+                    skill_name: Some("alpha".into()),
+                    path: Some("alpha".into()),
+                    commit_sha: None,
+                },
+                CollectionSkillRef {
+                    catalog_entry_id: "catalog-b".into(),
+                    source: source_b.clone(),
+                    source_details: SkillSourceDetails {
+                        owner: Some("other".into()),
+                        repository: Some("second".into()),
+                        reference: Some("v2".into()),
+                        subpath: Some("beta".into()),
+                        ..Default::default()
+                    },
+                    skill_name: Some("beta".into()),
+                    path: Some("beta".into()),
+                    commit_sha: None,
+                },
+            ],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let first = SourceInspection {
+            inspection_id: "a".into(),
+            source: source_a.clone(),
+            skills: vec![skill("a", "alpha", source_a, "alpha")],
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let second = SourceInspection {
+            inspection_id: "b".into(),
+            source: source_b.clone(),
+            skills: vec![skill("b", "beta", source_b, "beta")],
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let combined = compose_collection_inspection(&collection, &[first, second]).unwrap();
+        assert_eq!(
+            combined
+                .skills
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
     }
 
     #[test]

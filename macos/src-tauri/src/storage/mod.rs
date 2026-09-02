@@ -705,6 +705,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_v5_to_v6_migration_initializes_catalog_state() {
+        let data = tempfile::tempdir().unwrap();
+        let original = br#"{
+          "schemaVersion": 5,
+          "revision": 2,
+          "installations": [],
+          "backups": [],
+          "catalogSources": [{"id":"custom","name":"Custom","url":"https://github.com/acme/skills","provider":"github-json","enabled":true}],
+          "catalogFavorites": ["custom:acme/skills:demo"],
+          "skillCollections": []
+        }"#;
+        fs::write(data.path().join("state.json"), original).unwrap();
+
+        let state = load_state(data.path()).unwrap();
+
+        assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(state.catalog_sources[0].id, "custom");
+        assert_eq!(state.catalog_favorites, vec!["custom:acme/skills:demo"]);
+        assert!(data.path().join("backups/state-migrations").exists());
+    }
+
+    #[test]
     fn future_schema_is_rejected_without_rewriting_state() {
         let data = tempfile::tempdir().unwrap();
         let original = br#"{

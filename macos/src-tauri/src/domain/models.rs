@@ -373,8 +373,8 @@ impl Default for PersistedState {
     }
 }
 
-/// A public catalog provider.  The built-in skills.sh provider and user-added
-/// GitHub catalog URLs use the same representation so the UI can present one
+/// A public catalog provider.  The built-in GitHub provider and user-added
+/// public catalog URLs use the same representation so the UI can present one
 /// source list and the cache can apply one refresh policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -431,6 +431,24 @@ pub struct CatalogEntry {
     pub warnings: Vec<String>,
 }
 
+/// Stable provenance captured when a catalog item is added to a collection.
+/// Keeping the source descriptor alongside the catalog id lets a collection
+/// span repositories and remain installable when catalog ordering changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionSkillRef {
+    pub catalog_entry_id: String,
+    pub source: SkillSource,
+    #[serde(default)]
+    pub source_details: SkillSourceDetails,
+    #[serde(default)]
+    pub skill_name: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum CatalogInstallState {
@@ -477,6 +495,8 @@ pub struct SkillCollection {
     pub skill_refs: Vec<String>,
     #[serde(default)]
     pub default_client_ids: Vec<String>,
+    #[serde(default)]
+    pub source_refs: Vec<CollectionSkillRef>,
     pub created_at: String,
     pub updated_at: String,
 }
