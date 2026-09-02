@@ -421,6 +421,10 @@ mod tests {
             operation_journals: Vec::new(),
             backup_policy: BackupPolicy::default(),
             pinned_installation_ids: Vec::new(),
+            catalog_sources: Vec::new(),
+            catalog_favorites: Vec::new(),
+            skill_collections: Vec::new(),
+            catalog_cache: Vec::new(),
         };
         let client = DetectedClient {
             id: "kiro".to_string(),

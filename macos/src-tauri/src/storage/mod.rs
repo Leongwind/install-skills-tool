@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 pub const MAX_FILES: usize = 5_000;
 pub const MAX_BYTES: u64 = 200 * 1024 * 1024;
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 static STATE_IO_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -94,10 +94,18 @@ fn load_state_unlocked(data_dir: &Path) -> Result<PersistedState, String> {
         state.schema_version = 4;
     }
     if state.schema_version == 4 {
-        state.schema_version = CURRENT_SCHEMA_VERSION;
+        state.schema_version = 5;
         if state.revision == 0 {
             state.revision = 1;
         }
+    }
+    if state.schema_version == 5 {
+        state.schema_version = CURRENT_SCHEMA_VERSION;
+        // Catalog configuration was introduced in v6.  The serde defaults
+        // above intentionally keep existing installations/backups intact.
+        // Do not eagerly populate a remote source here: first launch should
+        // remain fully offline and only add the built-in provider when the
+        // catalog UI is opened.
     }
     let migrated = original_schema != state.schema_version;
     let mut changed = migrated;

@@ -1,9 +1,11 @@
 use crate::adapters::{
     adapters, passive_consumers_for, resolve_global_target, CURRENT_ADAPTER_VERSION,
 };
+use crate::catalog;
 use crate::domain::*;
 use crate::{macos, skill, storage};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -205,6 +207,41 @@ pub struct AppState {
     pub mutation_lock: Mutex<()>,
     pub operation_progress: Mutex<Option<OperationProgress>>,
     pub cancel_requested: AtomicBool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSyncResult {
+    pub source_id: String,
+    pub entries: Vec<CatalogEntry>,
+    pub fetched_at: String,
+    pub from_cache: bool,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSearchRequest {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub source_id: Option<String>,
+    #[serde(default)]
+    pub scripts_only: bool,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub updated_since: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionInstallRequest {
+    pub collection_id: String,
+    #[serde(default)]
+    pub inspection_id: Option<String>,
+    #[serde(default)]
+    pub assignments: Vec<SkillAssignment>,
 }
 
 fn begin_progress(
@@ -534,6 +571,341 @@ pub fn scan_environment(state: State<'_, AppState>) -> Result<EnvironmentScan, S
         return Err("库存扫描已取消".to_string());
     }
     Ok(scan)
+}
+
+/// Return configured catalog providers.  The built-in skills.sh provider is
+/// added lazily, so upgrading an existing installation never performs a
+/// network request or changes the user's state until this page is opened.
+#[tauri::command]
+pub fn list_catalog_sources(state: State<'_, AppState>) -> Result<Vec<CatalogSource>, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| {
+        catalog::ensure_sources(persisted);
+        Ok(persisted.catalog_sources.clone())
+    })
+}
+
+#[tauri::command]
+pub fn save_catalog_source(
+    source: CatalogSource,
+    state: State<'_, AppState>,
+) -> Result<Vec<CatalogSource>, String> {
+    if source.id.trim().is_empty() || source.name.trim().is_empty() || source.url.trim().is_empty()
+    {
+        return Err("目录来源需要 id、名称和 URL".to_string());
+    }
+    if !source.url.starts_with("https://") {
+        return Err("目录来源必须使用 HTTPS".to_string());
+    }
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| {
+        catalog::ensure_sources(persisted);
+        if let Some(existing) = persisted
+            .catalog_sources
+            .iter_mut()
+            .find(|item| item.id == source.id)
+        {
+            *existing = source.clone();
+        } else {
+            persisted.catalog_sources.push(source.clone());
+        }
+        Ok(persisted.catalog_sources.clone())
+    })
+}
+
+#[tauri::command]
+pub fn remove_catalog_source(
+    source_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<CatalogSource>, String> {
+    if source_id == "skills-sh" {
+        return Err("内置 skills.sh 来源不能删除，可在设置中停用".to_string());
+    }
+    let repository = storage::StateRepository::new(&state.data_dir);
+    let sources = repository.mutate(|persisted| {
+        catalog::ensure_sources(persisted);
+        persisted
+            .catalog_sources
+            .retain(|source| source.id != source_id);
+        persisted
+            .catalog_cache
+            .retain(|item| item.source_id != source_id);
+        Ok(persisted.catalog_sources.clone())
+    })?;
+    let _ = fs::remove_file(catalog::cache_path(&state.data_dir, &source_id));
+    Ok(sources)
+}
+
+#[tauri::command]
+pub async fn sync_catalog(
+    source_id: String,
+    state: State<'_, AppState>,
+) -> Result<CatalogSyncResult, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    let sources = repository.mutate(|persisted| {
+        catalog::ensure_sources(persisted);
+        Ok(persisted.catalog_sources.clone())
+    })?;
+    let source = sources
+        .into_iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| "目录来源不存在".to_string())?;
+    let fallback = catalog::load_snapshot(&state.data_dir, &source.id)
+        .ok()
+        .flatten();
+    match catalog::sync_source(&state.data_dir, &source).await {
+        Ok((snapshot, from_cache)) => {
+            let mut updated = source.clone();
+            updated.etag = snapshot.etag.clone();
+            updated.last_modified = snapshot.last_modified.clone();
+            updated.last_synced_at = Some(snapshot.fetched_at.clone());
+            let metadata = CatalogCacheMetadata {
+                source_id: snapshot.source_id.clone(),
+                cache_path: catalog::cache_path(&state.data_dir, &snapshot.source_id)
+                    .display()
+                    .to_string(),
+                fetched_at: snapshot.fetched_at.clone(),
+                etag: snapshot.etag.clone(),
+                last_modified: snapshot.last_modified.clone(),
+                entry_count: snapshot.entries.len(),
+            };
+            catalog::update_cache_metadata(&repository, metadata, updated)?;
+            Ok(CatalogSyncResult {
+                source_id: snapshot.source_id,
+                entries: snapshot.entries,
+                fetched_at: snapshot.fetched_at,
+                from_cache,
+                warning: None,
+            })
+        }
+        Err(error) => {
+            if let Some(snapshot) = fallback {
+                Ok(CatalogSyncResult {
+                    source_id: snapshot.source_id,
+                    entries: snapshot.entries,
+                    fetched_at: snapshot.fetched_at,
+                    from_cache: true,
+                    warning: Some(format!("在线同步失败，已使用最近缓存：{error}")),
+                })
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[tauri::command]
+pub fn search_catalog(
+    request: CatalogSearchRequest,
+    state: State<'_, AppState>,
+) -> Result<Vec<CatalogEntry>, String> {
+    let mut persisted = storage::load_state(&state.data_dir)?;
+    catalog::ensure_sources(&mut persisted);
+    let mut entries = catalog::all_cached_entries(&state.data_dir, &persisted.catalog_sources)?;
+    let query = request.query.unwrap_or_default().trim().to_lowercase();
+    entries.retain(|entry| {
+        let matches_query = query.is_empty()
+            || entry.name.to_lowercase().contains(&query)
+            || entry.description.to_lowercase().contains(&query)
+            || entry
+                .repository
+                .as_deref()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains(&query);
+        let matches_source = request
+            .source_id
+            .as_deref()
+            .is_none_or(|source_id| source_id == entry.source_id);
+        let matches_scripts = !request.scripts_only || entry.has_scripts;
+        let matches_category = request
+            .category
+            .as_deref()
+            .is_none_or(|category| entry.path.as_deref().unwrap_or_default().contains(category));
+        let matches_updated = request.updated_since.as_deref().is_none_or(|since| {
+            entry
+                .updated_at
+                .as_deref()
+                .is_some_and(|updated| updated >= since)
+        });
+        matches_query && matches_source && matches_scripts && matches_category && matches_updated
+    });
+    let favorites = persisted.catalog_favorites;
+    entries.sort_by_key(|entry| (!favorites.contains(&entry.id), entry.name.to_lowercase()));
+    Ok(entries)
+}
+
+#[tauri::command]
+pub fn set_catalog_favorite(
+    entry_id: String,
+    favorite: bool,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| {
+        if favorite {
+            if !persisted.catalog_favorites.contains(&entry_id) {
+                persisted.catalog_favorites.push(entry_id.clone());
+            }
+        } else {
+            persisted.catalog_favorites.retain(|id| id != &entry_id);
+        }
+        Ok(persisted.catalog_favorites.clone())
+    })
+}
+
+#[tauri::command]
+pub fn list_collections(state: State<'_, AppState>) -> Result<Vec<SkillCollection>, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| Ok(persisted.skill_collections.clone()))
+}
+
+#[tauri::command]
+pub fn save_collection(
+    collection: SkillCollection,
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillCollection>, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| {
+        let existing = persisted
+            .skill_collections
+            .iter()
+            .find(|item| item.id == collection.id);
+        let normalized = catalog::collection_from_input(
+            Some(collection.id.clone()),
+            collection.name.clone(),
+            collection.description.clone(),
+            collection.skill_refs.clone(),
+            collection.default_client_ids.clone(),
+            existing,
+        )?;
+        if let Some(item) = persisted
+            .skill_collections
+            .iter_mut()
+            .find(|item| item.id == normalized.id)
+        {
+            *item = normalized;
+        } else {
+            persisted.skill_collections.push(normalized);
+        }
+        Ok(persisted.skill_collections.clone())
+    })
+}
+
+#[tauri::command]
+pub fn delete_collection(
+    collection_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SkillCollection>, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    repository.mutate(|persisted| {
+        persisted
+            .skill_collections
+            .retain(|item| item.id != collection_id);
+        Ok(persisted.skill_collections.clone())
+    })
+}
+
+#[tauri::command]
+pub async fn plan_collection_install(
+    request: CollectionInstallRequest,
+    state: State<'_, AppState>,
+) -> Result<InstallPlan, String> {
+    let repository = storage::StateRepository::new(&state.data_dir);
+    let collection = storage::load_state(&state.data_dir)?
+        .skill_collections
+        .into_iter()
+        .find(|item| item.id == request.collection_id)
+        .ok_or_else(|| "Skill 集合不存在".to_string())?;
+    let inspection_id = request
+        .inspection_id
+        .ok_or_else(|| "集合安装需要先检查来源并提供 inspectionId".to_string())?;
+    let assignments = if request.assignments.is_empty() {
+        collection
+            .skill_refs
+            .iter()
+            .map(|skill_id| SkillAssignment {
+                skill_id: skill_id.clone(),
+                client_ids: collection.default_client_ids.clone(),
+            })
+            .collect()
+    } else {
+        request.assignments
+    };
+    let inspection = state
+        .inspections
+        .lock()
+        .map_err(|_| "来源检查锁已损坏".to_string())?
+        .get(&inspection_id)
+        .cloned()
+        .ok_or_else(|| "来源检查不存在或已过期".to_string())?;
+    let clients = macos::scan_clients();
+    let persisted = repository.load()?;
+    let plan = build_install_plan(
+        &inspection,
+        &assignments,
+        &clients,
+        &home_dir()?,
+        &persisted,
+    )?;
+    let selected_ids: HashSet<_> = plan
+        .skills
+        .iter()
+        .map(|skill| skill.skill_id.as_str())
+        .collect();
+    let source_paths = inspection
+        .skills
+        .iter()
+        .filter(|skill| selected_ids.contains(skill.skill_id.as_str()))
+        .map(|skill| (skill.skill_id.clone(), PathBuf::from(&skill.prepared_path)))
+        .collect();
+    let source_guards = plan
+        .skills
+        .iter()
+        .map(|skill| (skill.skill_id.clone(), skill.content_hash.clone()))
+        .collect();
+    let target_guards = plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                target_guard(Path::new(&entry.resolved_path)),
+            )
+        })
+        .collect();
+    let installation_guards = plan
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.entry_id.clone(),
+                persisted
+                    .installations
+                    .iter()
+                    .find(|item| item.resolved_path == entry.resolved_path)
+                    .map(|item| item.id.clone()),
+            )
+        })
+        .collect();
+    state
+        .plans
+        .lock()
+        .map_err(|_| "安装计划锁已损坏".to_string())?
+        .insert(
+            plan.plan_id.clone(),
+            PendingPlan {
+                created_at: plan.created_at.clone(),
+                expires_at: plan.expires_at.clone(),
+                public: plan.clone(),
+                source_paths,
+                pinned_skill_ids: HashSet::new(),
+                source_guards,
+                target_guards,
+                installation_guards,
+            },
+        );
+    Ok(plan)
 }
 
 #[tauri::command]

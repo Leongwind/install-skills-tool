@@ -342,20 +342,143 @@ pub struct PersistedState {
     pub backup_policy: BackupPolicy,
     #[serde(default)]
     pub pinned_installation_ids: Vec<String>,
+    /// User-configured catalog providers.  Catalog content itself lives in
+    /// the cache directory; state.json only keeps the small source config and
+    /// cache indexes so a catalog refresh can be resumed offline.
+    #[serde(default)]
+    pub catalog_sources: Vec<CatalogSource>,
+    #[serde(default)]
+    pub catalog_favorites: Vec<String>,
+    #[serde(default)]
+    pub skill_collections: Vec<SkillCollection>,
+    #[serde(default)]
+    pub catalog_cache: Vec<CatalogCacheMetadata>,
 }
 
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            schema_version: 5,
+            schema_version: 6,
             revision: 0,
             installations: Vec::new(),
             backups: Vec::new(),
             operation_journals: Vec::new(),
             backup_policy: BackupPolicy::default(),
             pinned_installation_ids: Vec::new(),
+            catalog_sources: Vec::new(),
+            catalog_favorites: Vec::new(),
+            skill_collections: Vec::new(),
+            catalog_cache: Vec::new(),
         }
     }
+}
+
+/// A public catalog provider.  The built-in skills.sh provider and user-added
+/// GitHub catalog URLs use the same representation so the UI can present one
+/// source list and the cache can apply one refresh policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSource {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    #[serde(default)]
+    pub last_synced_at: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogEntry {
+    pub id: String,
+    pub source_id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub stars: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub skill_url: Option<String>,
+    #[serde(default)]
+    pub has_scripts: bool,
+    #[serde(default)]
+    pub installed_state: CatalogInstallState,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum CatalogInstallState {
+    #[default]
+    NotInstalled,
+    Partial,
+    Installed,
+    UpdateAvailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSnapshot {
+    pub source_id: String,
+    pub fetched_at: String,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    pub entries: Vec<CatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCacheMetadata {
+    pub source_id: String,
+    pub cache_path: String,
+    pub fetched_at: String,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
+    pub entry_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillCollection {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub skill_refs: Vec<String>,
+    #[serde(default)]
+    pub default_client_ids: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

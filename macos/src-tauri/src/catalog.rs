@@ -1,0 +1,326 @@
+//! Public catalog discovery and its small, offline-first cache.
+//!
+//! Catalog data is deliberately kept separate from the installer core.  A
+//! catalog entry is metadata only; selecting one still goes through the
+//! existing `inspect_source -> plan_install -> apply_install_plan` pipeline.
+
+use crate::domain::{
+    CatalogCacheMetadata, CatalogEntry, CatalogInstallState, CatalogSnapshot, CatalogSource,
+    SkillCollection,
+};
+use crate::storage::{cache_dir, StateRepository};
+use chrono::Utc;
+use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+
+pub const SKILLS_SH_URL: &str = "https://skills.sh/api/skills";
+pub const CATALOG_TTL_SECS: i64 = 15 * 60;
+
+pub fn builtin_sources() -> Vec<CatalogSource> {
+    vec![CatalogSource {
+        id: "skills-sh".to_string(),
+        name: "skills.sh".to_string(),
+        url: SKILLS_SH_URL.to_string(),
+        provider: "skills.sh".to_string(),
+        enabled: true,
+        etag: None,
+        last_modified: None,
+        last_synced_at: None,
+    }]
+}
+
+pub fn ensure_sources(state: &mut crate::domain::PersistedState) {
+    if state.catalog_sources.is_empty() {
+        state.catalog_sources = builtin_sources();
+    }
+}
+
+pub fn cache_path(data_dir: &Path, source_id: &str) -> PathBuf {
+    cache_dir(data_dir).join(format!("catalog-{}.json", safe_file_component(source_id)))
+}
+
+fn safe_file_component(value: &str) -> String {
+    let mut output: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if output.is_empty() {
+        output = Uuid::new_v4().to_string();
+    }
+    output
+}
+
+pub fn load_snapshot(data_dir: &Path, source_id: &str) -> Result<Option<CatalogSnapshot>, String> {
+    let path = cache_path(data_dir, source_id);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("目录缓存无效: {error}"))
+}
+
+fn save_snapshot(
+    data_dir: &Path,
+    snapshot: &CatalogSnapshot,
+) -> Result<CatalogCacheMetadata, String> {
+    let path = cache_path(data_dir, &snapshot.source_id);
+    fs::create_dir_all(cache_dir(data_dir)).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(snapshot).map_err(|error| error.to_string())?;
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+    Ok(CatalogCacheMetadata {
+        source_id: snapshot.source_id.clone(),
+        cache_path: path.display().to_string(),
+        fetched_at: snapshot.fetched_at.clone(),
+        etag: snapshot.etag.clone(),
+        last_modified: snapshot.last_modified.clone(),
+        entry_count: snapshot.entries.len(),
+    })
+}
+
+fn object_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned))
+}
+
+fn object_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|raw| {
+            raw.as_u64()
+                .or_else(|| raw.as_str().and_then(|text| text.parse().ok()))
+        })
+    })
+}
+
+/// Parse common skills.sh/GitHub catalog response shapes.  Keeping this
+/// parser tolerant lets the provider evolve without changing the installer.
+pub fn parse_entries(source_id: &str, payload: &Value) -> Vec<CatalogEntry> {
+    let values = payload
+        .as_array()
+        .cloned()
+        .or_else(|| {
+            ["skills", "items", "data", "results"]
+                .iter()
+                .find_map(|key| payload.get(*key).and_then(Value::as_array).cloned())
+        })
+        .unwrap_or_default();
+    values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let name = object_string(&value, &["name", "skill", "slug"])?;
+            let description =
+                object_string(&value, &["description", "summary"]).unwrap_or_default();
+            let owner = object_string(&value, &["owner", "author"]);
+            let repository = object_string(&value, &["repository", "repo"]);
+            let reference = object_string(&value, &["ref", "reference", "branch"]);
+            let path = object_string(&value, &["path", "subpath"]);
+            let commit_sha = object_string(&value, &["commitSha", "commit_sha", "sha"]);
+            let skill_url = object_string(&value, &["url", "skillUrl", "skill_url"]);
+            let id = object_string(&value, &["id", "skillId", "skill_id"]).unwrap_or_else(|| {
+                format!(
+                    "{}:{}:{}:{}",
+                    source_id,
+                    owner.as_deref().unwrap_or_default(),
+                    repository.as_deref().unwrap_or_default(),
+                    path.as_deref().unwrap_or(&name)
+                )
+            });
+            Some(CatalogEntry {
+                id: if id.is_empty() {
+                    format!("{source_id}:{index}:{name}")
+                } else {
+                    id
+                },
+                source_id: source_id.to_string(),
+                name,
+                description,
+                owner,
+                repository,
+                reference,
+                path,
+                commit_sha,
+                license: object_string(&value, &["license"]),
+                stars: object_u64(&value, &["stars", "stargazers_count", "downloads"]),
+                updated_at: object_string(
+                    &value,
+                    &["updatedAt", "updated_at", "updated", "publishedAt"],
+                ),
+                skill_url,
+                has_scripts: value
+                    .get("hasScripts")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                installed_state: CatalogInstallState::NotInstalled,
+                warnings: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+pub fn all_cached_entries(
+    data_dir: &Path,
+    sources: &[CatalogSource],
+) -> Result<Vec<CatalogEntry>, String> {
+    let mut entries = Vec::new();
+    for source in sources.iter().filter(|source| source.enabled) {
+        if let Some(snapshot) = load_snapshot(data_dir, &source.id)? {
+            entries.extend(snapshot.entries);
+        }
+    }
+    entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    Ok(entries)
+}
+
+pub fn update_cache_metadata(
+    repository: &StateRepository,
+    metadata: CatalogCacheMetadata,
+    source: CatalogSource,
+) -> Result<(), String> {
+    repository.mutate(|state| {
+        ensure_sources(state);
+        if let Some(existing) = state
+            .catalog_sources
+            .iter_mut()
+            .find(|item| item.id == source.id)
+        {
+            *existing = source;
+        }
+        state
+            .catalog_cache
+            .retain(|item| item.source_id != metadata.source_id);
+        state.catalog_cache.push(metadata);
+        Ok(())
+    })
+}
+
+pub async fn sync_source(
+    data_dir: &Path,
+    source: &CatalogSource,
+) -> Result<(CatalogSnapshot, bool), String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Skill-Installer/0.6.0")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request = client.get(&source.url);
+    if let Some(etag) = source.etag.as_deref() {
+        request = request.header(IF_NONE_MATCH, etag);
+    }
+    if let Some(last_modified) = source.last_modified.as_deref() {
+        request = request.header(IF_MODIFIED_SINCE, last_modified);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("目录同步失败: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return load_snapshot(data_dir, &source.id)?
+            .map(|snapshot| (snapshot, true))
+            .ok_or_else(|| "目录返回 304 但本地没有缓存".to_string());
+    }
+    if !response.status().is_success() {
+        return Err(format!("目录返回 {}", response.status()));
+    }
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let last_modified = response
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("目录 JSON 无效: {error}"))?;
+    let snapshot = CatalogSnapshot {
+        source_id: source.id.clone(),
+        fetched_at: Utc::now().to_rfc3339(),
+        etag,
+        last_modified,
+        entries: parse_entries(&source.id, &payload),
+    };
+    let _ = save_snapshot(data_dir, &snapshot)?;
+    Ok((snapshot, false))
+}
+
+pub fn collection_from_input(
+    id: Option<String>,
+    name: String,
+    description: Option<String>,
+    skill_refs: Vec<String>,
+    default_client_ids: Vec<String>,
+    existing: Option<&SkillCollection>,
+) -> Result<SkillCollection, String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err("集合名称不能为空且不能超过 80 个字符".to_string());
+    }
+    if skill_refs.is_empty() {
+        return Err("集合至少需要一个 Skill".to_string());
+    }
+    let now = Utc::now().to_rfc3339();
+    Ok(SkillCollection {
+        id: id
+            .or_else(|| existing.map(|value| value.id.clone()))
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        name: name.to_string(),
+        description,
+        skill_refs: skill_refs.into_iter().collect(),
+        default_client_ids: default_client_ids.into_iter().collect(),
+        created_at: existing
+            .map(|value| value.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
+        updated_at: now,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_array_and_metadata_fields() {
+        let payload = serde_json::json!({
+            "skills": [{
+                "name": "rust-review",
+                "description": "Review Rust code",
+                "owner": "acme",
+                "repo": "skills",
+                "ref": "main",
+                "path": "engineering/rust-review",
+                "sha": "abc123",
+                "stars": 42,
+                "hasScripts": true
+            }]
+        });
+        let entries = parse_entries("test", &payload);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "rust-review");
+        assert_eq!(entries[0].stars, Some(42));
+        assert!(entries[0].has_scripts);
+        assert_eq!(entries[0].commit_sha.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn collection_requires_name_and_skill() {
+        assert!(
+            collection_from_input(None, "".into(), None, vec!["x".into()], vec![], None).is_err()
+        );
+        assert!(collection_from_input(None, "x".into(), None, vec![], vec![], None).is_err());
+    }
+}

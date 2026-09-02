@@ -1,4 +1,5 @@
 mod adapters;
+mod catalog;
 pub mod commands;
 pub mod domain;
 mod inventory;
@@ -44,6 +45,16 @@ pub fn run() {
             commands::list_backups,
             commands::get_app_overview,
             commands::scan_client_inventory,
+            commands::list_catalog_sources,
+            commands::save_catalog_source,
+            commands::remove_catalog_source,
+            commands::sync_catalog,
+            commands::search_catalog,
+            commands::set_catalog_favorite,
+            commands::list_collections,
+            commands::save_collection,
+            commands::delete_collection,
+            commands::plan_collection_install,
             commands::recover_operation,
             commands::rollback_operation,
             commands::export_skill_bundle,
