@@ -227,9 +227,19 @@ export interface SkillCollection {
   name: string;
   description?: string;
   skillRefs: string[];
+  sourceRefs?: CollectionSkillRef[];
   defaultClientIds: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface CollectionSkillRef {
+  catalogEntryId: string;
+  source: SkillSource;
+  sourceDetails: SkillSourceDetails;
+  skillName?: string;
+  path?: string;
+  commitSha?: string;
 }
 
 export interface BackupRecord {

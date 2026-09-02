@@ -106,6 +106,7 @@ export const api = {
   }) => invoke<CatalogEntry[]>("search_catalog", { request }),
   setCatalogFavorite: (entryId: string, favorite: boolean) =>
     invoke<string[]>("set_catalog_favorite", { entryId, favorite }),
+  listCatalogFavorites: () => invoke<string[]>("list_catalog_favorites"),
   listCollections: () => invoke<SkillCollection[]>("list_collections"),
   saveCollection: (collection: SkillCollection) =>
     invoke<SkillCollection[]>("save_collection", { collection }),

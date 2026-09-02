@@ -759,6 +759,55 @@ code {
   font-size: 12px;
 }
 
+.catalog-source-panel {
+  align-content: start;
+  gap: 10px;
+}
+
+.source-name-input,
+.source-url-input {
+  height: 30px;
+  min-width: 150px;
+  padding: 0 9px;
+  border: 1px solid var(--gray-a6);
+  border-radius: 6px;
+  color: var(--gray-12);
+  background: var(--color-panel-solid);
+  font-size: 12px;
+}
+
+.source-url-input {
+  flex: 1;
+  min-width: 260px;
+}
+
+.source-list,
+.collection-plan-list {
+  display: grid;
+  border: 1px solid var(--gray-a5);
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.source-row,
+.collection-plan-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--gray-a4);
+}
+
+.source-row:last-child,
+.collection-plan-row:last-child {
+  border-bottom: 0;
+}
+
+.collection-plan-panel {
+  align-content: start;
+}
+
 .discover-check {
   display: flex;
   align-items: center;

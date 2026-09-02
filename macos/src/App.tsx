@@ -384,9 +384,9 @@ export default function App() {
   }
 
   function openCatalogEntry(entry: CatalogEntry) {
-    const url = entry.skillUrl ?? (entry.owner && entry.repository
-      ? `https://github.com/${entry.owner}/${entry.repository}/tree/${entry.commitSha ?? entry.reference ?? "HEAD"}/${entry.path ?? ""}`
-      : "");
+    // Only use the URL that passed the backend catalog consistency checks.
+    // Display metadata is never sufficient to construct an install source.
+    const url = entry.skillUrl;
     if (!url) {
       setError("该目录条目没有可用的公开来源 URL");
       return;
