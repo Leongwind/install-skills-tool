@@ -13,7 +13,7 @@ Skill Installer 是一个本地优先的 Agent Skill 批量安装和 IDE Skill �
 macOS 版支持 Codex、Claude Code、Kiro、Cursor、Windsurf、TRAE 国际版和
 TRAE 国内版。它可从目录、ZIP 或公开 GitHub 仓库批量发现 Skills，通过
 Skill-IDE 矩阵分配全局目标，并按 IDE 展示受管理、外部、异常和被动发现库存。
-0.6.0 新增 skills.sh 与公开目录浏览、离线目录缓存、搜索筛选、收藏和可复用 Skill 集合。
+0.6.0 新增 Anthropic Skills GitHub 公开目录浏览、离线目录缓存、搜索筛选、收藏和可复用 Skill 集合；skills.sh 官方 API 需要登录令牌，桌面端不直连。
 写入前会校验和预览，冲突覆盖与卸载前自动备份，且不会执行 Skill 脚本。
 0.6.0 在 0.5.1 的基础上增加可信目录发现与集合管理；0.5.1 增加 GitHub 简写、显式 ref/commit 和精确 Skill 路径解析；
 同时保留 Adapter V2 原生目录描述、递归库存扫描、Codex 共享目录的被动发现提示、

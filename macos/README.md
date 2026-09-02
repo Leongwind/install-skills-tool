@@ -6,7 +6,7 @@ Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 
 ## 0.6.0 功能
 
-- “发现 Skills”页面连接内置 skills.sh 和用户配置的公开 HTTPS 目录，支持关键词、来源、脚本筛选和离线缓存。
+- “发现 Skills”页面连接内置 Anthropic Skills GitHub 公开目录和用户配置的公开 HTTPS 目录，支持关键词、来源、脚本筛选和离线缓存。skills.sh 官方 API 当前要求 Vercel OIDC，桌面端不伪装直连；用户可在浏览器中访问 skills.sh 后复制公开 GitHub 来源导入。
 - 目录条目显示作者、仓库、许可证、热度、更新时间和安装状态；详情页展示来源版本、安全提示和目标 IDE。
 - 可收藏条目并保存 Skill 集合。集合只是安装前的选择预设，实际安装仍逐 Skill 经过检查、分配矩阵、冲突确认和原子备份。
 - 目录同步使用 ETag/Last-Modified，网络失败时保留最近有效快照；stars 仅表示热度，不代表安全或可信承诺。

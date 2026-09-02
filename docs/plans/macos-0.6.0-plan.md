@@ -4,7 +4,7 @@
 
 0.6.0 将安装器从单纯的来源导入升级为“发现、可信来源与集合管理”：
 
-- 内置 skills.sh 和用户添加的公开 HTTPS 目录；目录只提供元数据，stars 仅作热度参考。
+- 内置 Anthropic Skills 的 GitHub Contents 公开目录和用户添加的公开 HTTPS 目录；skills.sh 官方 API 需要 Vercel OIDC，桌面端不引入 OAuth，目录只提供元数据，stars 仅作热度参考。
 - 目录条目支持搜索、来源/分类/脚本筛选、详情预览、commit/ref 信息和安装状态。
 - 使用 ETag、Last-Modified 与本地快照缓存；网络失败不阻断已有库存管理。
 - 收藏条目并保存 SkillCollection 选择预设；实际写入仍复用 inspect_source → plan_install → apply_install_plan。
