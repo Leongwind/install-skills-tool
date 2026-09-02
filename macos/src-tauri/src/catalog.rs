@@ -6,7 +6,7 @@
 
 use crate::domain::{
     CatalogCacheMetadata, CatalogEntry, CatalogInstallState, CatalogSnapshot, CatalogSource,
-    SkillCollection,
+    SkillCollection, SkillSource,
 };
 use crate::storage::{cache_dir, StateRepository};
 use chrono::Utc;
@@ -184,6 +184,65 @@ pub fn all_cached_entries(
     Ok(entries)
 }
 
+/// Reconcile catalog metadata with tracked installations without ever
+/// conflating two repositories that happen to use the same Skill name.
+/// Installations with no GitHub provenance are intentionally left unmatched.
+pub fn reconcile_entries(
+    entries: &mut [CatalogEntry],
+    installations: &[crate::domain::PhysicalInstallation],
+) {
+    for entry in entries {
+        let matches: Vec<_> = installations
+            .iter()
+            .filter(|installation| {
+                let Some(source) = installation.source.as_ref() else {
+                    return false;
+                };
+                let SkillSource::Github { .. } = source else {
+                    return false;
+                };
+                let details = &installation.source_details;
+                let owner_matches = entry.owner.as_deref() == details.owner.as_deref();
+                let repository_matches =
+                    entry.repository.as_deref() == details.repository.as_deref();
+                let path_matches = match (entry.path.as_deref(), details.subpath.as_deref()) {
+                    (Some(expected), Some(actual)) => {
+                        actual.ends_with(expected) || expected.ends_with(actual)
+                    }
+                    (None, _) => true,
+                    _ => false,
+                };
+                owner_matches
+                    && repository_matches
+                    && path_matches
+                    && installation.skill_name == entry.name
+            })
+            .collect();
+        if matches.is_empty() {
+            continue;
+        }
+        let has_update = entry.commit_sha.as_deref().is_some_and(|sha| {
+            matches.iter().any(|installation| {
+                installation
+                    .source_details
+                    .commit_sha
+                    .as_deref()
+                    .is_some_and(|installed| installed != sha)
+            })
+        });
+        entry.installed_state = if has_update {
+            CatalogInstallState::UpdateAvailable
+        } else if matches
+            .iter()
+            .any(|installation| installation.consumers.len() > 1)
+        {
+            CatalogInstallState::Installed
+        } else {
+            CatalogInstallState::Partial
+        };
+    }
+}
+
 pub fn update_cache_metadata(
     repository: &StateRepository,
     metadata: CatalogCacheMetadata,
@@ -322,5 +381,54 @@ mod tests {
             collection_from_input(None, "".into(), None, vec!["x".into()], vec![], None).is_err()
         );
         assert!(collection_from_input(None, "x".into(), None, vec![], vec![], None).is_err());
+    }
+
+    #[test]
+    fn same_name_from_different_repositories_is_not_reconciled() {
+        let mut entries = vec![CatalogEntry {
+            id: "catalog:acme:skills:demo".into(),
+            source_id: "catalog".into(),
+            name: "demo".into(),
+            description: String::new(),
+            owner: Some("acme".into()),
+            repository: Some("skills".into()),
+            reference: Some("main".into()),
+            path: Some("demo".into()),
+            commit_sha: None,
+            license: None,
+            stars: None,
+            updated_at: None,
+            skill_url: None,
+            has_scripts: false,
+            installed_state: CatalogInstallState::NotInstalled,
+            warnings: Vec::new(),
+        }];
+        let installation = crate::domain::PhysicalInstallation {
+            id: "i".into(),
+            skill_name: "demo".into(),
+            resolved_path: "/tmp/demo".into(),
+            source: Some(crate::domain::SkillSource::Github {
+                url: "https://github.com/other/skills".into(),
+            }),
+            source_details: crate::domain::SkillSourceDetails {
+                owner: Some("other".into()),
+                repository: Some("skills".into()),
+                subpath: Some("demo".into()),
+                ..Default::default()
+            },
+            content_hash: "hash".into(),
+            scope: crate::domain::InstallScope::Global,
+            consumers: vec!["codex".into()],
+            passive_consumers: Vec::new(),
+            adapter_version: 1,
+            installed_at: String::new(),
+            provenance: crate::domain::InstallationProvenance::Tool,
+            legacy_project: false,
+        };
+        reconcile_entries(&mut entries, &[installation]);
+        assert_eq!(
+            entries[0].installed_state,
+            CatalogInstallState::NotInstalled
+        );
     }
 }

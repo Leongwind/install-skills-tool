@@ -702,6 +702,7 @@ pub fn search_catalog(
     let mut persisted = storage::load_state(&state.data_dir)?;
     catalog::ensure_sources(&mut persisted);
     let mut entries = catalog::all_cached_entries(&state.data_dir, &persisted.catalog_sources)?;
+    catalog::reconcile_entries(&mut entries, &persisted.installations);
     let query = request.query.unwrap_or_default().trim().to_lowercase();
     entries.retain(|entry| {
         let matches_query = query.is_empty()
