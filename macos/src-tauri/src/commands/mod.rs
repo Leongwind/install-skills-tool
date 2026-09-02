@@ -822,14 +822,7 @@ pub async fn plan_collection_install(
         .inspection_id
         .ok_or_else(|| "集合安装需要先检查来源并提供 inspectionId".to_string())?;
     let assignments = if request.assignments.is_empty() {
-        collection
-            .skill_refs
-            .iter()
-            .map(|skill_id| SkillAssignment {
-                skill_id: skill_id.clone(),
-                client_ids: collection.default_client_ids.clone(),
-            })
-            .collect()
+        catalog::collection_assignments(&collection)
     } else {
         request.assignments
     };

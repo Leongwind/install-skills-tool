@@ -14,6 +14,7 @@ use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub const SKILLS_SH_URL: &str = "https://skills.sh/api/skills";
@@ -68,6 +69,17 @@ pub fn load_snapshot(data_dir: &Path, source_id: &str) -> Result<Option<CatalogS
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(|error| format!("目录缓存无效: {error}"))
+}
+
+pub fn cache_is_stale(snapshot: &CatalogSnapshot) -> bool {
+    let Ok(fetched) = chrono::DateTime::parse_from_rfc3339(&snapshot.fetched_at) else {
+        return true;
+    };
+    let age = Utc::now()
+        .signed_duration_since(fetched.with_timezone(&Utc))
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    age > Duration::from_secs(CATALOG_TTL_SECS as u64)
 }
 
 fn save_snapshot(
@@ -177,10 +189,18 @@ pub fn all_cached_entries(
     let mut entries = Vec::new();
     for source in sources.iter().filter(|source| source.enabled) {
         if let Some(snapshot) = load_snapshot(data_dir, &source.id)? {
-            entries.extend(snapshot.entries);
+            let stale = cache_is_stale(&snapshot);
+            entries.extend(snapshot.entries.into_iter().map(|mut entry| {
+                if stale {
+                    entry
+                        .warnings
+                        .push("目录缓存已过期，建议重新同步".to_string());
+                }
+                entry
+            }));
         }
     }
-    entries.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
     Ok(entries)
 }
 
@@ -348,6 +368,17 @@ pub fn collection_from_input(
     })
 }
 
+pub fn collection_assignments(collection: &SkillCollection) -> Vec<crate::domain::SkillAssignment> {
+    collection
+        .skill_refs
+        .iter()
+        .map(|skill_id| crate::domain::SkillAssignment {
+            skill_id: skill_id.clone(),
+            client_ids: collection.default_client_ids.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +461,33 @@ mod tests {
             entries[0].installed_state,
             CatalogInstallState::NotInstalled
         );
+    }
+
+    #[test]
+    fn cache_age_is_detected_without_touching_content() {
+        let snapshot = CatalogSnapshot {
+            source_id: "test".into(),
+            fetched_at: "2000-01-01T00:00:00Z".into(),
+            etag: None,
+            last_modified: None,
+            entries: Vec::new(),
+        };
+        assert!(cache_is_stale(&snapshot));
+    }
+
+    #[test]
+    fn collection_assignments_preserve_order_and_defaults() {
+        let collection = SkillCollection {
+            id: "c".into(),
+            name: "coding".into(),
+            description: None,
+            skill_refs: vec!["a".into(), "b".into()],
+            default_client_ids: vec!["codex".into(), "kiro".into()],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let assignments = collection_assignments(&collection);
+        assert_eq!(assignments[0].skill_id, "a");
+        assert_eq!(assignments[1].client_ids, collection.default_client_ids);
     }
 }
