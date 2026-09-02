@@ -13,7 +13,7 @@ import {
 import { Badge, Button, Callout, Checkbox, Flex, Spinner, Text } from "@radix-ui/themes";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { CatalogEntry, CatalogSource, DetectedClient } from "../types";
+import type { CatalogEntry, CatalogSource, DetectedClient, SkillCollection } from "../types";
 import { shortPath } from "../ui";
 
 type Props = {
@@ -41,6 +41,9 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
   const [notice, setNotice] = useState("");
   const [favorites, setFavorites] = useState<string[]>([]);
   const [selected, setSelected] = useState<CatalogEntry>();
+  const [collections, setCollections] = useState<SkillCollection[]>([]);
+  const [selectedForCollection, setSelectedForCollection] = useState<string[]>([]);
+  const [collectionName, setCollectionName] = useState("");
 
   const available = typeof (api as Partial<typeof api>).listCatalogSources === "function";
 
@@ -58,6 +61,15 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
       setBusy("");
     }
   }, [available, sourceId]);
+
+  const loadCollections = useCallback(async () => {
+    if (!available || typeof api.listCollections !== "function") return;
+    try {
+      setCollections(await api.listCollections());
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [available]);
 
   const search = useCallback(async () => {
     if (!available || typeof api.searchCatalog !== "function") return;
@@ -80,7 +92,8 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
 
   useEffect(() => {
     void loadSources();
-  }, [loadSources]);
+    void loadCollections();
+  }, [loadCollections, loadSources]);
 
   useEffect(() => {
     void search();
@@ -108,6 +121,36 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
     const next = !favorites.includes(entry.id);
     try {
       setFavorites(await api.setCatalogFavorite(entry.id, next));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function saveCurrentCollection() {
+    if (!collectionName.trim() || selectedForCollection.length === 0 || typeof api.saveCollection !== "function") return;
+    const now = new Date().toISOString();
+    try {
+      const next = await api.saveCollection({
+        id: crypto.randomUUID(),
+        name: collectionName.trim(),
+        skillRefs: selectedForCollection,
+        defaultClientIds: clients.filter((client) => client.supportsSkills).map((client) => client.id),
+        createdAt: now,
+        updatedAt: now,
+      });
+      setCollections(next);
+      setCollectionName("");
+      setSelectedForCollection([]);
+      setNotice("集合已保存，可在下次安装时复用。");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function removeCollection(collection: SkillCollection) {
+    if (typeof api.deleteCollection !== "function") return;
+    try {
+      setCollections(await api.deleteCollection(collection.id));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -166,20 +209,30 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
       {categories.length > 0 && <div className="discover-categories">{categories.slice(0, 8).map((category) => <Badge key={category} variant="soft">{category}</Badge>)}</div>}
       <section className="discover-grid" aria-label="Skill 目录">
         {entries.length === 0 && busy !== "search" ? <div className="panel quiet-row">暂无缓存结果，请先同步目录。</div> : entries.map((entry) => (
-          <article className="panel discover-card" key={entry.id}>
+          <article className={`panel discover-card ${selectedForCollection.includes(entry.id) ? "collection-selected" : ""}`} key={entry.id}>
             <div className="discover-card-head">
               <div className="skill-icon"><Code size={18} /></div>
               <div className="grow min-width-zero">
                 <Flex align="center" gap="2" wrap="wrap"><strong>{entry.name}</strong><Badge color={entry.installedState === "notInstalled" ? "gray" : entry.installedState === "updateAvailable" ? "orange" : "green"} variant="soft">{stateLabels[entry.installedState]}</Badge></Flex>
                 <Text as="div" size="1" color="gray" className="truncate">{entry.owner && entry.repository ? `${entry.owner}/${entry.repository}` : entry.sourceId}{entry.stars !== undefined ? ` · ${entry.stars} stars` : ""}</Text>
               </div>
-              <Button size="1" variant="ghost" aria-label={`${favorites.includes(entry.id) ? "取消收藏" : "收藏"} ${entry.name}`} onClick={() => void toggleFavorite(entry)}><Heart weight={favorites.includes(entry.id) ? "fill" : "regular"} color={favorites.includes(entry.id) ? "red" : undefined} /></Button>
+              <Flex gap="1"><Checkbox aria-label={`加入集合 ${entry.name}`} checked={selectedForCollection.includes(entry.id)} onCheckedChange={(value) => setSelectedForCollection((current) => value ? [...new Set([...current, entry.id])] : current.filter((id) => id !== entry.id))} /><Button size="1" variant="ghost" aria-label={`${favorites.includes(entry.id) ? "取消收藏" : "收藏"} ${entry.name}`} onClick={() => void toggleFavorite(entry)}><Heart weight={favorites.includes(entry.id) ? "fill" : "regular"} color={favorites.includes(entry.id) ? "red" : undefined} /></Button></Flex>
             </div>
             <Text as="div" size="2" className="discover-description">{entry.description || "暂无描述"}</Text>
             <Flex gap="2" wrap="wrap" align="center"><Text size="1" color="gray">{entry.path ?? "目录根"}</Text>{entry.hasScripts && <Badge color="amber" variant="soft"><ShieldWarning /> 含脚本</Badge>}{entry.license && <Badge variant="soft">{entry.license}</Badge>}</Flex>
             <Flex justify="end" gap="2" mt="3"><Button size="1" variant="ghost" onClick={() => setSelected(entry)}>查看详情 <ArrowRight /></Button><Button size="1" onClick={() => onOpenInstall(entry)}>{entry.installedState === "notInstalled" ? "安装" : "查看安装"}</Button></Flex>
           </article>
         ))}
+      </section>
+
+      <section className="panel collection-panel" aria-label="Skill 集合">
+        <div className="section-caption"><div><strong>我的集合</strong><Text as="div" size="1" color="gray">保存常用 Skill 组合，安装前仍会逐项预览和分配 IDE。</Text></div><Badge variant="soft">{collections.length}</Badge></div>
+        <Flex gap="2" wrap="wrap" align="center">
+          <input className="collection-name" value={collectionName} placeholder="集合名称" onChange={(event) => setCollectionName(event.target.value)} />
+          <Text size="1" color="gray">已选 {selectedForCollection.length} 项</Text>
+          <Button size="1" disabled={!collectionName.trim() || selectedForCollection.length === 0} onClick={() => void saveCurrentCollection()}>保存集合</Button>
+        </Flex>
+        {collections.length > 0 && <div className="collection-list">{collections.map((collection) => <div className="collection-row" key={collection.id}><div className="grow min-width-zero"><strong>{collection.name}</strong><Text as="div" size="1" color="gray">{collection.skillRefs.length} 个 Skill · 默认 {collection.defaultClientIds.length} 个 IDE</Text></div><Button size="1" variant="soft" onClick={() => { const first = entries.find((entry) => collection.skillRefs.includes(entry.id)); if (first) onOpenInstall(first); else setNotice("该集合的 Skill 尚未出现在当前缓存中，请先同步目录。"); }}>使用集合安装</Button><Button size="1" variant="ghost" color="red" onClick={() => void removeCollection(collection)}>删除</Button></div>)}</div>}
       </section>
 
       {selected && <section className="panel discover-detail" aria-label="Skill 详情">
