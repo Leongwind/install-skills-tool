@@ -44,6 +44,8 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
   const [collections, setCollections] = useState<SkillCollection[]>([]);
   const [selectedForCollection, setSelectedForCollection] = useState<string[]>([]);
   const [collectionName, setCollectionName] = useState("");
+  const [activeCollection, setActiveCollection] = useState<SkillCollection>();
+  const [collectionAssignments, setCollectionAssignments] = useState<Record<string, string[]>>({});
   const [collectionPlan, setCollectionPlan] = useState<InstallPlan>();
   const [collectionOverwriteIds, setCollectionOverwriteIds] = useState<string[]>([]);
   const [newSourceName, setNewSourceName] = useState("");
@@ -129,9 +131,11 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
     setNotice("");
     try {
       const result = await api.syncCatalog(source.id);
-      setEntries(result.entries);
       setNotice(result.warning ?? `已同步 ${result.entries.length} 个目录条目。`);
       await loadSources();
+      // Re-run the normal search seam after sync so filters, favorites and
+      // inventory reconciliation are applied to the fresh snapshot.
+      await search();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -239,11 +243,32 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
   }
 
   async function planCollection(collection: SkillCollection) {
-    if (typeof api.planCollectionInstall !== "function") return;
-    setBusy(`collection:${collection.id}`);
+    const members = collection.sourceRefs?.length
+      ? collection.sourceRefs.map((reference) => reference.catalogEntryId)
+      : collection.skillRefs;
+    const defaults = clients.filter((client) =>
+      client.supportsSkills && collection.defaultClientIds.includes(client.id),
+    ).map((client) => client.id);
+    setActiveCollection(collection);
+    setCollectionPlan(undefined);
+    setCollectionAssignments(Object.fromEntries(members.map((id) => [id, defaults])));
+    setNotice(`已载入集合 ${collection.name}，请逐个 Skill 确认目标 IDE。`);
+  }
+
+  async function generateCollectionPlan() {
+    if (!activeCollection || typeof api.planCollectionInstall !== "function") return;
+    const assignments = Object.entries(collectionAssignments).map(([skillId, clientIds]) => ({
+      skillId,
+      clientIds,
+    }));
+    if (assignments.some((assignment) => assignment.clientIds.length === 0)) {
+      setError("集合中每个 Skill 至少需要分配一个可用 IDE");
+      return;
+    }
+    setBusy(`collection:${activeCollection.id}`);
     setError("");
     try {
-      const plan = await api.planCollectionInstall({ collectionId: collection.id });
+      const plan = await api.planCollectionInstall({ collectionId: activeCollection.id, assignments });
       setCollectionPlan(plan);
       setCollectionOverwriteIds([]);
       setNotice(`已生成 ${plan.skills.length} 个 Skill 的安装预览，请确认目标 IDE。`);
@@ -253,6 +278,42 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
       setBusy("");
     }
   }
+
+  function toggleCollectionAssignment(skillId: string, clientId: string, checked: boolean) {
+    setCollectionAssignments((current) => {
+      const ids = new Set(current[skillId] ?? []);
+      if (checked) ids.add(clientId);
+      else ids.delete(clientId);
+      return { ...current, [skillId]: [...ids] };
+    });
+  }
+
+  function toggleCollectionClientColumn(clientId: string) {
+    setCollectionAssignments((current) => {
+      const members = Object.keys(current);
+      const allSelected = members.length > 0 && members.every((skillId) => current[skillId]?.includes(clientId));
+      return Object.fromEntries(members.map((skillId) => {
+        const ids = new Set(current[skillId] ?? []);
+        if (allSelected) ids.delete(clientId);
+        else ids.add(clientId);
+        return [skillId, [...ids]];
+      }));
+    });
+  }
+
+  const collectionMembers = useMemo(() => {
+    if (!activeCollection) return [];
+    if (activeCollection.sourceRefs?.length) {
+      return activeCollection.sourceRefs.map((reference) => {
+        const entry = entries.find((candidate) => candidate.id === reference.catalogEntryId);
+        return { id: reference.catalogEntryId, name: reference.skillName ?? entry?.name ?? reference.catalogEntryId, path: reference.path ?? entry?.path };
+      });
+    }
+    return activeCollection.skillRefs.map((id) => {
+      const entry = entries.find((candidate) => candidate.id === id);
+      return { id, name: entry?.name ?? id, path: entry?.path };
+    });
+  }, [activeCollection, entries]);
 
   async function applyCollectionPlan() {
     if (!collectionPlan || typeof api.applyInstallPlan !== "function") return;
@@ -356,8 +417,17 @@ export function DiscoverPage({ clients, onOpenInstall }: Props) {
           <Text size="1" color="gray">已选 {selectedForCollection.length} 项</Text>
           <Button size="1" disabled={!collectionName.trim() || selectedForCollection.length === 0} onClick={() => void saveCurrentCollection()}>保存集合</Button>
         </Flex>
-        {collections.length > 0 && <div className="collection-list">{collections.map((collection) => <div className="collection-row" key={collection.id}><div className="grow min-width-zero"><strong>{collection.name}</strong><Text as="div" size="1" color="gray">{(collection.sourceRefs?.length ?? collection.skillRefs.length)} 个 Skill · 默认 {collection.defaultClientIds.length} 个 IDE</Text></div><Button size="1" variant="soft" disabled={busy === `collection:${collection.id}`} onClick={() => void planCollection(collection)}>使用集合安装</Button><Button size="1" variant="ghost" color="red" onClick={() => void removeCollection(collection)}>删除</Button></div>)}</div>}
+        {collections.length > 0 && <div className="collection-list">{collections.map((collection) => <div className="collection-row" key={collection.id}><div className="grow min-width-zero"><strong>{collection.name}</strong><Text as="div" size="1" color="gray">{(collection.sourceRefs?.length ?? collection.skillRefs.length)} 个 Skill · 默认 {collection.defaultClientIds.length} 个 IDE</Text></div><Button size="1" variant="soft" onClick={() => void planCollection(collection)}>使用集合安装</Button><Button size="1" variant="ghost" color="red" onClick={() => void removeCollection(collection)}>删除</Button></div>)}</div>}
       </section>
+
+      {activeCollection && !collectionPlan && <section className="panel collection-matrix-panel" aria-label="集合 Skill IDE 分配矩阵">
+        <div className="section-caption"><div><strong>分配集合 Skill 到 IDE</strong><Text as="div" size="1" color="gray">默认目标来自集合设置，可逐个 Skill 调整；生成预览前不会执行安装。</Text></div><Button size="1" variant="ghost" onClick={() => setActiveCollection(undefined)}>取消</Button></div>
+        {collectionMembers.length === 0 ? <div className="empty-inline">集合没有可安装成员。</div> : <div className="assignment-matrix collection-assignment-matrix">
+          <div className="matrix-head"><span>Skill</span>{clients.map((client) => <button key={client.id} disabled={!client.supportsSkills} onClick={() => client.supportsSkills && toggleCollectionClientColumn(client.id)} title={client.notes.join("；")}><span>{client.name}</span><small>{client.supportsSkills ? "整列选择" : "不可用"}</small></button>)}</div>
+          {collectionMembers.map((member) => <div className="matrix-row" key={member.id}><div className="matrix-skill"><strong>{member.name}</strong><small>{member.path ?? member.id}</small></div><div className="matrix-targets">{clients.map((client) => <label className={!client.supportsSkills ? "unavailable" : ""} key={client.id} title={client.notes.join("；")}><Checkbox checked={collectionAssignments[member.id]?.includes(client.id) ?? false} disabled={!client.supportsSkills} onCheckedChange={(value) => toggleCollectionAssignment(member.id, client.id, Boolean(value))} /><span>{client.name}</span>{!client.supportsSkills && <small>不可用</small>}</label>)}</div></div>)}
+        </div>}
+        <Flex justify="end" gap="2" mt="3"><Button disabled={busy === `collection:${activeCollection.id}` || collectionMembers.length === 0} onClick={() => void generateCollectionPlan()}>{busy === `collection:${activeCollection.id}` ? <Spinner size="1" /> : null} 生成安装预览</Button></Flex>
+      </section>}
 
       {collectionPlan && <section className="panel collection-plan-panel" aria-label="集合安装预览"><div className="section-caption"><div><strong>集合安装预览</strong><Text as="div" size="1" color="gray">所有成员均已重新检查来源，确认后才会进入现有安装流程。</Text></div><Badge variant="soft">{collectionPlan.entries.length} 个目标</Badge></div><div className="collection-plan-list">{collectionPlan.entries.map((entry) => <div className="collection-plan-row" key={entry.entryId}><Checkbox checked={collectionOverwriteIds.includes(entry.entryId)} onCheckedChange={(value) => setCollectionOverwriteIds((current) => value ? [...new Set([...current, entry.entryId])] : current.filter((id) => id !== entry.entryId))} /><div className="grow min-width-zero"><strong>{entry.skillName}</strong><Text as="div" size="1" color="gray" className="mono">{shortPath(entry.resolvedPath)} · {entry.consumers.join("、")}</Text></div><Badge color={entry.conflict === "notInstalled" || entry.conflict === "identical" ? "green" : "orange"} variant="soft">{entry.conflict}</Badge></div>)}</div><Flex justify="end" gap="2"><Button variant="soft" onClick={() => setCollectionPlan(undefined)}>取消</Button><Button disabled={busy === "collection-apply"} onClick={() => void applyCollectionPlan()}>确认并安装</Button></Flex></section>}
 

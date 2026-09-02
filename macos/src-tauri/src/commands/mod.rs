@@ -665,59 +665,79 @@ pub async fn sync_catalog(
     source_id: String,
     state: State<'_, AppState>,
 ) -> Result<CatalogSyncResult, String> {
+    let Some(owner) = begin_progress(&state, "sync-catalog", "同步目录", 0, true) else {
+        return Err("已有操作正在进行，请稍后重试".to_string());
+    };
     let repository = storage::StateRepository::new(&state.data_dir);
-    let sources = repository.mutate(|persisted| {
-        catalog::ensure_sources(persisted);
-        Ok(persisted.catalog_sources.clone())
-    })?;
-    let source = sources
-        .into_iter()
-        .find(|source| source.id == source_id)
-        .ok_or_else(|| "目录来源不存在".to_string())?;
-    let fallback = catalog::load_snapshot(&state.data_dir, &source.id)
-        .ok()
-        .flatten();
-    match catalog::sync_source_with_control(&state.data_dir, &source, Some(&state.cancel_requested))
-        .await
-    {
-        Ok((snapshot, from_cache)) => {
-            let mut updated = source.clone();
-            updated.etag = snapshot.etag.clone();
-            updated.last_modified = snapshot.last_modified.clone();
-            updated.last_synced_at = Some(snapshot.fetched_at.clone());
-            let metadata = CatalogCacheMetadata {
-                source_id: snapshot.source_id.clone(),
-                cache_path: catalog::cache_path(&state.data_dir, &snapshot.source_id)
-                    .display()
-                    .to_string(),
-                fetched_at: snapshot.fetched_at.clone(),
-                etag: snapshot.etag.clone(),
-                last_modified: snapshot.last_modified.clone(),
-                entry_count: snapshot.entries.len(),
-            };
-            catalog::update_cache_metadata(&repository, metadata, updated)?;
-            Ok(CatalogSyncResult {
-                source_id: snapshot.source_id,
-                entries: snapshot.entries,
-                fetched_at: snapshot.fetched_at,
-                from_cache,
-                warning: None,
-            })
-        }
-        Err(error) => {
-            if let Some(snapshot) = fallback {
+    let sync_result = async {
+        let sources = repository.mutate(|persisted| {
+            catalog::ensure_sources(persisted);
+            Ok(persisted.catalog_sources.clone())
+        })?;
+        let source = sources
+            .into_iter()
+            .find(|source| source.id == source_id)
+            .ok_or_else(|| "目录来源不存在".to_string())?;
+        let fallback = catalog::load_snapshot(&state.data_dir, &source.id)
+            .ok()
+            .flatten();
+        let outcome = catalog::sync_source_with_control(
+            &state.data_dir,
+            &source,
+            Some(&state.cancel_requested),
+        )
+        .await;
+        match outcome {
+            Ok((snapshot, from_cache)) => {
+                let mut updated = source.clone();
+                updated.etag = snapshot.etag.clone();
+                updated.last_modified = snapshot.last_modified.clone();
+                updated.last_synced_at = Some(snapshot.fetched_at.clone());
+                let metadata = CatalogCacheMetadata {
+                    source_id: snapshot.source_id.clone(),
+                    cache_path: catalog::cache_path(&state.data_dir, &snapshot.source_id)
+                        .display()
+                        .to_string(),
+                    fetched_at: snapshot.fetched_at.clone(),
+                    etag: snapshot.etag.clone(),
+                    last_modified: snapshot.last_modified.clone(),
+                    entry_count: snapshot.entries.len(),
+                };
+                catalog::update_cache_metadata(&repository, metadata, updated)?;
+                let persisted = repository.load()?;
+                let mut entries =
+                    catalog::all_cached_entries(&state.data_dir, &persisted.catalog_sources)?;
+                catalog::reconcile_entries(&mut entries, &persisted.installations);
                 Ok(CatalogSyncResult {
                     source_id: snapshot.source_id,
-                    entries: snapshot.entries,
+                    entries,
                     fetched_at: snapshot.fetched_at,
-                    from_cache: true,
-                    warning: Some(format!("在线同步失败，已使用最近缓存：{error}")),
+                    from_cache,
+                    warning: None,
                 })
-            } else {
-                Err(error)
+            }
+            Err(error) => {
+                if let Some(snapshot) = fallback {
+                    let persisted = repository.load()?;
+                    let mut entries =
+                        catalog::all_cached_entries(&state.data_dir, &persisted.catalog_sources)?;
+                    catalog::reconcile_entries(&mut entries, &persisted.installations);
+                    Ok(CatalogSyncResult {
+                        source_id: snapshot.source_id,
+                        entries,
+                        fetched_at: snapshot.fetched_at,
+                        from_cache: true,
+                        warning: Some(format!("在线同步失败，已使用最近缓存：{error}")),
+                    })
+                } else {
+                    Err(error)
+                }
             }
         }
     }
+    .await;
+    finish_progress(&state, &owner);
+    sync_result
 }
 
 #[tauri::command]
@@ -802,9 +822,11 @@ pub fn save_collection(
 ) -> Result<Vec<SkillCollection>, String> {
     let repository = storage::StateRepository::new(&state.data_dir);
     repository.mutate(|persisted| {
-        for reference in &collection.source_refs {
-            catalog::validate_collection_ref(reference)?;
-        }
+        let normalized_source_refs = collection
+            .source_refs
+            .iter()
+            .map(catalog::normalize_collection_ref)
+            .collect::<Result<Vec<_>, _>>()?;
         let existing = persisted
             .skill_collections
             .iter()
@@ -818,7 +840,7 @@ pub fn save_collection(
             existing,
         )?;
         let mut normalized = normalized;
-        normalized.source_refs = collection.source_refs.clone();
+        normalized.source_refs = normalized_source_refs;
         if let Some(item) = persisted
             .skill_collections
             .iter_mut()
@@ -846,14 +868,16 @@ pub fn delete_collection(
     })
 }
 
-fn compose_collection_inspection(
+fn compose_collection_inspection_with_map(
     collection: &SkillCollection,
     inspected_sources: &[SourceInspection],
-) -> Result<SourceInspection, String> {
+) -> Result<(SourceInspection, HashMap<String, String>), String> {
     let mut skills = Vec::new();
     let mut rejected = Vec::new();
     let mut warnings = Vec::new();
     let mut source = None;
+    let mut catalog_to_skill = HashMap::new();
+    let mut used_skill_ids = HashSet::new();
     for reference in &collection.source_refs {
         catalog::validate_collection_ref(reference)?;
         let inspected = inspected_sources
@@ -890,6 +914,12 @@ fn compose_collection_inspection(
                 reference.catalog_entry_id
             ));
         };
+        if !used_skill_ids.insert(candidate.skill_id.clone()) {
+            return Err(format!(
+                "集合成员 {} 与另一个成员解析到同一 Skill",
+                reference.catalog_entry_id
+            ));
+        }
         if let (Some(expected), Some(actual)) = (
             reference
                 .commit_sha
@@ -904,15 +934,63 @@ fn compose_collection_inspection(
                 ));
             }
         }
+        catalog_to_skill.insert(
+            reference.catalog_entry_id.clone(),
+            candidate.skill_id.clone(),
+        );
         skills.push(candidate.clone());
     }
-    Ok(SourceInspection {
-        inspection_id: Uuid::new_v4().to_string(),
-        source: source.ok_or_else(|| "集合没有可安装的 Skill".to_string())?,
-        skills,
-        rejected,
-        warnings,
-    })
+    Ok((
+        SourceInspection {
+            inspection_id: Uuid::new_v4().to_string(),
+            source: source.ok_or_else(|| "集合没有可安装的 Skill".to_string())?,
+            skills,
+            rejected,
+            warnings,
+        },
+        catalog_to_skill,
+    ))
+}
+
+fn map_collection_assignments(
+    requested: Vec<SkillAssignment>,
+    catalog_to_skill: &HashMap<String, String>,
+    skills: &[SkillMetadata],
+    default_client_ids: &[String],
+) -> Result<Vec<SkillAssignment>, String> {
+    if requested.is_empty() {
+        return Ok(skills
+            .iter()
+            .map(|skill| SkillAssignment {
+                skill_id: skill.skill_id.clone(),
+                client_ids: default_client_ids.to_vec(),
+            })
+            .collect());
+    }
+    let mut assignments = Vec::with_capacity(requested.len());
+    for mut assignment in requested {
+        let Some(skill_id) = catalog_to_skill.get(assignment.skill_id.as_str()) else {
+            return Err(format!(
+                "集合安装分配包含未知 Skill: {}",
+                assignment.skill_id
+            ));
+        };
+        assignment.skill_id = skill_id.clone();
+        assignments.push(assignment);
+    }
+    let assigned_ids = assignments
+        .iter()
+        .map(|assignment| assignment.skill_id.clone())
+        .collect::<HashSet<_>>();
+    for skill in skills {
+        if !assigned_ids.contains(&skill.skill_id) {
+            assignments.push(SkillAssignment {
+                skill_id: skill.skill_id.clone(),
+                client_ids: default_client_ids.to_vec(),
+            });
+        }
+    }
+    Ok(assignments)
 }
 
 #[tauri::command]
@@ -948,55 +1026,19 @@ pub async fn plan_collection_install(
             })?;
             inspected_sources.push(inspected);
         }
-        let inspection = compose_collection_inspection(&collection, &inspected_sources)?;
+        let (inspection, by_catalog_id) =
+            compose_collection_inspection_with_map(&collection, &inspected_sources)?;
         state
             .inspections
             .lock()
             .map_err(|_| "来源检查锁已损坏".to_string())?
             .insert(inspection.inspection_id.clone(), inspection.clone());
-        let by_catalog_id: HashMap<_, _> = collection
-            .source_refs
-            .iter()
-            .zip(inspection.skills.iter())
-            .map(|(reference, skill)| (reference.catalog_entry_id.as_str(), skill.skill_id.clone()))
-            .collect();
-        let assignments = if request.assignments.is_empty() {
-            inspection
-                .skills
-                .iter()
-                .map(|skill| SkillAssignment {
-                    skill_id: skill.skill_id.clone(),
-                    client_ids: collection.default_client_ids.clone(),
-                })
-                .collect()
-        } else {
-            let mut assignments: Vec<SkillAssignment> = request
-                .assignments
-                .into_iter()
-                .map(|mut assignment| {
-                    if let Some(skill_id) = by_catalog_id.get(assignment.skill_id.as_str()) {
-                        assignment.skill_id = skill_id.clone();
-                    }
-                    assignment
-                })
-                .collect();
-            // A collection operation may customise the matrix, but it can
-            // never silently drop a member.  Missing rows receive the
-            // collection defaults and therefore remain in the preview.
-            let assigned_ids = assignments
-                .iter()
-                .map(|assignment: &SkillAssignment| assignment.skill_id.clone())
-                .collect::<HashSet<_>>();
-            for skill in &inspection.skills {
-                if !assigned_ids.contains(&skill.skill_id) {
-                    assignments.push(SkillAssignment {
-                        skill_id: skill.skill_id.clone(),
-                        client_ids: collection.default_client_ids.clone(),
-                    });
-                }
-            }
-            assignments
-        };
+        let assignments = map_collection_assignments(
+            request.assignments,
+            &by_catalog_id,
+            &inspection.skills,
+            &collection.default_client_ids,
+        )?;
         (inspection, assignments)
     } else {
         let inspection_id = request
@@ -3420,7 +3462,8 @@ mod tests {
             rejected: Vec::new(),
             warnings: Vec::new(),
         };
-        let combined = compose_collection_inspection(&collection, &[first, second]).unwrap();
+        let (combined, _) =
+            compose_collection_inspection_with_map(&collection, &[first, second]).unwrap();
         assert_eq!(
             combined
                 .skills
@@ -3503,6 +3546,187 @@ mod tests {
         assert!(plan.entries.iter().any(|entry| {
             entry.skill_name == "two" && entry.resolved_path == "/tmp/home/.kiro/skills/two"
         }));
+    }
+
+    #[test]
+    fn cross_source_matrix_keeps_distinct_assignments() {
+        let source = |url: &str, owner: &str, repository: &str, path: &str| SkillMetadata {
+            skill_id: path.to_string(),
+            relative_path: path.to_string(),
+            name: path.to_string(),
+            description: path.to_string(),
+            license: None,
+            compatibility: None,
+            metadata: None,
+            allowed_tools: None,
+            source: SkillSource::Github {
+                url: url.to_string(),
+            },
+            source_details: SkillSourceDetails {
+                owner: Some(owner.to_string()),
+                repository: Some(repository.to_string()),
+                reference: Some("main".to_string()),
+                subpath: Some(path.to_string()),
+                ..Default::default()
+            },
+            prepared_path: format!("/tmp/{path}"),
+            content_hash: format!("{path}-hash"),
+            file_count: 1,
+            total_bytes: 10,
+            has_scripts: false,
+            warnings: Vec::new(),
+        };
+        let inspection = SourceInspection {
+            inspection_id: "cross-source".to_string(),
+            source: SkillSource::Github {
+                url: "https://github.com/acme/first/tree/main/alpha".to_string(),
+            },
+            skills: vec![
+                source(
+                    "https://github.com/acme/first/tree/main/alpha",
+                    "acme",
+                    "first",
+                    "alpha",
+                ),
+                source(
+                    "https://github.com/other/second/tree/main/beta",
+                    "other",
+                    "second",
+                    "beta",
+                ),
+            ],
+            rejected: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let client = |id: &str| DetectedClient {
+            id: id.to_string(),
+            name: id.to_string(),
+            edition: ClientEdition::Standard,
+            version: Some("1.0.0".to_string()),
+            status: DetectionStatus::Installed,
+            application_path: None,
+            cli_path: None,
+            global_skills_path: format!("/tmp/{id}"),
+            inventory_skills_paths: vec![format!("/tmp/{id}")],
+            detection_evidence: Vec::new(),
+            supports_skills: true,
+            notes: Vec::new(),
+        };
+        let assignments = vec![
+            SkillAssignment {
+                skill_id: "alpha".to_string(),
+                client_ids: vec!["codex".to_string()],
+            },
+            SkillAssignment {
+                skill_id: "beta".to_string(),
+                client_ids: vec!["kiro".to_string()],
+            },
+        ];
+        let plan = build_install_plan(
+            &inspection,
+            &assignments,
+            &[client("codex"), client("kiro")],
+            Path::new("/tmp/home"),
+            &PersistedState::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.entries.len(), 2);
+        assert_eq!(
+            plan.entries
+                .iter()
+                .find(|entry| entry.skill_name == "alpha")
+                .unwrap()
+                .consumers,
+            vec!["codex"]
+        );
+        assert_eq!(
+            plan.entries
+                .iter()
+                .find(|entry| entry.skill_name == "beta")
+                .unwrap()
+                .consumers,
+            vec!["kiro"]
+        );
+    }
+
+    #[test]
+    fn collection_assignments_map_catalog_ids_before_building_plan() {
+        let skills = vec![
+            SkillMetadata {
+                skill_id: "inspected-a".into(),
+                relative_path: "a".into(),
+                name: "a".into(),
+                description: String::new(),
+                license: None,
+                compatibility: None,
+                metadata: None,
+                allowed_tools: None,
+                source: SkillSource::Github {
+                    url: "https://github.com/acme/a".into(),
+                },
+                source_details: SkillSourceDetails::default(),
+                prepared_path: "/tmp/a".into(),
+                content_hash: "a".into(),
+                file_count: 1,
+                total_bytes: 1,
+                has_scripts: false,
+                warnings: Vec::new(),
+            },
+            SkillMetadata {
+                skill_id: "inspected-b".into(),
+                relative_path: "b".into(),
+                name: "b".into(),
+                description: String::new(),
+                license: None,
+                compatibility: None,
+                metadata: None,
+                allowed_tools: None,
+                source: SkillSource::Github {
+                    url: "https://github.com/other/b".into(),
+                },
+                source_details: SkillSourceDetails::default(),
+                prepared_path: "/tmp/b".into(),
+                content_hash: "b".into(),
+                file_count: 1,
+                total_bytes: 1,
+                has_scripts: false,
+                warnings: Vec::new(),
+            },
+        ];
+        let mapping = HashMap::from([
+            ("catalog-a".to_string(), "inspected-a".to_string()),
+            ("catalog-b".to_string(), "inspected-b".to_string()),
+        ]);
+        let assignments = map_collection_assignments(
+            vec![
+                SkillAssignment {
+                    skill_id: "catalog-a".into(),
+                    client_ids: vec!["codex".into()],
+                },
+                SkillAssignment {
+                    skill_id: "catalog-b".into(),
+                    client_ids: vec!["kiro".into()],
+                },
+            ],
+            &mapping,
+            &skills,
+            &["codex".into()],
+        )
+        .unwrap();
+        assert_eq!(assignments[0].skill_id, "inspected-a");
+        assert_eq!(assignments[0].client_ids, vec!["codex"]);
+        assert_eq!(assignments[1].skill_id, "inspected-b");
+        assert_eq!(assignments[1].client_ids, vec!["kiro"]);
+        assert!(map_collection_assignments(
+            vec![SkillAssignment {
+                skill_id: "unknown".into(),
+                client_ids: vec!["codex".into()]
+            }],
+            &mapping,
+            &skills,
+            &[],
+        )
+        .is_err());
     }
 
     #[test]
