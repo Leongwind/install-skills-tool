@@ -5,6 +5,8 @@
 - 新增发现 Skills 页面、Anthropic Skills GitHub 公开目录来源、搜索筛选和 Skill 详情预览；不直连需要 Vercel OIDC 的 skills.sh API。
 - 新增目录 ETag/Last-Modified 离线缓存；同步失败时继续使用最近有效快照。
 - 新增收藏和可复用 Skill 集合，集合安装继续复用既有安全检查与 Skill-IDE 分配流程。
+- 集合安装预览改为可编辑的 Skill × IDE 矩阵；跨来源成员按稳定目录条目 ID 映射到实际检查结果，所有成员均需显式目标。
+- GitHub URL 解析统一复用安装器 parser，规范化 tree/blob/commit 与 `ref`/`path` 查询参数；Contents provider 单次读取、流式限制 20 MB 并支持取消。
 - 目录条目按来源仓库和路径与库存关联，区分未安装、部分安装、已安装和有更新，避免同名跨仓库误合并。
 - 状态 schema 升级到 v6；保持本地优先、无遥测、不执行 Skill 脚本和 ad-hoc DMG 内测边界。
 

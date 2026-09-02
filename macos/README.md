@@ -10,6 +10,7 @@ Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 - 目录条目显示作者、仓库、许可证、热度、更新时间和安装状态；详情页展示来源版本、安全提示和目标 IDE。
 - 可收藏条目并保存 Skill 集合。集合只是安装前的选择预设，实际安装仍逐 Skill 经过检查、分配矩阵、冲突确认和原子备份。
 - 目录同步使用 ETag/Last-Modified，网络失败时保留最近有效快照；stars 仅表示热度，不代表安全或可信承诺。
+- GitHub Contents 目录每次只读取一个响应，并遵循公开 API 单目录最多 1,000 项的边界；需要递归大目录时应配置未来的 Git Trees provider。响应按 20 MB 流式上限读取，支持取消，不会执行目录中的脚本。
 
 ## 0.5.1 功能
 
@@ -119,6 +120,7 @@ TRAE 国际版通过 `com.trae.app`、应用内 `product.json` 和 `.trae` 数�
 - 发现一个 Skill 根目录后不再向下搜索，避免将示例文件识别为嵌套 Skill。
 - 相同名称和相同哈希的重复项合并；相同名称但内容不同的项目不能同时安装。
 - 检查结果通过 `inspectionId` 暂存在 Rust 内存中，生成计划时不重复下载来源。
+- 使用集合时会先逐来源重新检查全部成员，再显示可编辑的 Skill × IDE 矩阵；集合成员不能绕过普通预览、冲突确认和 `apply_install_plan`。
 
 ## 库存与纳管
 
