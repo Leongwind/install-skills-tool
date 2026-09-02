@@ -1776,11 +1776,7 @@ export default function App() {
                       <Button
                         disabled={
                           busy === "update-apply" ||
-                          updatePlan.entries.some(
-                            (entry) =>
-                              entry.requiresConfirmation &&
-                              !approvedUpdateIds.includes(entry.entryId),
-                          )
+                          approvedUpdateIds.length === 0
                         }
                         onClick={() => void applyUpdates()}
                       >
