@@ -6,12 +6,15 @@
 
 use crate::domain::{
     CatalogCacheMetadata, CatalogEntry, CatalogInstallState, CatalogSnapshot, CatalogSource,
-    SkillCollection, SkillSource,
+    CollectionSkillRef, SkillCollection, SkillSource,
 };
+use crate::skill::{canonical_github_url, normalize_github_subpath, parse_github_url};
 use crate::storage::{cache_dir, StateRepository};
 use chrono::Utc;
+use futures_util::{Stream, StreamExt};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde_json::Value;
+use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,8 +28,35 @@ pub const GITHUB_SKILLS_URL: &str =
     "https://api.github.com/repos/anthropics/skills/contents/skills?ref=main";
 pub const CATALOG_TTL_SECS: i64 = 15 * 60;
 pub const MAX_CATALOG_BODY: usize = 20 * 1024 * 1024;
-const GITHUB_PAGE_SIZE: usize = 100;
-const GITHUB_MAX_PAGES: usize = 20;
+
+/// Read a catalog response incrementally.  We intentionally avoid
+/// `Response::bytes()` so a server cannot allocate an unbounded body before
+/// the 20 MB limit is enforced.  Cancellation is checked between every
+/// chunk, including the chunk that crosses the limit.
+pub async fn read_catalog_body<S, E>(
+    mut stream: S,
+    cancel_requested: Option<&AtomicBool>,
+) -> Result<Vec<u8>, String>
+where
+    S: Stream<Item = Result<Vec<u8>, E>> + Unpin,
+    E: Display,
+{
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("目录同步已取消".to_string());
+        }
+        let chunk = chunk.map_err(|error| format!("读取目录响应失败: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > MAX_CATALOG_BODY {
+            return Err("目录响应超过 20 MB 限制".to_string());
+        }
+        body.extend_from_slice(&chunk);
+        if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err("目录同步已取消".to_string());
+        }
+    }
+    Ok(body)
+}
 
 pub fn builtin_sources() -> Vec<CatalogSource> {
     vec![CatalogSource {
@@ -132,22 +162,6 @@ fn save_snapshot(
     })
 }
 
-fn github_contents_page_url(raw: &str, page: usize) -> Result<String, String> {
-    let mut url = url::Url::parse(raw).map_err(|_| "GitHub 目录 URL 无效".to_string())?;
-    let mut pairs = url
-        .query_pairs()
-        .filter(|(key, _)| key != "page" && key != "per_page")
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    pairs.push(("per_page".to_string(), GITHUB_PAGE_SIZE.to_string()));
-    pairs.push(("page".to_string(), page.to_string()));
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.extend_pairs(pairs);
-    let query = serializer.finish();
-    url.set_query(Some(&query));
-    Ok(url.to_string())
-}
-
 fn object_string(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str).map(str::to_owned))
@@ -224,12 +238,7 @@ pub fn parse_entries(source_id: &str, payload: &Value) -> Vec<CatalogEntry> {
                 installed_state: CatalogInstallState::NotInstalled,
                 warnings: Vec::new(),
             };
-            if entry.skill_url.is_some() && source_for_entry(&entry).is_err() {
-                entry
-                    .warnings
-                    .push("来源元数据与 URL 不一致，仅可查看，安装前请重新确认来源。".to_string());
-                entry.skill_url = None;
-            }
+            normalize_entry_source(&mut entry);
             Some(entry)
         })
         .collect()
@@ -242,8 +251,17 @@ pub fn parse_provider_entries(source: &CatalogSource, payload: &Value) -> Vec<Ca
     let Some(values) = payload.as_array() else {
         return Vec::new();
     };
-    let (owner, repository) = url::Url::parse(&source.url)
-        .ok()
+    let parsed_source_url = url::Url::parse(&source.url).ok();
+    let source_reference = parsed_source_url
+        .as_ref()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "ref")
+                .map(|(_, value)| value.into_owned())
+        })
+        .unwrap_or_else(|| "HEAD".to_string());
+    let (owner, repository) = parsed_source_url
+        .as_ref()
         .and_then(|url| {
             let parts: Vec<_> = url.path_segments()?.collect();
             if parts.len() >= 4 && parts[0] == "repos" {
@@ -255,6 +273,7 @@ pub fn parse_provider_entries(source: &CatalogSource, payload: &Value) -> Vec<Ca
         .unwrap_or_else(|| ("anthropics".to_string(), "skills".to_string()));
     values
         .iter()
+        .take(1_000)
         .filter(|value| {
             value
                 .get("type")
@@ -266,17 +285,17 @@ pub fn parse_provider_entries(source: &CatalogSource, payload: &Value) -> Vec<Ca
             let name = object_string(value, &["name"]).unwrap_or_else(|| path.clone());
             let skill_url = object_string(value, &["html_url"]).or_else(|| {
                 Some(format!(
-                    "https://github.com/{owner}/{repository}/tree/main/{path}"
+                    "https://github.com/{owner}/{repository}/tree/{source_reference}/{path}"
                 ))
             });
-            Some(CatalogEntry {
+            let mut entry = CatalogEntry {
                 id: format!("{}:{owner}/{repository}:{path}", source.id),
                 source_id: source.id.clone(),
                 name,
                 description: "来自 GitHub 公开目录（打开详情后读取 SKILL.md）".to_string(),
                 owner: Some(owner.clone()),
                 repository: Some(repository.clone()),
-                reference: Some("main".to_string()),
+                reference: Some(source_reference.clone()),
                 path: Some(path),
                 commit_sha: None,
                 license: None,
@@ -288,9 +307,32 @@ pub fn parse_provider_entries(source: &CatalogSource, payload: &Value) -> Vec<Ca
                 warnings: vec![
                     "目录 API 未提供 SKILL.md 内容，请在安装预览中再次检查来源。".to_string(),
                 ],
-            })
+            };
+            normalize_entry_source(&mut entry);
+            Some(entry)
         })
         .collect()
+}
+
+/// Canonicalize the URL returned by a provider before it reaches the UI or
+/// the installer.  Invalid/mismatched metadata remains browse-only and can
+/// never be turned into a different installation source by the frontend.
+fn normalize_entry_source(entry: &mut CatalogEntry) {
+    if entry.skill_url.is_none() {
+        return;
+    }
+    match source_for_entry(entry) {
+        Ok((SkillSource::Github { url }, _)) => entry.skill_url = Some(url),
+        Ok(_) => {
+            entry.skill_url = None;
+        }
+        Err(_) => {
+            entry
+                .warnings
+                .push("来源元数据与 URL 不一致，仅可查看，安装前请重新确认来源。".to_string());
+            entry.skill_url = None;
+        }
+    }
 }
 
 /// Build the only installable source descriptor accepted from a catalog
@@ -304,20 +346,13 @@ pub fn source_for_entry(
         .skill_url
         .as_deref()
         .ok_or_else(|| "目录条目没有公开 Skill URL".to_string())?;
-    let parsed = url::Url::parse(raw).map_err(|_| "目录 Skill URL 无效".to_string())?;
-    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com") {
+    let parsed_url = url::Url::parse(raw).map_err(|_| "目录 Skill URL 无效".to_string())?;
+    if parsed_url.scheme() != "https" || parsed_url.host_str() != Some("github.com") {
         return Err("目录 Skill URL 必须是 github.com HTTPS 地址".to_string());
     }
-    let parts: Vec<_> = parsed
-        .path_segments()
-        .ok_or_else(|| "目录 Skill URL 缺少路径".to_string())?
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.len() < 2 {
-        return Err("目录 Skill URL 缺少 owner/repository".to_string());
-    }
-    let owner = parts[0].to_string();
-    let repository = parts[1].trim_end_matches(".git").to_string();
+    let location = parse_github_url(raw)?;
+    let owner = location.owner.clone();
+    let repository = location.repository.clone();
     if entry.owner.as_deref().is_some_and(|value| value != owner)
         || entry
             .repository
@@ -326,31 +361,26 @@ pub fn source_for_entry(
     {
         return Err("目录条目的 owner/repository 与 URL 不一致".to_string());
     }
-    let (reference, mut subpath) =
-        if parts.len() >= 4 && matches!(parts[2], "tree" | "blob" | "commit") {
-            (parts[3].to_string(), parts[4..].join("/"))
-        } else {
-            ("HEAD".to_string(), parts[2..].join("/"))
-        };
-    if subpath.ends_with("/SKILL.md") {
-        subpath.truncate(subpath.len() - "/SKILL.md".len());
-    } else if subpath == "SKILL.md" {
-        subpath.clear();
-    }
+    let reference = location.reference.clone();
+    let subpath = location.subpath.clone();
+    let metadata_path = entry
+        .path
+        .as_deref()
+        .map(normalize_github_subpath)
+        .transpose()?;
     if entry
         .reference
         .as_deref()
         .is_some_and(|value| value != reference)
-        || entry.path.as_deref().is_some_and(|value| value != subpath)
+        || metadata_path
+            .as_deref()
+            .is_some_and(|value| value != subpath)
         || entry
             .commit_sha
             .as_deref()
             .is_some_and(|sha| sha != reference)
     {
         return Err("目录条目的 path/ref/commit SHA 与 URL 不一致".to_string());
-    }
-    if reference == "." || reference == ".." || reference.chars().any(char::is_control) {
-        return Err("目录 Skill ref 无效".to_string());
     }
     let details = crate::domain::SkillSourceDetails {
         owner: Some(owner),
@@ -362,7 +392,7 @@ pub fn source_for_entry(
     };
     Ok((
         SkillSource::Github {
-            url: raw.to_string(),
+            url: canonical_github_url(&location),
         },
         details,
     ))
@@ -403,6 +433,55 @@ pub fn validate_collection_ref(
     };
     let _ = source_for_entry(&temporary)?;
     Ok(())
+}
+
+/// Persist only the canonical descriptor produced by the shared URL parser.
+/// This prevents a collection from retaining a query alias or a non-canonical
+/// path that could later diverge from the source inspected for installation.
+pub fn normalize_collection_ref(
+    reference: &CollectionSkillRef,
+) -> Result<CollectionSkillRef, String> {
+    let SkillSource::Github { url } = &reference.source else {
+        return Err("集合只支持公开 GitHub Skill 来源".to_string());
+    };
+    let temporary = CatalogEntry {
+        id: reference.catalog_entry_id.clone(),
+        source_id: String::new(),
+        name: reference
+            .skill_name
+            .clone()
+            .unwrap_or_else(|| "skill".to_string()),
+        description: String::new(),
+        owner: reference.source_details.owner.clone(),
+        repository: reference.source_details.repository.clone(),
+        reference: reference.source_details.reference.clone(),
+        path: reference
+            .path
+            .clone()
+            .or_else(|| reference.source_details.subpath.clone()),
+        commit_sha: reference
+            .commit_sha
+            .clone()
+            .or_else(|| reference.source_details.commit_sha.clone()),
+        license: None,
+        stars: None,
+        updated_at: None,
+        skill_url: Some(url.clone()),
+        has_scripts: false,
+        installed_state: CatalogInstallState::NotInstalled,
+        warnings: Vec::new(),
+    };
+    let (SkillSource::Github { url }, details) = source_for_entry(&temporary)? else {
+        return Err("集合来源不是 GitHub 来源".to_string());
+    };
+    Ok(CollectionSkillRef {
+        catalog_entry_id: reference.catalog_entry_id.clone(),
+        source: SkillSource::Github { url },
+        source_details: details.clone(),
+        skill_name: reference.skill_name.clone(),
+        path: details.subpath.clone(),
+        commit_sha: details.commit_sha.clone(),
+    })
 }
 
 pub fn all_cached_entries(
@@ -526,87 +605,60 @@ pub async fn sync_source_with_control(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| error.to_string())?;
-    let mut payloads = Vec::new();
-    let mut total_bytes = 0usize;
-    let mut page = 1usize;
-    let mut etag = None;
-    let mut last_modified = None;
-    loop {
-        if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            return Err("目录同步已取消".to_string());
-        }
-        let page_url = if source.provider == "github-contents" {
-            github_contents_page_url(&source.url, page)?
-        } else {
-            source.url.clone()
-        };
-        let mut request = client.get(page_url);
-        // Validators apply to the first page.  Subsequent pages have their own
-        // cache semantics and are bounded by GITHUB_MAX_PAGES.
-        if page == 1 {
-            if let Some(value) = source.etag.as_deref() {
-                request = request.header(IF_NONE_MATCH, value);
-            }
-            if let Some(value) = source.last_modified.as_deref() {
-                request = request.header(IF_MODIFIED_SINCE, value);
-            }
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| format!("目录同步失败: {error}"))?;
-        if page == 1 && response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return load_snapshot(data_dir, &source.id)?
-                .map(|snapshot| retimestamp_snapshot(data_dir, snapshot).map(|next| (next, true)))
-                .transpose()?
-                .ok_or_else(|| "目录返回 304 但本地没有缓存".to_string());
-        }
-        if !response.status().is_success() {
-            return Err(format!("目录返回 {}", response.status()));
-        }
-        if page == 1 {
-            etag = response
-                .headers()
-                .get(ETAG)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            last_modified = response
-                .headers()
-                .get(LAST_MODIFIED)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-        }
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| format!("读取目录响应失败: {error}"))?;
-        total_bytes = total_bytes.saturating_add(body.len());
-        if total_bytes > MAX_CATALOG_BODY {
-            return Err("目录响应超过 20 MB 限制".to_string());
-        }
-        let payload = serde_json::from_slice::<Value>(&body)
-            .map_err(|error| format!("目录 JSON 无效: {error}"))?;
-        let page_len = payload.as_array().map_or(0, Vec::len);
-        payloads.push(payload);
-        if source.provider != "github-contents"
-            || page_len < GITHUB_PAGE_SIZE
-            || page >= GITHUB_MAX_PAGES
-        {
-            break;
-        }
-        page += 1;
+    if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("目录同步已取消".to_string());
     }
-    let payload = if payloads.len() == 1 {
-        payloads.pop().expect("one payload")
-    } else {
-        let mut values = Vec::new();
-        for payload in payloads {
-            if let Some(array) = payload.as_array() {
-                values.extend(array.iter().cloned());
-            }
-        }
-        Value::Array(values)
-    };
+    // GitHub Contents returns at most 1,000 entries for a directory.  A
+    // catalog source must therefore point at a concrete directory; one
+    // bounded request is safer and avoids silently duplicating pages.  Larger
+    // recursive catalogs can use a future Git Trees provider.
+    let mut request = client.get(&source.url);
+    if let Some(value) = source.etag.as_deref() {
+        request = request.header(IF_NONE_MATCH, value);
+    }
+    if let Some(value) = source.last_modified.as_deref() {
+        request = request.header(IF_MODIFIED_SINCE, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("目录同步失败: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return load_snapshot(data_dir, &source.id)?
+            .map(|snapshot| retimestamp_snapshot(data_dir, snapshot).map(|next| (next, true)))
+            .transpose()?
+            .ok_or_else(|| "目录返回 304 但本地没有缓存".to_string());
+    }
+    if !response.status().is_success() {
+        return Err(format!("目录返回 {}", response.status()));
+    }
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let last_modified = response
+        .headers()
+        .get(LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if response
+        .content_length()
+        .is_some_and(|length| length as usize > MAX_CATALOG_BODY)
+    {
+        return Err("目录响应超过 20 MB 限制".to_string());
+    }
+    let body_stream = response.bytes_stream().map(|chunk| {
+        chunk
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| error.to_string())
+    });
+    let body = read_catalog_body(body_stream, cancel_requested).await?;
+    if cancel_requested.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err("目录同步已取消".to_string());
+    }
+    let payload = serde_json::from_slice::<Value>(&body)
+        .map_err(|error| format!("目录 JSON 无效: {error}"))?;
     let snapshot = CatalogSnapshot {
         source_id: source.id.clone(),
         fetched_at: Utc::now().to_rfc3339(),
@@ -666,6 +718,8 @@ pub fn collection_assignments(collection: &SkillCollection) -> Vec<crate::domain
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn parses_array_and_metadata_fields() {
@@ -716,6 +770,50 @@ mod tests {
     }
 
     #[test]
+    fn github_contents_provider_accepts_more_than_one_hundred_entries_once() {
+        let source = CatalogSource {
+            id: "catalog".into(),
+            name: "Catalog".into(),
+            url: "https://api.github.com/repos/acme/skills/contents/skills?ref=main".into(),
+            provider: "github-contents".into(),
+            enabled: true,
+            etag: None,
+            last_modified: None,
+            last_synced_at: None,
+        };
+        let payload = Value::Array(
+            (0..128)
+                .map(|index| {
+                    serde_json::json!({
+                        "name": format!("skill-{index}"),
+                        "path": format!("skills/skill-{index}"),
+                        "type": "dir",
+                        "html_url": format!("https://github.com/acme/skills/tree/main/skills/skill-{index}")
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(parse_provider_entries(&source, &payload).len(), 128);
+    }
+
+    #[test]
+    fn catalog_body_stream_enforces_limit_between_chunks_and_cancellation() {
+        let oversized = vec![vec![b'x'; MAX_CATALOG_BODY], vec![b'y'; 1]];
+        let result = tauri::async_runtime::block_on(read_catalog_body(
+            stream::iter(oversized.into_iter().map(Ok::<_, String>)),
+            None,
+        ));
+        assert!(result.unwrap_err().contains("20 MB"));
+
+        let cancelled = AtomicBool::new(true);
+        let result = tauri::async_runtime::block_on(read_catalog_body(
+            stream::iter(vec![Ok::<_, String>(b"{}".to_vec())]),
+            Some(&cancelled),
+        ));
+        assert!(result.unwrap_err().contains("取消"));
+    }
+
+    #[test]
     fn catalog_entry_source_descriptor_rejects_metadata_spoofing() {
         let entry = CatalogEntry {
             id: "catalog:spoof".into(),
@@ -739,16 +837,93 @@ mod tests {
     }
 
     #[test]
-    fn github_contents_page_url_preserves_ref_and_replaces_paging() {
-        let page = github_contents_page_url(
-            "https://api.github.com/repos/acme/skills/contents?ref=main&page=9",
-            2,
-        )
-        .unwrap();
-        assert!(page.contains("ref=main"));
-        assert!(page.contains("per_page=100"));
-        assert!(page.contains("page=2"));
-        assert!(!page.contains("page=9"));
+    fn catalog_entry_source_descriptor_uses_shared_query_parser_and_canonical_url() {
+        let entry = CatalogEntry {
+            id: "catalog:query".into(),
+            source_id: "catalog".into(),
+            name: "demo".into(),
+            description: String::new(),
+            owner: Some("acme".into()),
+            repository: Some("skills".into()),
+            reference: Some("feature/agent".into()),
+            path: Some("catalog/demo/SKILL.md".into()),
+            commit_sha: None,
+            license: None,
+            stars: None,
+            updated_at: None,
+            skill_url: Some(
+                "https://github.com/acme/skills?ref=feature%2Fagent&path=catalog%2Fdemo%2FSKILL.md"
+                    .into(),
+            ),
+            has_scripts: false,
+            installed_state: CatalogInstallState::NotInstalled,
+            warnings: Vec::new(),
+        };
+        let (SkillSource::Github { url }, details) = source_for_entry(&entry).unwrap() else {
+            panic!("expected GitHub source");
+        };
+        assert_eq!(
+            url,
+            "https://github.com/acme/skills/tree/feature%2Fagent/catalog/demo"
+        );
+        assert_eq!(details.reference.as_deref(), Some("feature/agent"));
+        assert_eq!(details.subpath.as_deref(), Some("catalog/demo"));
+
+        let mut mismatch = entry.clone();
+        mismatch.skill_url = Some(
+            "https://github.com/acme/skills?ref=feature%2Fother&path=catalog%2Fdemo%2FSKILL.md"
+                .into(),
+        );
+        assert!(source_for_entry(&mismatch).is_err());
+    }
+
+    #[test]
+    fn catalog_entry_source_descriptor_rejects_duplicate_query_parameters() {
+        let entry = CatalogEntry {
+            id: "catalog:duplicate".into(),
+            source_id: "catalog".into(),
+            name: "demo".into(),
+            description: String::new(),
+            owner: Some("acme".into()),
+            repository: Some("skills".into()),
+            reference: None,
+            path: None,
+            commit_sha: None,
+            license: None,
+            stars: None,
+            updated_at: None,
+            skill_url: Some("https://github.com/acme/skills?ref=main&ref=dev".into()),
+            has_scripts: false,
+            installed_state: CatalogInstallState::NotInstalled,
+            warnings: Vec::new(),
+        };
+        assert!(source_for_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn catalog_entry_source_descriptor_requires_commit_sha_to_be_in_url() {
+        let base = CatalogEntry {
+            id: "catalog:pinned".into(),
+            source_id: "catalog".into(),
+            name: "demo".into(),
+            description: String::new(),
+            owner: Some("acme".into()),
+            repository: Some("skills".into()),
+            reference: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            path: Some("demo".into()),
+            commit_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            license: None,
+            stars: None,
+            updated_at: None,
+            skill_url: Some("https://github.com/acme/skills/commit/0123456789abcdef0123456789abcdef01234567/demo".into()),
+            has_scripts: false,
+            installed_state: CatalogInstallState::NotInstalled,
+            warnings: Vec::new(),
+        };
+        assert!(source_for_entry(&base).is_ok());
+        let mut mismatch = base;
+        mismatch.commit_sha = Some("fedcba9876543210fedcba9876543210fedcba98".into());
+        assert!(source_for_entry(&mismatch).is_err());
     }
 
     #[test]

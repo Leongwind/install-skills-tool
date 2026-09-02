@@ -5,7 +5,7 @@ use crate::storage::{cache_dir, inspect_tree, MAX_BYTES, MAX_FILES};
 use futures_util::StreamExt;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::future::Future;
 use std::io::{Cursor, Read, Seek};
@@ -32,17 +32,20 @@ struct Frontmatter {
     allowed_tools: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct GithubLocation {
-    owner: String,
-    repository: String,
-    reference: String,
-    subpath: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubLocation {
+    pub owner: String,
+    pub repository: String,
+    pub reference: String,
+    pub subpath: String,
 }
 
 type DiscoveryResult = (Vec<SkillMetadata>, Vec<RejectedSkill>, Vec<String>);
 
-fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
+/// Parse every GitHub source form accepted by the installer.  Catalog entries
+/// must use this exact parser too; keeping one canonical implementation avoids
+/// a browse URL being interpreted differently when it reaches installation.
+pub fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("GitHub 来源不能为空".to_string());
@@ -80,7 +83,13 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
     }
 
     let url = url::Url::parse(raw).map_err(|_| "GitHub URL 无效".to_string())?;
-    if url.host_str() != Some("github.com") {
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
         return Err("仅支持 github.com 公共仓库".to_string());
     }
     let parts: Vec<_> = url
@@ -106,16 +115,35 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
         } else {
             ("HEAD".to_string(), String::new())
         };
-    let query = url.query_pairs().collect::<HashMap<_, _>>();
-    if !matches!(
-        parts.get(2),
-        Some(&"tree") | Some(&"blob") | Some(&"commit")
-    ) {
-        if let Some(value) = query.get("ref") {
-            reference = value.to_string();
+    let query_ref = query_parameter(&url, "ref")?;
+    let query_path = query_parameter(&url, "path")?;
+    if let Some(value) = query_ref {
+        if !matches!(
+            parts.get(2),
+            Some(&"tree") | Some(&"blob") | Some(&"commit")
+        ) || value != reference
+        {
+            if matches!(
+                parts.get(2),
+                Some(&"tree") | Some(&"blob") | Some(&"commit")
+            ) {
+                return Err("GitHub URL 的 query ref 与路径 ref 不一致".to_string());
+            }
+            reference = value;
         }
-        if let Some(value) = query.get("path") {
-            subpath = value.to_string();
+    }
+    if let Some(value) = query_path {
+        let normalized_query = normalize_github_subpath(&value)?;
+        if matches!(
+            parts.get(2),
+            Some(&"tree") | Some(&"blob") | Some(&"commit")
+        ) {
+            let normalized_path = normalize_github_subpath(&subpath)?;
+            if normalized_query != normalized_path {
+                return Err("GitHub URL 的 query path 与路径不一致".to_string());
+            }
+        } else {
+            subpath = value;
         }
     }
     validate_github_reference(&reference)?;
@@ -126,6 +154,38 @@ fn parse_github_url(raw: &str) -> Result<GithubLocation, String> {
         reference,
         subpath,
     })
+}
+
+fn query_parameter(url: &url::Url, name: &str) -> Result<Option<String>, String> {
+    let mut value = None;
+    for (key, current) in url.query_pairs() {
+        if key != name {
+            continue;
+        }
+        if value.is_some() {
+            return Err(format!("GitHub URL 不允许重复 query 参数 {name}"));
+        }
+        value = Some(current.into_owned());
+    }
+    Ok(value)
+}
+
+/// Return a stable, canonical GitHub URL for a parsed source descriptor.
+/// Query aliases are removed so catalog metadata and the installer share the
+/// same owner/repository/ref/subpath identity.
+pub fn canonical_github_url(location: &GithubLocation) -> String {
+    let mut url = url::Url::parse("https://github.com").expect("valid GitHub base URL");
+    {
+        let mut segments = url.path_segments_mut().expect("URL can be a base");
+        segments.push(&location.owner).push(&location.repository);
+        if location.reference != "HEAD" || !location.subpath.is_empty() {
+            segments.push("tree").push(&location.reference);
+            for component in location.subpath.split('/').filter(|part| !part.is_empty()) {
+                segments.push(component);
+            }
+        }
+    }
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 fn validate_github_component(value: &str, label: &str) -> Result<(), String> {
@@ -160,7 +220,7 @@ fn validate_github_reference(reference: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn normalize_github_subpath(path: &str) -> Result<String, String> {
+pub fn normalize_github_subpath(path: &str) -> Result<String, String> {
     if path.chars().any(char::is_control) || path.contains('\\') {
         return Err("GitHub Skill 子路径无效".to_string());
     }
@@ -841,6 +901,41 @@ mod tests {
                 .unwrap();
         assert_eq!(query.reference, "v2");
         assert_eq!(query.subpath, "catalog/demo");
+    }
+
+    #[test]
+    fn parses_encoded_query_values_and_rejects_duplicate_or_mismatched_aliases() {
+        let encoded = parse_github_url(
+            "https://github.com/acme/skills?ref=feature%2Fagent&path=catalog%2Fdemo%2FSKILL.md",
+        )
+        .unwrap();
+        assert_eq!(encoded.reference, "feature/agent");
+        assert_eq!(encoded.subpath, "catalog/demo");
+
+        let tree = parse_github_url(
+            "https://github.com/acme/skills/tree/main/catalog/demo?ref=main&path=catalog%2Fdemo",
+        )
+        .unwrap();
+        assert_eq!(tree.reference, "main");
+        assert_eq!(tree.subpath, "catalog/demo");
+
+        assert!(parse_github_url("https://github.com/acme/skills?ref=main&ref=dev").is_err());
+        assert!(parse_github_url("https://github.com/acme/skills/tree/main/demo?ref=dev").is_err());
+        assert!(
+            parse_github_url("https://github.com/acme/skills/tree/main/demo?path=other").is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_github_url_removes_query_aliases() {
+        let location = parse_github_url(
+            "https://github.com/acme/skills?ref=feature%2Fagent&path=catalog%2Fdemo%2FSKILL.md",
+        )
+        .unwrap();
+        assert_eq!(
+            canonical_github_url(&location),
+            "https://github.com/acme/skills/tree/feature%2Fagent/catalog/demo"
+        );
     }
 
     #[test]
