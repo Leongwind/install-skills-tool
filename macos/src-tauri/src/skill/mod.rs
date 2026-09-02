@@ -628,7 +628,7 @@ async fn download_github(
     on_progress: Option<&(dyn Fn(usize, Option<usize>) + Send + Sync)>,
 ) -> Result<(PathBuf, SkillSourceDetails), String> {
     let client = reqwest::Client::builder()
-        .user_agent("Skill-Installer/0.5.1")
+        .user_agent("Skill-Installer/0.6.0")
         .build()
         .map_err(|error| error.to_string())?;
     let resolve_commit = {

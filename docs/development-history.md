@@ -1,5 +1,19 @@
 # Development history
 
+## macOS 0.6.0 catalog discovery and collections, 2026-09-02
+
+| Commit | Change |
+|---|---|
+| `37cffa9` | Added catalog source models, schema v6 migration, offline snapshots and catalog IPC. |
+| `050f5e0` | Added Discover page, public catalog search/filtering and Skill detail preview. |
+| `f899f95` | Added favorites and reusable Skill collections. |
+| `b8e3278` | Reconciled catalog entries with tracked GitHub installations by source identity. |
+| `fd8d76e` | Added cache-age, collection assignment and same-name cross-repository security tests. |
+
+macOS 0.6.0 keeps global-only installs, no script execution and ad-hoc DMG packaging. Directory
+metadata and stars are informational; the existing content hash, commit/ref pinning and atomic
+backup pipeline remain authoritative for writes.
+
 ## macOS foundation, 2026-07-30
 
 | Commit | Change |

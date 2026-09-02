@@ -1,8 +1,15 @@
 # Skill Installer for macOS
 
-Skill Installer 0.5.1 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
+Skill Installer 0.6.0 是独立的 macOS Agent Skill 批量安装与库存管理工具，使用
 Tauri 2、Rust、React、TypeScript、Vite、Radix Themes 和 Phosphor Icons。
 应用数据只保存在本机，不采集遥测，不上传 Skill 内容。
+
+## 0.6.0 功能
+
+- “发现 Skills”页面连接内置 skills.sh 和用户配置的公开 HTTPS 目录，支持关键词、来源、脚本筛选和离线缓存。
+- 目录条目显示作者、仓库、许可证、热度、更新时间和安装状态；详情页展示来源版本、安全提示和目标 IDE。
+- 可收藏条目并保存 Skill 集合。集合只是安装前的选择预设，实际安装仍逐 Skill 经过检查、分配矩阵、冲突确认和原子备份。
+- 目录同步使用 ETag/Last-Modified，网络失败时保留最近有效快照；stars 仅表示热度，不代表安全或可信承诺。
 
 ## 0.5.1 功能
 
@@ -147,7 +154,7 @@ TRAE 国际版通过 `com.trae.app`、应用内 `product.json` 和 `.trae` 数�
 └── logs/
 ```
 
-`state.json` 当前为 schema v5。v1/v2/v3/v4 会原子迁移，不会删除 Skill 或备份。迁移
+`state.json` 当前为 schema v6。v1/v2/v3/v4/v5 会原子迁移，不会删除 Skill 或备份。迁移
 前的原始 `state.json` 会保存在 `backups/state-migrations/`，未知的更高版本会拒绝
 读取。诊断
 预览会将用户目录替换为 `~`，包含库存数量、检测依据、操作日志、备份策略、

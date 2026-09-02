@@ -6,12 +6,12 @@ This is the entry point for continuing the project on another machine.
 
 - Repository: `Leongwind/install-skills-tool`
 - Default branch: `main`
-- macOS version: `0.5.1`, local verification and dual-architecture CI packaging complete
+- macOS version: `0.6.0`, catalog discovery/collections implemented; dual-architecture CI packaging remains ad-hoc
 - Windows version: `0.1.0`, Windows CI passed, waiting for Win11 real-IDE validation
 - Latest Windows code milestone: `89cb9ed`, GitHub source revision tracking
-- Latest macOS milestones: `5a91737` durable schema v5 state, `cb4b0d1` Adapter V2
-  inventory, `ea3bb28` GitHub source ergonomics, `afa4f9f` lifecycle safety and
-  `5afe99c` operation ownership plus verified packaging
+- Latest macOS milestones: `37cffa9` catalog sources/cache, `050f5e0` Discover UI,
+  `f899f95` favorites/collections, `b8e3278` inventory reconciliation and `fd8d76e`
+  catalog security tests. The latest documentation/version commit follows these milestones.
 
 ## Platform boundary
 
@@ -48,6 +48,11 @@ Then run `git status -sb` and `git log -5 --oneline` before changing anything.
 ## Current next steps
 
 ### macOS
+
+0.6.0 adds the Discover page, skills.sh/public catalog sources, offline ETag/Last-Modified
+snapshots, favorites and reusable Skill collections. Read `docs/plans/macos-0.6.0-plan.md`
+for the milestone commits and scope. Catalog metadata is never treated as a trust decision;
+the existing inspect/plan/apply installer remains the only write path.
 
 Workflow run
 [`33254849319`](https://github.com/Leongwind/install-skills-tool/actions/runs/33254849319)
